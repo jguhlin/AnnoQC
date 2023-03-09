@@ -59,3 +59,6 @@ For each input seq
 * Use syncmers for pre-filtering?
 * Use DIAMOND instead of BLAST
 * Rust (ofc)
+
+### Other Ideas
+* Syncmers + BiWFA instead of diamond?
