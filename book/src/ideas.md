@@ -52,6 +52,7 @@ For each input seq
 * Exon fuses and splits
 * % Nucleotides found (via kmers)
 * % AA's found (via kmers)
+* Maybe use clusters? Diamond DeepClust? Looks like a good idea! Then can exceed the 10 most significant hits
 
 ### Ideas for Speed
 * ECS dataflow
