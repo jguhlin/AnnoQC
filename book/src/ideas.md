@@ -48,3 +48,14 @@ For each input seq
 * Exon Length Distributions - Should be species specific
 * Nearby genome for comparison - What is the distribution there of exons/introns/length/etc?
 * Number of transcripts?
+* Consistent exon/intron boundaries
+* Exon fuses and splits
+* % Nucleotides found (via kmers)
+* % AA's found (via kmers)
+
+### Ideas for Speed
+* ECS dataflow
+* Use SFASTA internally
+* Use syncmers for pre-filtering?
+* Use DIAMOND instead of BLAST
+* Rust (ofc)
