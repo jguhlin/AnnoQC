@@ -1,0 +1,21 @@
+[package]
+name = "AnnoQC"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bevy_app = "0.10.0"
+bevy_ecs = "0.10.0"
+mimalloc = { version = "0.1.34", default-features = false }
+twox-hash = "1.6.3"
+once_cell = "1.17.0"
+strum = "0.24.1"
+strum_macros = "0.24.3"
+pulp = "0.11.5"
+libsfasta = { path = "../sfasta/libsfasta" }
+itertools = "0.10.5"
+
+[profile.dev.package."*"]
+opt-level = 3
