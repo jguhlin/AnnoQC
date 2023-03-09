@@ -3,7 +3,8 @@ name = "AnnoQC"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.dev.package."*"]
+opt-level = 3
 
 [dependencies]
 bevy_app = "0.10.0"
@@ -16,6 +17,8 @@ strum_macros = "0.24.3"
 pulp = "0.11.5"
 libsfasta = { path = "../sfasta/libsfasta" }
 itertools = "0.10.5"
-
-[profile.dev.package."*"]
-opt-level = 3
+clap = { version= "4.1.8", features = ["derive"] }
+log = "0.4.17"
+env_logger = "0.10.0"
+curl = "0.4.44"
+flate2 = "1.0.25"
