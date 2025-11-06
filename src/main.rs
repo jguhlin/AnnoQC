@@ -303,7 +303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_run_manifest(&cfg, &tools, &checksums, &snapshot)?;
             let scores_map = build_scores_map(&metrics, &stats, &intrinsic_map, &file_cfg.scoring, args.coverage_delta_threshold);
             write_jsonl_metrics(&cfg.out, &metrics, &stats, &intrinsic_map, &alignment_map, args.coverage_delta_threshold, &file_cfg.scoring)?;
-            write_csv_metrics(&cfg.out, &metrics, &stats, args.coverage_delta_threshold, &scores_map)?;
+            write_csv_metrics(&cfg.out, &metrics, &stats, args.coverage_delta_threshold, &scores_map, &alignment_map)?;
             Ok(())
         }
         Commands::TaxonomyCache(t) => {
@@ -501,10 +501,11 @@ fn write_csv_metrics(
     stats: &std::collections::HashMap<String, diamond::DiamondHitStats>,
     cov_delta_thresh: f64,
     scores: &HashMap<String, (f64, String)>,
+    alignment_map: &std::collections::HashMap<String, mafft::AlignmentMetrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_summary.csv");
     let mut f = File::create(path)?;
-    writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,taxonomy_score,taxonomy_status,warnings")?;
+    writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,taxonomy_score,taxonomy_status,warnings")?;
     for m in metrics {
         let warnings = if m.hits == 0 { "No DIAMOND hits" } else { "" };
         let s = stats.get(&m.gene_id);
@@ -529,9 +530,13 @@ fn write_csv_metrics(
         let cov_ratio = s.map(|x| x.coverage_ratio).unwrap_or(0.0);
         let fusion = if cov_delta > cov_delta_thresh { 1 } else { 0 };
         let (final_score, classif) = scores.get(&m.gene_id).cloned().unwrap_or((0.0, String::new()));
+        let aln = alignment_map.get(&m.gene_id);
+        let (mafft_enabled, conserved, pid, seqs_aln, qgap, gap_runs, max_gap) = if let Some(a) = aln {
+            (a.mafft_enabled as i32, a.conserved_fraction, a.pairwise_identity, a.sequences_aligned, a.query_gap_fraction, a.gap_run_count, a.max_gap_run)
+        } else { (0, 0.0, 0.0, 0, 0.0, 0, 0) };
         writeln!(
             f,
-            "{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{},{}",
+            "{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{},{:.3},{},{},{},{},{}",
             m.gene_id,
             m.hits,
             top_hit,
@@ -545,6 +550,13 @@ fn write_csv_metrics(
             fusion,
             final_score,
             classif,
+            mafft_enabled,
+            conserved,
+            pid,
+            seqs_aln,
+            qgap,
+            gap_runs,
+            max_gap,
             "",
             "disabled",
             warnings

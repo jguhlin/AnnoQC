@@ -83,11 +83,11 @@ Rows with potential issues advertise warnings such as missing start/stop codons,
 
 ## CSV Columns
 
-`qc_summary.csv` contains headline homology numbers, coverage metrics, final_score, an optional classification, and a `warnings` column for quick filtering:
+`qc_summary.csv` contains headline homology numbers, coverage metrics, final_score, optional classification, and (when MAFFT is enabled) alignment summary metrics. A `warnings` column eases quick filtering:
 
 ```
-gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,taxonomy_score,taxonomy_status,warnings
-Gene00042,12,sp|P12345|REF_HUMAN,212.600,3.20e-68,0.940,0.910,3.210,0.030,1.030,0,0.870,High,,,
+gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,taxonomy_score,taxonomy_status,warnings
+Gene00042,12,sp|P12345|REF_HUMAN,212.600,3.20e-68,0.940,0.910,3.210,0.030,1.030,0,0.870,High,1,0.890,0.860,6,0.040,1,4,,,
 ```
 
 The CSV is suitable for spreadsheets or dashboards, while the JSONL is richer for downstream pipelines.
