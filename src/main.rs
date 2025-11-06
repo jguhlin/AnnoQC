@@ -198,6 +198,13 @@ struct TaxonomyConfigOverride {
 struct ScoringConfigOverride {
     #[serde(default)]
     weights: HashMap<String, f64>,
+    thresholds: Option<ScoringThresholds>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ScoringThresholds {
+    high: Option<f64>,
+    medium: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -292,9 +299,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Emit outputs
             let stats = parse_tsv_stats(&diamond_tsv).unwrap_or_default();
             let checksums = collect_checksums(&cfg)?;
-            write_run_manifest(&cfg, &tools, &checksums)?;
+            let snapshot = build_config_snapshot(&cfg, &args, &file_cfg);
+            write_run_manifest(&cfg, &tools, &checksums, &snapshot)?;
+            let scores_map = build_scores_map(&metrics, &stats, &intrinsic_map, &file_cfg.scoring, args.coverage_delta_threshold);
             write_jsonl_metrics(&cfg.out, &metrics, &stats, &intrinsic_map, &alignment_map, args.coverage_delta_threshold, &file_cfg.scoring)?;
-            write_csv_metrics(&cfg.out, &metrics, &stats, args.coverage_delta_threshold)?;
+            write_csv_metrics(&cfg.out, &metrics, &stats, args.coverage_delta_threshold, &scores_map)?;
             Ok(())
         }
         Commands::TaxonomyCache(t) => {
@@ -369,35 +378,47 @@ fn collect_checksums(cfg: &EffectiveConfig) -> Result<Checksums, Box<dyn std::er
     })
 }
 
+#[derive(Serialize)]
+struct ConfigSnapshot<'a> {
+    fasta: &'a str,
+    db: &'a str,
+    out: &'a str,
+    threads: usize,
+    diamond_bin: &'a str,
+    reference_fasta: Option<&'a str>,
+    alignment_top_hits: usize,
+    alignment_strategy: String,
+    coverage_delta_threshold: f64,
+    log_format: String,
+    scoring_weights: std::collections::HashMap<String, f64>,
+}
+
 fn write_run_manifest(
     cfg: &EffectiveConfig,
     tools: &preflight::ToolVersions,
     sums: &Checksums,
+    snapshot: &ConfigSnapshot,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[derive(Serialize)]
     struct Manifest<'a> {
+        schema_version: &'a str,
         tool: &'a str,
         diamond_version: &'a str,
         mafft_version: Option<&'a str>,
         hmmscan_version: Option<&'a str>,
-        fasta: &'a str,
-        db: &'a str,
-        threads: usize,
-        out: &'a str,
         fasta_xx64: Option<&'a str>,
         db_xx64: Option<&'a str>,
+        config: &'a ConfigSnapshot<'a>,
     }
     let manifest = Manifest {
+        schema_version: "1.0",
         tool: "AnnoQC",
         diamond_version: tools.diamond.as_deref().unwrap_or_default(),
         mafft_version: tools.mafft.as_deref(),
         hmmscan_version: tools.hmmscan.as_deref(),
-        fasta: &cfg.fasta,
-        db: &cfg.db,
-        threads: cfg.threads,
-        out: &cfg.out,
         fasta_xx64: sums.fasta_xx64.as_deref(),
         db_xx64: sums.db_xx64.as_deref(),
+        config: snapshot,
     };
     let path = Path::new(&cfg.out).join("run.json");
     let text = serde_json::to_string_pretty(&manifest)?;
@@ -479,10 +500,11 @@ fn write_csv_metrics(
     metrics: &[ecs::GeneMetrics],
     stats: &std::collections::HashMap<String, diamond::DiamondHitStats>,
     cov_delta_thresh: f64,
+    scores: &HashMap<String, (f64, String)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_summary.csv");
     let mut f = File::create(path)?;
-    writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,taxonomy_score,taxonomy_status,warnings")?;
+    writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,taxonomy_score,taxonomy_status,warnings")?;
     for m in metrics {
         let warnings = if m.hits == 0 { "No DIAMOND hits" } else { "" };
         let s = stats.get(&m.gene_id);
@@ -506,9 +528,10 @@ fn write_csv_metrics(
         let cov_delta = s.map(|x| x.coverage_delta).unwrap_or(0.0);
         let cov_ratio = s.map(|x| x.coverage_ratio).unwrap_or(0.0);
         let fusion = if cov_delta > cov_delta_thresh { 1 } else { 0 };
+        let (final_score, classif) = scores.get(&m.gene_id).cloned().unwrap_or((0.0, String::new()));
         writeln!(
             f,
-            "{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{}",
+            "{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{},{}",
             m.gene_id,
             m.hits,
             top_hit,
@@ -520,6 +543,8 @@ fn write_csv_metrics(
             cov_delta,
             cov_ratio,
             fusion,
+            final_score,
+            classif,
             "",
             "disabled",
             warnings
@@ -608,6 +633,16 @@ fn scoring_weights(scoring: &Option<ScoringConfigOverride>) -> (f64, f64) {
     }
 }
 
+fn scoring_thresholds(scoring: &Option<ScoringConfigOverride>) -> (f64, f64) {
+    if let Some(cfg) = scoring {
+        let h = cfg.thresholds.as_ref().and_then(|t| t.high).unwrap_or(0.8);
+        let m = cfg.thresholds.as_ref().and_then(|t| t.medium).unwrap_or(0.5);
+        (h, m)
+    } else {
+        (0.8, 0.5)
+    }
+}
+
 fn compute_intrinsic_for_ids(
     fasta_path: &str,
     metrics: &[GeneMetrics],
@@ -657,6 +692,56 @@ fn stats_top_ids_for(
     ids.sort();
     ids.dedup();
     ids
+}
+
+fn build_config_snapshot<'a>(
+    cfg: &'a EffectiveConfig,
+    args: &'a AnalyzeArgs,
+    file_cfg: &'a FileConfig,
+) -> ConfigSnapshot<'a> {
+    let mut weights = HashMap::new();
+    if let Some(sc) = &file_cfg.scoring {
+        weights = sc.weights.clone();
+    } else {
+        weights.insert("homology".to_string(), 0.6);
+        weights.insert("intrinsic".to_string(), 0.4);
+    }
+    ConfigSnapshot {
+        fasta: &cfg.fasta,
+        db: &cfg.db,
+        out: &cfg.out,
+        threads: cfg.threads,
+        diamond_bin: &cfg.diamond_bin,
+        reference_fasta: cfg.reference_fasta.as_deref(),
+        alignment_top_hits: args.alignment_top_hits,
+        alignment_strategy: format!("{:?}", args.alignment_strategy),
+        coverage_delta_threshold: args.coverage_delta_threshold,
+        log_format: format!("{:?}", args.log_format),
+        scoring_weights: weights,
+    }
+}
+
+fn build_scores_map(
+    metrics: &[GeneMetrics],
+    stats: &HashMap<String, diamond::DiamondHitStats>,
+    intrinsic: &HashMap<String, (metrics::IntrinsicMetrics, Vec<u8>)>,
+    scoring: &Option<ScoringConfigOverride>,
+    cov_delta_thresh: f64,
+) -> HashMap<String, (f64, String)> {
+    let (w_h, w_i) = scoring_weights(scoring);
+    let (th_high, th_med) = scoring_thresholds(scoring);
+    let mut out: HashMap<String, (f64, String)> = HashMap::new();
+    for m in metrics {
+        let s = stats.get(&m.gene_id);
+        let default_im = metrics::IntrinsicMetrics::default();
+        let im = intrinsic.get(&m.gene_id).map(|t| &t.0).unwrap_or(&default_im);
+        let h = compute_homology_score(s);
+        let i = compute_intrinsic_score(im);
+        let score = combine_scores(h, i, w_h, w_i).final_score;
+        let classif = if score >= th_high { "High" } else if score >= th_med { "Medium" } else { "Low" };
+        out.insert(m.gene_id.clone(), (score, classif.to_string()));
+    }
+    out
 }
 
 // ... (rest of file unchanged for brevity in plan)

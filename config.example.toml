@@ -21,6 +21,10 @@ homology = 0.6
 intrinsic = 0.4
 taxonomy = 0.0
 
+[scoring.thresholds]
+high = 0.8
+medium = 0.5
+
 [scoring.homology]
 qcov_min = 0.75
 scov_min = 0.75

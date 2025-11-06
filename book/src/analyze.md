@@ -31,17 +31,16 @@ intrinsic = 0.4
 cargo run -- analyze --config config.example.toml
 ```
 
-This produces `results/qc_report.jsonl`, `results/qc_summary.csv`, and `results/run.json` (manifest with tool versions and resolved configuration).
+This produces `results/qc_report.jsonl`, `results/qc_summary.csv`, and `results/run.json` (manifest with schema_version, tool versions, file hashes, and a config snapshot).
 
 ## JSONL Scorecard Snapshot
 
-Each JSON line records the final score, per-pillar components, evidence blocks, and warnings. New fields include coverage metrics and a fusion/split flag, plus intrinsic metrics. When MAFFT is enabled, an alignment block is present.
+Each JSON line records the final score, per-pillar components, evidence blocks, and warnings. Fields include homology coverage metrics and a fusion/split flag, intrinsic metrics, and (optionally) an alignment block when MAFFT is enabled.
 
 ```json
 {
   "gene_id": "Gene00042",
   "final_score": 0.87,
-  "classification": "High",
   "score_components": { "homology": 0.92, "intrinsic": 0.81 },
   "homology": {
     "hits_count": 12,
@@ -84,10 +83,11 @@ Rows with potential issues advertise warnings such as missing start/stop codons,
 
 ## CSV Columns
 
-`qc_summary.csv` contains headline homology numbers, coverage metrics, and a `warnings` column for quick filtering:
+`qc_summary.csv` contains headline homology numbers, coverage metrics, final_score, an optional classification, and a `warnings` column for quick filtering:
 
 ```
-gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,taxonomy_score,taxonomy_status,warnings
+gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,taxonomy_score,taxonomy_status,warnings
+Gene00042,12,sp|P12345|REF_HUMAN,212.600,3.20e-68,0.940,0.910,3.210,0.030,1.030,0,0.870,High,,,
 ```
 
 The CSV is suitable for spreadsheets or dashboards, while the JSONL is richer for downstream pipelines.

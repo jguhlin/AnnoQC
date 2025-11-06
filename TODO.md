@@ -41,6 +41,7 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 - [ ] `analyze`: read input → schedule tasks → parse DIAMOND → compute metrics → emit outputs.
 - [x] Read input + schedule tasks + emit minimal outputs.
 - [x] Emit enriched homology fields in JSONL and CSV.
+- [x] Add final_score and classification to CSV; JSONL contains per-pillar scores and final_score.
 
 ## Testing & CI
 
@@ -60,6 +61,7 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 - [ ] Run manifest (tool versions, config snapshot, checksums) at `results/run.json`.
 - [x] Basic run manifest with tool versions (diamond/mafft/hmmscan) and inputs.
 - [x] Add file hashes for FASTA and DB (xx64).
+- [x] Manifest includes schema_version and a config snapshot (resolved settings & weights).
 - [ ] Schema versioning for outputs; CSV headers include tool versions.
 
 ## Caching & Resume
@@ -91,4 +93,5 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 ## Packaging & Docs
 
 - [ ] mdBook pages aligned for prepare/analyze/metrics & scoring.
+- [x] Update analyze docs to reflect new JSONL/CSV fields and manifest contents.
 - [ ] Release artifacts (Linux/macOS/Windows), optional Docker image.
