@@ -12,6 +12,7 @@ mod checkpoint;
 mod diamond;
 mod ecs;
 mod mafft;
+mod hmmer;
 mod metrics;
 mod preflight;
 mod provenance;
@@ -23,6 +24,7 @@ use diamond::{
 };
 use ecs::{run_scheduler, EcsConfig, GeneMetrics};
 use mafft::{load_sequences_by_ids, run_mafft, AlignmentMetrics};
+use hmmer::{run_hmmscan, HmmscanSummary};
 use metrics::compute_intrinsic;
 use scoring::{combine_scores, compute_homology_score, compute_intrinsic_score};
 use preflight::preflight;
@@ -124,6 +126,8 @@ struct AnalyzeArgs {
     pfam_metadata: Option<String>,
     #[arg(long)]
     pfam_clans: Option<String>,
+    #[arg(long)]
+    pfam_db: Option<String>,
     #[arg(long, value_enum, default_value_t = DiamondMode::Auto)]
     diamond_mode: DiamondMode,
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
@@ -184,6 +188,7 @@ struct FileConfig {
     taxonomy_taxdump_dir: Option<String>,
     pfam_metadata: Option<String>,
     pfam_clans: Option<String>,
+    pfam_db: Option<String>,
     diamond_mode: Option<DiamondMode>,
 }
 
@@ -252,8 +257,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 threads: cfg.threads,
                 out_dir: cfg.out.clone(),
                 out_name: "diamond.blastp.tsv".to_string(),
+                retries: 2,
             };
-            let diamond_tsv = blastp_once(&dia_cfg)?;
+            let diamond_tsv = match args.diamond_mode {
+                DiamondMode::Single => diamond::blastp_chunked(&dia_cfg, args.batch_size.max(1))?,
+                _ => blastp_once(&dia_cfg)?,
+            };
 
             // ECS: compute per-gene metrics from FASTA and DIAMOND
     let metrics: Vec<GeneMetrics> = run_scheduler(EcsConfig {
@@ -296,14 +305,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Optional HMMER/Pfam domain summary (JSONL only for now)
+            let mut hmmsum_map: HashMap<String, HmmscanSummary> = HashMap::new();
+            if let (Some(hmm), Some(pfam_db)) = (args.hmmscan_bin.as_ref(), file_cfg.pfam_db.as_ref()) {
+                for (gid, (_im, qseq)) in &intrinsic_map {
+                    if let Ok(sum) = run_hmmscan(hmm, pfam_db, gid, qseq) {
+                        hmmsum_map.insert(gid.clone(), sum);
+                    }
+                }
+            }
+
             // Emit outputs
             let stats = parse_tsv_stats(&diamond_tsv).unwrap_or_default();
             let checksums = collect_checksums(&cfg)?;
             let snapshot = build_config_snapshot(&cfg, &args, &file_cfg);
             write_run_manifest(&cfg, &tools, &checksums, &snapshot)?;
             let scores_map = build_scores_map(&metrics, &stats, &intrinsic_map, &file_cfg.scoring, args.coverage_delta_threshold);
-            write_jsonl_metrics(&cfg.out, &metrics, &stats, &intrinsic_map, &alignment_map, args.coverage_delta_threshold, &file_cfg.scoring)?;
-            write_csv_metrics(&cfg.out, &metrics, &stats, args.coverage_delta_threshold, &scores_map, &alignment_map)?;
+            write_jsonl_metrics(&cfg.out, &metrics, &stats, &intrinsic_map, &alignment_map, &hmmsum_map, args.coverage_delta_threshold, &file_cfg.scoring, &file_cfg, args.enable_taxonomy)?;
+            write_csv_metrics(&cfg.out, &metrics, &stats, args.coverage_delta_threshold, &scores_map, &alignment_map, &file_cfg, args.enable_taxonomy)?;
             Ok(())
         }
         Commands::TaxonomyCache(t) => {
@@ -432,8 +451,11 @@ fn write_jsonl_metrics(
     stats: &std::collections::HashMap<String, diamond::DiamondHitStats>,
     intrinsic_map: &std::collections::HashMap<String, (metrics::IntrinsicMetrics, Vec<u8>)>,
     alignment_map: &std::collections::HashMap<String, mafft::AlignmentMetrics>,
+    hmmsum_map: &std::collections::HashMap<String, hmmer::HmmscanSummary>,
     cov_delta_thresh: f64,
     scoring: &Option<ScoringConfigOverride>,
+    file_cfg: &FileConfig,
+    taxonomy_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_report.jsonl");
     let mut f = File::create(path)?;
@@ -454,9 +476,19 @@ fn write_jsonl_metrics(
         let (w_h, w_i) = scoring_weights(scoring);
         let scores = combine_scores(homology_score, intrinsic_score, w_h, w_i);
         let fusion_split_flag = summary.map(|s| s.coverage_delta > cov_delta_thresh).unwrap_or(false);
+        let taxonomy = if taxonomy_enabled {
+            if let Some(s) = summary {
+                serde_json::json!({"status":"enabled", "top_hit_taxon": s.top_sseqid})
+            } else { serde_json::json!({"status":"enabled"}) }
+        } else { serde_json::json!({"status":"disabled"}) };
+        let domains = hmmsum_map.get(&m.gene_id).map(|d| serde_json::json!({
+            "hits_count": d.hits_count,
+            "top_accession": d.top_accession,
+            "top_evalue": d.top_evalue
+        }));
         let record = serde_json::json!({
             "gene_id": m.gene_id,
-            "taxonomy": {"status": "disabled"},
+            "taxonomy": taxonomy,
             "score_components": {"taxonomy": serde_json::Value::Null, "homology": scores.homology, "intrinsic": scores.intrinsic},
             "final_score": scores.final_score,
             "homology": {
@@ -488,6 +520,7 @@ fn write_jsonl_metrics(
                 "max_gap_run": a.max_gap_run,
                 "motif_mismatch_fraction": a.motif_mismatch_fraction,
             })),
+            "domains": domains,
             "warnings": warnings,
         });
         writeln!(f, "{}", serde_json::to_string(&record)?)?;
@@ -502,6 +535,8 @@ fn write_csv_metrics(
     cov_delta_thresh: f64,
     scores: &HashMap<String, (f64, String)>,
     alignment_map: &std::collections::HashMap<String, mafft::AlignmentMetrics>,
+    file_cfg: &FileConfig,
+    taxonomy_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_summary.csv");
     let mut f = File::create(path)?;
@@ -558,7 +593,7 @@ fn write_csv_metrics(
             gap_runs,
             max_gap,
             "",
-            "disabled",
+            if taxonomy_enabled { "enabled" } else { "disabled" },
             warnings
         )?;
     }

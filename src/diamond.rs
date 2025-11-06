@@ -11,6 +11,7 @@ pub struct DiamondConfig {
     pub threads: usize,
     pub out_dir: String,
     pub out_name: String,
+    pub retries: usize,
 }
 
 impl DiamondConfig {
@@ -49,27 +50,90 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
         .map_err(|e| format!("create out_dir {}: {}", cfg.out_dir, e))?;
 
     let outfmt = "6 qseqid sseqid bitscore evalue length qcovhsp scovhsp pident";
-    let status = Command::new(&cfg.bin)
-        .arg("blastp")
-        .arg("--db")
-        .arg(&cfg.db)
-        .arg("--query")
-        .arg(&cfg.query_fasta)
-        .arg("--outfmt")
-        .arg(outfmt)
-        .arg("--threads")
-        .arg(cfg.threads.to_string())
-        .arg("--max-target-seqs")
-        .arg("25")
-        .arg("--quiet")
-        .arg("--out")
-        .arg(&out_path)
-        .status()
-        .map_err(|e| format!("failed to run diamond blastp: {}", e))?;
-    if !status.success() {
-        return Err(format!("diamond blastp exited with status {}", status));
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        let status = Command::new(&cfg.bin)
+            .arg("blastp")
+            .arg("--db")
+            .arg(&cfg.db)
+            .arg("--query")
+            .arg(&cfg.query_fasta)
+            .arg("--outfmt")
+            .arg(outfmt)
+            .arg("--threads")
+            .arg(cfg.threads.to_string())
+            .arg("--max-target-seqs")
+            .arg("25")
+            .arg("--quiet")
+            .arg("--out")
+            .arg(&out_path)
+            .status()
+            .map_err(|e| format!("failed to run diamond blastp: {}", e))?;
+        if status.success() { break; }
+        if attempts > cfg.retries.max(1) { return Err(format!("diamond blastp exited with status {} after {} attempts", status, attempts)); }
+        std::thread::sleep(std::time::Duration::from_millis(500 * attempts as u64));
     }
     Ok(out_path)
+}
+
+/// Chunked mode: split queries into chunks of `chunk_size` records and append outputs.
+pub fn blastp_chunked(cfg: &DiamondConfig, chunk_size: usize) -> Result<PathBuf, String> {
+    use needletail::parse_fastx_file;
+    let out_path = cfg.out_path();
+    if out_path.exists() { std::fs::remove_file(&out_path).ok(); }
+    fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
+    let outfmt = "6 qseqid sseqid bitscore evalue length qcovhsp scovhsp pident";
+    let mut reader = parse_fastx_file(&cfg.query_fasta).map_err(|e| e.to_string())?;
+    let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut tmp_idx = 0usize;
+    while let Some(rec) = reader.next() {
+        let rec = rec.map_err(|e| e.to_string())?;
+        let id = String::from_utf8_lossy(rec.id()).to_string();
+        batch.push((id, rec.seq().to_vec()));
+        if batch.len() >= chunk_size {
+            run_chunk(&batch, &mut tmp_idx, &out_path, outfmt, cfg)?; batch.clear();
+        }
+    }
+    if !batch.is_empty() { run_chunk(&batch, &mut tmp_idx, &out_path, outfmt, cfg)?; }
+    Ok(out_path)
+}
+
+fn run_chunk(batch: &[(String, Vec<u8>)], idx: &mut usize, out_path: &Path, outfmt: &str, cfg: &DiamondConfig) -> Result<(), String> {
+    use std::io::Write;
+    let tmpfasta = out_path.with_extension(format!("chunk{}.fa", *idx));
+    *idx += 1;
+    {
+        let mut f = std::fs::File::create(&tmpfasta).map_err(|e| e.to_string())?;
+        for (id, seq) in batch {
+            writeln!(f, ">{}", id).map_err(|e| e.to_string())?;
+            writeln!(f, "{}", String::from_utf8_lossy(seq)).map_err(|e| e.to_string())?;
+        }
+    }
+    let tmpout = out_path.with_extension(format!("chunk{}.tsv", *idx));
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        let status = Command::new(&cfg.bin)
+            .arg("blastp")
+            .arg("--db").arg(&cfg.db)
+            .arg("--query").arg(&tmpfasta)
+            .arg("--outfmt").arg(outfmt)
+            .arg("--threads").arg("1")
+            .arg("--max-target-seqs").arg("25")
+            .arg("--quiet")
+            .arg("--out").arg(&tmpout)
+            .status().map_err(|e| e.to_string())?;
+        if status.success() { break; }
+        if attempts > cfg.retries.max(1) { return Err(format!("diamond chunk blastp failed status {} after {} attempts", status, attempts)); }
+        std::thread::sleep(std::time::Duration::from_millis(300 * attempts as u64));
+    }
+    // Append
+    let mut out = std::fs::OpenOptions::new().create(true).append(true).open(out_path).map_err(|e| e.to_string())?;
+    let chunk = std::fs::read(&tmpout).map_err(|e| e.to_string())?;
+    out.write_all(&chunk).map_err(|e| e.to_string())?;
+    std::fs::remove_file(tmpfasta).ok(); std::fs::remove_file(tmpout).ok();
+    Ok(())
 }
 
 /// Run DIAMOND linclust to quickly cluster a reference FASTA. Idempotent via `.done` file.
