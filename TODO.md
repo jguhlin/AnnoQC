@@ -83,9 +83,9 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 
 ## Next Up (prioritized)
 
-- [ ] Schema versioning and config snapshot in run.json.
-- [ ] JSON log mode and progress counters in analyze loop.
-- [ ] Reciprocal coverage delta, fusion/split heuristics, and initial scoring weights.
+- [x] Schema versioning (run.json) and include basic config weights/hash info.
+- [x] JSON log mode and progress counters in analyze loop.
+- [x] Reciprocal coverage delta, fusion/split heuristics, and initial scoring weights.
 - [ ] Optional MAFFT conserved-region metrics for top-N hits integrated into CSV.
 
 ## Packaging & Docs

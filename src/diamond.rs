@@ -140,6 +140,8 @@ pub struct DiamondHitStats {
     pub top_scov: f64,
     pub top_len: usize,
     pub top_pident: f64,
+    pub coverage_delta: f64,
+    pub coverage_ratio: f64,
 }
 
 /// Parse diamond tsv produced by `blastp_once` and compute per-query top-hit stats.
@@ -179,6 +181,8 @@ pub fn parse_tsv_stats(
             entry.top_scov = scov;
             entry.top_len = alen;
             entry.top_pident = pident;
+            entry.coverage_delta = (qcov - scov).abs();
+            entry.coverage_ratio = if scov > 0.0 { qcov / scov } else { 0.0 };
         }
     }
     Ok(map)

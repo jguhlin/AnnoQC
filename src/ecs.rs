@@ -5,12 +5,14 @@ use bevy_ecs::prelude::*;
 use bevy_tasks::{AsyncComputeTaskPool, Task, TaskPoolBuilder};
 use futures_lite::future::{block_on, poll_once};
 use needletail::parse_fastx_file;
+use std::time::{Duration, Instant};
 
 #[derive(Resource, Clone)]
 pub struct EcsConfig {
     pub fasta_path: String,
     pub diamond_tsv: String,
     pub threads: usize,
+    pub log_json: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +47,15 @@ struct InFlight {
 #[derive(Resource, Default)]
 struct LengthMap(pub HashMap<String, usize>);
 
+#[derive(Resource)]
+struct Progress {
+    start: Instant,
+    last_log: Instant,
+    processed: usize,
+    total: usize,
+    log_json: bool,
+}
+
 fn intake_system(mut commands: Commands, cfg: Res<EcsConfig>) {
     // Parse FASTA ids and lengths
     let mut ids = VecDeque::new();
@@ -77,6 +88,7 @@ fn intake_system(mut commands: Commands, cfg: Res<EcsConfig>) {
     }
 
     // Convert ids to a queue; lengths needed by tasks
+    let total = ids.len();
     commands.insert_resource(WorkQueue { ids, hit_counts });
     commands.insert_resource(Results::default());
     commands.insert_resource(InFlight {
@@ -84,6 +96,8 @@ fn intake_system(mut commands: Commands, cfg: Res<EcsConfig>) {
         max_in_flight: cfg.threads.max(1),
     });
     commands.insert_resource(LengthMap(lengths));
+    let now = Instant::now();
+    commands.insert_resource(Progress { start: now, last_log: now, processed: 0, total, log_json: cfg.log_json });
 }
 
 fn schedule_system(
@@ -111,16 +125,28 @@ fn schedule_system(
     }
 }
 
-fn collect_system(mut inflight: ResMut<InFlight>, mut results: ResMut<Results>) {
+fn collect_system(mut inflight: ResMut<InFlight>, mut results: ResMut<Results>, mut prog: ResMut<Progress>) {
     let mut i = 0;
     while i < inflight.tasks.len() {
         let done = block_on(poll_once(&mut inflight.tasks[i]));
         if let Some(metrics) = done {
             results.records.push(metrics);
             let _ = inflight.tasks.swap_remove(i);
+            prog.processed += 1;
         } else {
             i += 1;
         }
+    }
+    let now = Instant::now();
+    if now.duration_since(prog.last_log) > Duration::from_secs(1) || (prog.processed % 100 == 0 && prog.processed > 0) {
+        let dt = now.duration_since(prog.start).as_secs_f64().max(1e-6);
+        let rate = (prog.processed as f64) / dt;
+        if prog.log_json {
+            log::info!("{}", serde_json::json!({"event":"progress","processed":prog.processed,"total":prog.total,"rate":format!("{:.2}",rate)}));
+        } else {
+            log::info!("progress: {}/{} ({:.2} genes/s)", prog.processed, prog.total, rate);
+        }
+        prog.last_log = now;
     }
 }
 

@@ -35,7 +35,7 @@ This produces `results/qc_report.jsonl`, `results/qc_summary.csv`, and `results/
 
 ## JSONL Scorecard Snapshot
 
-Each JSON line records the final score, per-pillar components, evidence blocks, and warnings:
+Each JSON line records the final score, per-pillar components, evidence blocks, and warnings. New fields include coverage metrics and a fusion/split flag, plus intrinsic metrics. When MAFFT is enabled, an alignment block is present.
 
 ```json
 {
@@ -84,12 +84,10 @@ Rows with potential issues advertise warnings such as missing start/stop codons,
 
 ## CSV Columns
 
-`qc_summary.csv` contains the same headline numbers plus a `warnings` column for quick filtering:
+`qc_summary.csv` contains headline homology numbers, coverage metrics, and a `warnings` column for quick filtering:
 
 ```
-gene_id,hits_count,top_hit,top_bitscore,...,mafft_motif_mismatch_fraction,low_complexity_fraction,low_complexity_windows,orf_has_start,orf_has_stop,orf_internal_stop,warnings
-Gene00042,12,sp|P12345|REF_HUMAN,212.600,3.20e-68,0.940,0.910,3.210000,1.030,0.030,0,0.0000,5,0.9200,0.8100,0.8700,high,0.890,0.860,6,0.040,1,4,0.1100,0.0800,2,1,1,0,
-Gene00077,4,sp|Q8XXX7|ALT_MOUSE,98.300,2.50e-18,0.540,0.310,1.820000,1.742,0.230,1,0.1200,14,0.4200,0.5100,0.4660,medium,0.420,0.380,5,0.120,3,9,0.5800,0.2700,9,0,0,1,Internal stop codon detected;High low-complexity content (27.0% windows)
+gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,taxonomy_score,taxonomy_status,warnings
 ```
 
 The CSV is suitable for spreadsheets or dashboards, while the JSONL is richer for downstream pipelines.

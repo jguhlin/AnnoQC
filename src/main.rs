@@ -16,6 +16,7 @@ mod metrics;
 mod preflight;
 mod provenance;
 mod taxonomy;
+mod scoring;
 use diamond::{
     blastp_once, cluster as diamond_cluster, linclust as diamond_linclust, parse_tsv_stats,
     version as diamond_version, DiamondConfig,
@@ -23,6 +24,7 @@ use diamond::{
 use ecs::{run_scheduler, EcsConfig, GeneMetrics};
 use mafft::{load_sequences_by_ids, run_mafft, AlignmentMetrics};
 use metrics::compute_intrinsic;
+use scoring::{combine_scores, compute_homology_score, compute_intrinsic_score};
 use preflight::preflight;
 use provenance::filehash_xx64;
 use taxonomy::TaxonomyResolver;
@@ -66,6 +68,12 @@ enum DiamondMode {
     Auto,
     Batch,
     Single,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum, Serialize, Deserialize)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Args, Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +126,10 @@ struct AnalyzeArgs {
     pfam_clans: Option<String>,
     #[arg(long, value_enum, default_value_t = DiamondMode::Auto)]
     diamond_mode: DiamondMode,
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+    #[arg(long, default_value_t = 0.25)]
+    coverage_delta_threshold: f64,
 }
 
 #[derive(Args, Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +148,8 @@ struct PrepareArgs {
     diamond_bin: Option<String>,
     #[arg(long, default_value_t = false)]
     resume: bool,
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
 }
 
 #[derive(Args, Debug, Clone, Serialize, Deserialize)]
@@ -235,11 +249,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let diamond_tsv = blastp_once(&dia_cfg)?;
 
             // ECS: compute per-gene metrics from FASTA and DIAMOND
-            let metrics: Vec<GeneMetrics> = run_scheduler(EcsConfig {
-                fasta_path: cfg.fasta.clone(),
-                diamond_tsv: diamond_tsv.to_string_lossy().to_string(),
-                threads: cfg.threads,
-            });
+    let metrics: Vec<GeneMetrics> = run_scheduler(EcsConfig {
+        fasta_path: cfg.fasta.clone(),
+        diamond_tsv: diamond_tsv.to_string_lossy().to_string(),
+        threads: cfg.threads,
+        log_json: matches!(args.log_format, LogFormat::Json),
+    });
 
             // Intrinsic metrics per gene
             let intrinsic_map = compute_intrinsic_for_ids(&cfg.fasta, &metrics)?;
@@ -278,8 +293,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let stats = parse_tsv_stats(&diamond_tsv).unwrap_or_default();
             let checksums = collect_checksums(&cfg)?;
             write_run_manifest(&cfg, &tools, &checksums)?;
-            write_jsonl_metrics(&cfg.out, &metrics, &stats, &intrinsic_map, &alignment_map)?;
-            write_csv_metrics(&cfg.out, &metrics, &stats)?;
+            write_jsonl_metrics(&cfg.out, &metrics, &stats, &intrinsic_map, &alignment_map, args.coverage_delta_threshold, &file_cfg.scoring)?;
+            write_csv_metrics(&cfg.out, &metrics, &stats, args.coverage_delta_threshold)?;
             Ok(())
         }
         Commands::TaxonomyCache(t) => {
@@ -396,6 +411,8 @@ fn write_jsonl_metrics(
     stats: &std::collections::HashMap<String, diamond::DiamondHitStats>,
     intrinsic_map: &std::collections::HashMap<String, (metrics::IntrinsicMetrics, Vec<u8>)>,
     alignment_map: &std::collections::HashMap<String, mafft::AlignmentMetrics>,
+    cov_delta_thresh: f64,
+    scoring: &Option<ScoringConfigOverride>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_report.jsonl");
     let mut f = File::create(path)?;
@@ -411,10 +428,16 @@ fn write_jsonl_metrics(
             .map(|t| t.0.clone())
             .unwrap_or_default();
         let aln = alignment_map.get(&m.gene_id);
+        let homology_score = compute_homology_score(summary);
+        let intrinsic_score = compute_intrinsic_score(&intrinsic);
+        let (w_h, w_i) = scoring_weights(scoring);
+        let scores = combine_scores(homology_score, intrinsic_score, w_h, w_i);
+        let fusion_split_flag = summary.map(|s| s.coverage_delta > cov_delta_thresh).unwrap_or(false);
         let record = serde_json::json!({
             "gene_id": m.gene_id,
             "taxonomy": {"status": "disabled"},
-            "score_components": {"taxonomy": serde_json::Value::Null},
+            "score_components": {"taxonomy": serde_json::Value::Null, "homology": scores.homology, "intrinsic": scores.intrinsic},
+            "final_score": scores.final_score,
             "homology": {
                 "hits_count": m.hits,
                 "top_hit": summary.and_then(|s| s.top_sseqid.clone()),
@@ -423,6 +446,9 @@ fn write_jsonl_metrics(
                 "top_qcov": summary.map(|s| s.top_qcov),
                 "top_scov": summary.map(|s| s.top_scov),
                 "bitscore_density": summary.map(|s| if s.top_len>0 { s.top_bitscore / s.top_len as f64 } else { 0.0 }),
+                "coverage_delta": summary.map(|s| s.coverage_delta),
+                "coverage_ratio": summary.map(|s| s.coverage_ratio),
+                "fusion_split_flag": fusion_split_flag,
             },
             "intrinsic": {
                 "ambiguous_fraction": intrinsic.ambiguous_fraction,
@@ -452,10 +478,11 @@ fn write_csv_metrics(
     out_dir: &str,
     metrics: &[ecs::GeneMetrics],
     stats: &std::collections::HashMap<String, diamond::DiamondHitStats>,
+    cov_delta_thresh: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_summary.csv");
     let mut f = File::create(path)?;
-    writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,taxonomy_score,taxonomy_status,warnings")?;
+    writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,taxonomy_score,taxonomy_status,warnings")?;
     for m in metrics {
         let warnings = if m.hits == 0 { "No DIAMOND hits" } else { "" };
         let s = stats.get(&m.gene_id);
@@ -476,9 +503,12 @@ fn write_csv_metrics(
         } else {
             (String::new(), 0.0, String::new(), 0.0, 0.0, 0.0)
         };
+        let cov_delta = s.map(|x| x.coverage_delta).unwrap_or(0.0);
+        let cov_ratio = s.map(|x| x.coverage_ratio).unwrap_or(0.0);
+        let fusion = if cov_delta > cov_delta_thresh { 1 } else { 0 };
         writeln!(
             f,
-            "{},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{},{}",
+            "{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{}",
             m.gene_id,
             m.hits,
             top_hit,
@@ -487,6 +517,9 @@ fn write_csv_metrics(
             top_qcov,
             top_scov,
             bsd,
+            cov_delta,
+            cov_ratio,
+            fusion,
             "",
             "disabled",
             warnings
@@ -507,7 +540,8 @@ fn prepare_cmd(p: PrepareArgs) -> Result<(), Box<dyn std::error::Error>> {
     let db_out = Path::new(&p.db_out);
     let db_done_buf = format!("{}.done", p.db_out);
     let db_done = Path::new(&db_done_buf);
-    checkpoint::run_step(db_done, p.resume, "diamond makedb", || {
+    let prep_json = matches!(p.log_format, LogFormat::Json);
+    checkpoint::run_step(db_done, p.resume, "diamond makedb", prep_json, || {
         if db_out.exists() {
             log::info!(
                 "makedb: {} exists; rebuilding due to resume=false",
@@ -531,7 +565,7 @@ fn prepare_cmd(p: PrepareArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Step 3: linclust -> clusters
     let clusters = Path::new("clusters");
     let clusters_done = Path::new("clusters.done");
-    checkpoint::run_step(clusters_done, p.resume, "diamond linclust", || {
+    checkpoint::run_step(clusters_done, p.resume, "diamond linclust", prep_json, || {
         diamond_linclust(&diamond_bin, &p.fasta, clusters, p.approx_id, p.threads)
             .map_err(|e| format!("linclust failed: {}", e))
     })?;
@@ -539,7 +573,7 @@ fn prepare_cmd(p: PrepareArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Step 4: cluster (sensitive) → clusters.realign
     let realign = Path::new("clusters.realign");
     let realign_done = Path::new("clusters.realign.done");
-    checkpoint::run_step(realign_done, p.resume, "diamond cluster", || {
+    checkpoint::run_step(realign_done, p.resume, "diamond cluster", prep_json, || {
         diamond_cluster(&diamond_bin, &p.fasta, realign, p.approx_id, p.threads)
             .map_err(|e| format!("cluster failed: {}", e))
     })?;
@@ -551,6 +585,7 @@ fn prepare_cmd(p: PrepareArgs) -> Result<(), Box<dyn std::error::Error>> {
         recluster_done,
         p.resume,
         "diamond recluster (placeholder)",
+        prep_json,
         || {
             if recluster.exists() {
                 std::fs::remove_file(recluster).ok();
@@ -561,6 +596,16 @@ fn prepare_cmd(p: PrepareArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     Ok(())
+}
+
+fn scoring_weights(scoring: &Option<ScoringConfigOverride>) -> (f64, f64) {
+    if let Some(cfg) = scoring {
+        let wh = *cfg.weights.get("homology").unwrap_or(&0.6);
+        let wi = *cfg.weights.get("intrinsic").unwrap_or(&0.4);
+        (wh, wi)
+    } else {
+        (0.6, 0.4)
+    }
 }
 
 fn compute_intrinsic_for_ids(
