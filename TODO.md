@@ -2,6 +2,17 @@
 
 Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 
+## Status Snapshot (2025-11-06)
+
+- Core CLI operational; run.json, qc_report.jsonl, qc_summary.csv emitted.
+- DIAMOND pre-run caching; retries; optional chunked mode; homology metrics incl. coverage_delta/ratio and fusion flag.
+- ECS minimal scheduler with JSON/text progress.
+- Intrinsic metrics; MAFFT metrics (optional) in JSONL and CSV.
+- Scoring: homology+intrinsic weights; thresholds; CSV final_score/classification; taxonomy weight plumbed (default 0.0).
+- Prepare: checkpointed makedb/linclust/cluster/recluster placeholder; `--resume`; JSON logs.
+- Manifest: schema_version, tool versions, file hashes, config snapshot.
+- HMMER/Pfam scaffolding (gated) with domtblout parser; JSONL domains summary.
+
 ## TODO Tracker
 
 - [ ] Stabilize `prepare` flow (download, validation, clustering artifacts).
@@ -77,10 +88,13 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 
 ## Completed in this iteration
 
-- DIAMOND pre-run caching before processing.
-- ECS scheduler scaffold consuming FASTA + DIAMOND TSV.
-- Enriched homology metrics in outputs.
-- Prepare checkpoints (`makedb`, `linclust`, `cluster`) and `.done` markers.
+- DIAMOND pre-run caching; retries; optional chunked mode.
+- ECS scheduler scaffold consuming FASTA + DIAMOND TSV; progress logs.
+- Enriched homology metrics; coverage delta/ratio; fusion/split flag.
+- Prepare checkpoints (`makedb`, `linclust`, `cluster`) with `--resume`.
+- Scoring weights + thresholds; CSV final_score/classification.
+- Manifest schema_version + config snapshot; file hashes.
+- MAFFT metrics (JSONL and CSV); HMMER/Pfam scaffolding and domains JSONL.
 
 
 ## Next Up (prioritized)
@@ -88,7 +102,49 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 - [x] Schema versioning (run.json) and include basic config weights/hash info.
 - [x] JSON log mode and progress counters in analyze loop.
 - [x] Reciprocal coverage delta, fusion/split heuristics, and initial scoring weights.
-- [ ] Optional MAFFT conserved-region metrics for top-N hits integrated into CSV.
+- [x] Optional MAFFT conserved-region metrics for top-N hits integrated into CSV.
+- [ ] Taxonomy pillar (Phase 2): lineage resolution + taxonomy_score and outputs
+  - Wire `TaxonomyResolver::from_sources(cache, reference_fasta, taxdump_dir)` and resolve top-hit accessions.
+  - JSONL: taxonomy {status, taxid, name, lineage[]} + scalar `taxonomy_score` (presence now, congruence later).
+  - CSV: add taxonomy_score when enabled; taxonomy_status already switches enabled/disabled.
+  - Scoring: include in `score_components` and weighted `final_score` when `[scoring.weights].taxonomy > 0`.
+  - Tests: add resolver unit tests with tiny headers/fixtures; smoke test unchanged when disabled.
+
+- [ ] Pfam/HMMER (Phase 2): domains_score + architecture summary
+  - Batch/threaded `hmmscan`; parse domtblout (parser present).
+  - JSONL: expand domains list (capped) and `domains_score`; config gates execution.
+  - Tests: tiny domtblout fixtures; no external calls in CI.
+
+- [ ] DIAMOND batch mode: Auto heuristics and chunk progress logs
+  - Implement `DiamondMode::Auto` decision by input size; JSON log per chunk (genes, secs, rate).
+  - Improve error reporting; capture tool stderr in logs.
+
+- [ ] Observability & Logs
+  - Analyze start/finish JSON events; durations and counters.
+  - Optional text progress bar (off in JSON mode); sidecar metrics file.
+
+- [ ] Docs & Packaging
+  - mdBook: add “Taxonomy & Domains” and “Scoring” pages; realistic examples.
+  - Quickstart outputs updated; optional Docker with DIAMOND/HMMER via Pixi.
+
+## Implementation Notes
+
+- Taxonomy (Phase 2)
+  - Source: `src/taxonomy.rs`; call after DIAMOND stats. Cache from FASTA or TSV; use `new_taxdump` for full lineage.
+  - Outputs: JSONL taxonomy block + taxonomy_score; CSV taxonomy_score when enabled; adjustable scoring weight.
+
+- HMMER/Pfam (Phase 2)
+  - Source: `src/hmmer.rs` (present). Add executor for batch/threaded hmmscan, then compute `domains_score`.
+  - Outputs: JSONL domains list and score; optional CSV columns later.
+
+- DIAMOND
+  - Chunked mode implemented; add `Auto` heuristics and per-chunk JSON logs.
+
+- Manifest
+  - `schema_version=1.0`; resolved config snapshot; consider adding classification thresholds explicitly.
+
+- Docs
+  - `book/src/analyze.md` updated; next add real JSONL/CSV samples from fixtures and a new “Taxonomy & Domains” page.
 
 ## Packaging & Docs
 

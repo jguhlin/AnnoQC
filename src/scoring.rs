@@ -35,3 +35,12 @@ pub fn combine_scores(homology: f64, intrinsic: f64, w_h: f64, w_i: f64) -> Scor
     ScoreBreakdown { homology, intrinsic, final_score }
 }
 
+pub fn compute_taxonomy_score(resolved: bool) -> f64 {
+    if resolved { 1.0 } else { 0.0 }
+}
+
+pub fn combine_scores3(h: f64, i: f64, t: f64, w_h: f64, w_i: f64, w_t: f64) -> ScoreBreakdown {
+    let sum = (w_h + w_i + w_t).max(1e-6);
+    let final_score = (w_h * h + w_i * i + w_t * t) / sum;
+    ScoreBreakdown { homology: h, intrinsic: i, final_score }
+}

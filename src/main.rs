@@ -26,7 +26,7 @@ use ecs::{run_scheduler, EcsConfig, GeneMetrics};
 use mafft::{load_sequences_by_ids, run_mafft, AlignmentMetrics};
 use hmmer::{run_hmmscan, HmmscanSummary};
 use metrics::compute_intrinsic;
-use scoring::{combine_scores, compute_homology_score, compute_intrinsic_score};
+use scoring::{combine_scores, combine_scores3, compute_homology_score, compute_intrinsic_score, compute_taxonomy_score};
 use preflight::preflight;
 use provenance::filehash_xx64;
 use taxonomy::TaxonomyResolver;
@@ -320,9 +320,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let checksums = collect_checksums(&cfg)?;
             let snapshot = build_config_snapshot(&cfg, &args, &file_cfg);
             write_run_manifest(&cfg, &tools, &checksums, &snapshot)?;
-            let scores_map = build_scores_map(&metrics, &stats, &intrinsic_map, &file_cfg.scoring, args.coverage_delta_threshold);
+            let scores_map = build_scores_map(&metrics, &stats, &intrinsic_map, &file_cfg.scoring, args.coverage_delta_threshold, args.enable_taxonomy);
+            let tax_map: HashMap<String, bool> = metrics.iter().map(|m| {
+                let has = stats.get(&m.gene_id).is_some(); (m.gene_id.clone(), has)
+            }).collect();
             write_jsonl_metrics(&cfg.out, &metrics, &stats, &intrinsic_map, &alignment_map, &hmmsum_map, args.coverage_delta_threshold, &file_cfg.scoring, &file_cfg, args.enable_taxonomy)?;
-            write_csv_metrics(&cfg.out, &metrics, &stats, args.coverage_delta_threshold, &scores_map, &alignment_map, &file_cfg, args.enable_taxonomy)?;
+            write_csv_metrics(&cfg.out, &metrics, &stats, args.coverage_delta_threshold, &scores_map, &alignment_map, &file_cfg, args.enable_taxonomy, &tax_map)?;
             Ok(())
         }
         Commands::TaxonomyCache(t) => {
@@ -473,8 +476,9 @@ fn write_jsonl_metrics(
         let aln = alignment_map.get(&m.gene_id);
         let homology_score = compute_homology_score(summary);
         let intrinsic_score = compute_intrinsic_score(&intrinsic);
-        let (w_h, w_i) = scoring_weights(scoring);
-        let scores = combine_scores(homology_score, intrinsic_score, w_h, w_i);
+        let taxonomy_score = if taxonomy_enabled { Some(compute_taxonomy_score(summary.is_some())) } else { None };
+        let (w_h, w_i, w_t) = scoring_weights3(scoring);
+        let scores = combine_scores3(homology_score, intrinsic_score, taxonomy_score.unwrap_or(0.0), w_h, w_i, w_t);
         let fusion_split_flag = summary.map(|s| s.coverage_delta > cov_delta_thresh).unwrap_or(false);
         let taxonomy = if taxonomy_enabled {
             if let Some(s) = summary {
@@ -489,7 +493,7 @@ fn write_jsonl_metrics(
         let record = serde_json::json!({
             "gene_id": m.gene_id,
             "taxonomy": taxonomy,
-            "score_components": {"taxonomy": serde_json::Value::Null, "homology": scores.homology, "intrinsic": scores.intrinsic},
+            "score_components": {"taxonomy": taxonomy_score, "homology": scores.homology, "intrinsic": scores.intrinsic},
             "final_score": scores.final_score,
             "homology": {
                 "hits_count": m.hits,
@@ -537,6 +541,7 @@ fn write_csv_metrics(
     alignment_map: &std::collections::HashMap<String, mafft::AlignmentMetrics>,
     file_cfg: &FileConfig,
     taxonomy_enabled: bool,
+    _tax_map: &HashMap<String, bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_summary.csv");
     let mut f = File::create(path)?;
@@ -690,6 +695,17 @@ fn scoring_thresholds(scoring: &Option<ScoringConfigOverride>) -> (f64, f64) {
     }
 }
 
+fn scoring_weights3(scoring: &Option<ScoringConfigOverride>) -> (f64, f64, f64) {
+    if let Some(cfg) = scoring {
+        let wh = *cfg.weights.get("homology").unwrap_or(&0.6);
+        let wi = *cfg.weights.get("intrinsic").unwrap_or(&0.4);
+        let wt = *cfg.weights.get("taxonomy").unwrap_or(&0.0);
+        (wh, wi, wt)
+    } else {
+        (0.6, 0.4, 0.0)
+    }
+}
+
 fn compute_intrinsic_for_ids(
     fasta_path: &str,
     metrics: &[GeneMetrics],
@@ -774,8 +790,9 @@ fn build_scores_map(
     intrinsic: &HashMap<String, (metrics::IntrinsicMetrics, Vec<u8>)>,
     scoring: &Option<ScoringConfigOverride>,
     cov_delta_thresh: f64,
+    taxonomy_enabled: bool,
 ) -> HashMap<String, (f64, String)> {
-    let (w_h, w_i) = scoring_weights(scoring);
+    let (w_h, w_i, w_t) = scoring_weights3(scoring);
     let (th_high, th_med) = scoring_thresholds(scoring);
     let mut out: HashMap<String, (f64, String)> = HashMap::new();
     for m in metrics {
@@ -784,7 +801,8 @@ fn build_scores_map(
         let im = intrinsic.get(&m.gene_id).map(|t| &t.0).unwrap_or(&default_im);
         let h = compute_homology_score(s);
         let i = compute_intrinsic_score(im);
-        let score = combine_scores(h, i, w_h, w_i).final_score;
+        let t = if taxonomy_enabled { compute_taxonomy_score(s.is_some()) } else { 0.0 };
+        let score = combine_scores3(h, i, t, w_h, w_i, w_t).final_score;
         let classif = if score >= th_high { "High" } else if score >= th_med { "Medium" } else { "Low" };
         out.insert(m.gene_id.clone(), (score, classif.to_string()));
     }

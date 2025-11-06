@@ -144,3 +144,22 @@ AnnoQC evaluates gene models using a multi-pillar evidence-based approach. Each 
 - Keep `book/` pages aligned: `prepare.md`, `analyze.md` examples, and a “Metrics & Scoring” page.
 - Maintain `BEVY_GUIDE.md` with recurring errors and fixes.
 - Add a quickstart with sample data and expected outputs for smoke testing.
+
+## Roadmap Update (2025-11-06)
+
+Recent completions
+- DIAMOND: pre-run caching, retries; optional chunked mode.
+- ECS scheduler scaffold with progress logs.
+- Homology coverage metrics (coverage_delta/ratio) + fusion/split flag.
+- Intrinsic metrics; MAFFT metrics (optional) in JSONL and CSV.
+- Scoring: homology+intrinsic weighted; thresholds; CSV final_score/classification.
+- Prepare checkpoints with `--resume` + JSON logs.
+- run.json manifest: schema_version, tool versions, file hashes, config snapshot.
+- HMMER/Pfam scaffolding and domtblout parser (gated).
+
+Planned next
+- Taxonomy pillar (Phase 2): lineage resolution and taxonomy_score (enabled via config/flag); expose in JSONL/CSV; add scoring weight.
+- Pfam/HMMER (Phase 2): batch/threaded hmmscan; domains_score; extend domains block and optional CSV columns.
+- DIAMOND Auto chunking + per-chunk JSON progress logs; better external-tool diagnostics.
+- Observability: analyze start/finish JSON events; optional text progress; sidecar metrics.
+- Docs: add “Taxonomy & Domains” and “Scoring” pages; realistic examples from fixtures.
