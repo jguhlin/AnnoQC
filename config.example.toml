@@ -1,0 +1,42 @@
+# Example config for `cargo run -- analyze --config config.example.toml`
+
+fasta = "input.faa"
+db = "uniprot_sprot.dmnd"
+threads = 16
+approx_id = 50
+member_cover = 80
+out = "results"
+mode = "auto"
+top = 5
+diamond_bin = "diamond"
+# hmmscan_bin = "/usr/bin/hmmscan"  # optional
+mafft_bin = "/usr/bin/mafft"       # optional, enables conserved-region alignment
+reference_fasta = "uniprot_sprot.fasta.gz"
+alignment_top_hits = 5
+alignment_strategy = "Auto"
+conserved_identity_min = 0.8
+
+[scoring.weights]
+homology = 0.6
+intrinsic = 0.4
+taxonomy = 0.0
+
+[scoring.homology]
+qcov_min = 0.75
+scov_min = 0.75
+density_min = 1.0
+evalue_max = 1e-5
+
+[scoring.intrinsic]
+ambiguous_max = 0.05
+max_homopolymer = 10
+
+[taxonomy]
+enabled = false
+min_support = 0.7
+# profile_db = "/path/to/pfam.hmm"
+require_domain_match = false
+# cache_path = "share/uniprot/uniprot_taxonomy.tsv"
+# taxdump_dir = "share/taxonomy/new_taxdump"
+# pfam_metadata = "share/pfam/Pfam-A.hmm.dat"
+# pfam_clans = "share/pfam/Pfam-A.clans.tsv"

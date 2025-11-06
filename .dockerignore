@@ -1,0 +1,10 @@
+target
+dist
+.git
+.gitignore
+Dockerfile
+README.md
+*.sfasta
+clusters*
+uniprot_sprot.*
+results

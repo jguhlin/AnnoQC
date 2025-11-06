@@ -17,3 +17,7 @@ Cargo.lock
 uniprot*
 clusters.*
 clusters
+results/
+# pixi environments
+.pixi/*
+!.pixi/config.toml

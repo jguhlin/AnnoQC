@@ -7,18 +7,24 @@ edition = "2021"
 opt-level = 3
 
 [dependencies]
-bevy_app = "0.10.0"
-bevy_ecs = "0.10.0"
+bevy_app = "0.17.2"
+bevy_ecs = "0.17.2"
 mimalloc = { version = "0.1.34", default-features = false }
 twox-hash = "1.6.3"
 once_cell = "1.17.0"
 strum = "0.24.1"
 strum_macros = "0.24.3"
 pulp = "0.11.5"
-libsfasta = { path = "../sfasta/libsfasta" }
 itertools = "0.10.5"
 clap = { version= "4.1.8", features = ["derive"] }
 log = "0.4.17"
 env_logger = "0.10.0"
 curl = "0.4.44"
-flate2 = "1.0.25"
+needletail = { version = "0.6.3", features = ["compression"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3.8"
+bevy_tasks = "0.17.2"
+futures-lite = "2.2"
