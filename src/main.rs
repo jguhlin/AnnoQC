@@ -443,7 +443,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let seqs = load_sequences_by_ids(ref_fasta, &all_ids).unwrap_or_default();
                 for g in &metrics {
                     let ids = panel_map.get(&g.gene_id).cloned().unwrap_or_default();
-                    if ids.is_empty() {
+                    // Gate start-concordance/MAFFT: require at least min_hits homologs in the panel
+                    if ids.len() < cons_cfg.min_hits {
                         continue;
                     }
                     let mut hits: HashMap<String, Vec<u8>> = HashMap::new();
@@ -548,15 +549,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(qsum) = hmmsum_map.get(&g.gene_id) {
                         let qsum_c = if let Some(ref clans) = clan_map { hmmer::collapse_by_clan(qsum, clans) } else { qsum.clone() };
                         let ref_ids = panel_map.get(&g.gene_id).cloned().unwrap_or_default();
+                        // Canonicalize panel IDs to match keys used in reference hmmscan map
+                        let ref_ids_canonical: Vec<String> = ref_ids.iter().map(|rid| taxonomy::canonical_accession(rid)).collect();
                         let mut ref_map_c: HashMap<String, HmmscanSummary> = HashMap::new();
-                        for rid in &ref_ids {
-                            let key = taxonomy::canonical_accession(rid);
-                            if let Some(s) = _ref_hmmsum_map.get(&key) {
+                        for key in &ref_ids_canonical {
+                            if let Some(s) = _ref_hmmsum_map.get(key) {
                                 let val = if let Some(ref clans) = clan_map { hmmer::collapse_by_clan(s, clans) } else { s.clone() };
                                 ref_map_c.insert(key.clone(), val);
                             }
                         }
-                        let dbg = hmmer::domains_architecture_diagnostics(&qsum_c, &ref_ids, &ref_map_c);
+                        // Light diagnostics if nothing matched (helps debugging join issues)
+                        if ref_map_c.is_empty() && !ref_ids_canonical.is_empty() {
+                            log::debug!(
+                                "ref_join_empty: gene={} panel_n={} keys_example={:?} ref_map_total={}",
+                                g.gene_id,
+                                ref_ids_canonical.len(),
+                                &ref_ids_canonical.iter().take(5).collect::<Vec<_>>(),
+                                _ref_hmmsum_map.len()
+                            );
+                        }
+                        let dbg = hmmer::domains_architecture_diagnostics(&qsum_c, &ref_ids_canonical, &ref_map_c);
                         let score = dbg.score;
                         domains_arch_map.insert(g.gene_id.clone(), score);
                         domains_arch_dbg.push((

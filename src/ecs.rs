@@ -144,6 +144,7 @@ fn collect_system(
     mut inflight: ResMut<InFlight>,
     mut results: ResMut<Results>,
     mut prog: ResMut<Progress>,
+    queue: Res<WorkQueue>,
 ) {
     let mut i = 0;
     while i < inflight.tasks.len() {
@@ -165,14 +166,23 @@ fn collect_system(
         if prog.log_json {
             log::info!(
                 "{}",
-                serde_json::json!({"event":"progress","processed":prog.processed,"total":prog.total,"rate":format!("{:.2}",rate)})
+                serde_json::json!({
+                    "event":"progress",
+                    "processed":prog.processed,
+                    "total":prog.total,
+                    "rate":format!("{:.2}",rate),
+                    "inflight": inflight.tasks.len(),
+                    "queue_remaining": queue.queue.len()
+                })
             );
         } else {
             log::info!(
-                "progress: {}/{} ({:.2} genes/s)",
+                "progress: {}/{} ({:.2} genes/s) inflight={} queue={}",
                 prog.processed,
                 prog.total,
-                rate
+                rate,
+                inflight.tasks.len(),
+                queue.queue.len()
             );
         }
         prog.last_log = now;

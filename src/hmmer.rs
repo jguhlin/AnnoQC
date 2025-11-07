@@ -288,6 +288,9 @@ pub fn domains_architecture_diagnostics(
     use std::collections::{HashMap, HashSet};
     let mut diag = DomainsArchDiagnostics::default();
     diag.panel_size = ref_ids.len();
+    // Always record query-side domain count (useful even if refs have none)
+    let qset: HashSet<&str> = query.hits.iter().map(|h| h.accession.as_str()).collect();
+    diag.query_domains = qset.len();
     if ref_ids.is_empty() { return diag; }
     let mut freq: HashMap<String, usize> = HashMap::new();
     let mut denom = 0usize;
@@ -319,8 +322,7 @@ pub fn domains_architecture_diagnostics(
     }
     diag.core_count = core.len();
     diag.accessory_count = acc.len();
-    let qset: HashSet<&str> = query.hits.iter().map(|h| h.accession.as_str()).collect();
-    diag.query_domains = qset.len();
+    // qset/diag.query_domains already computed above
     let core_count_f = diag.core_count as f64;
     diag.overlap_core = qset.iter().filter(|d| core.contains(**d)).count();
     diag.recall_core = if core_count_f > 0.0 { diag.overlap_core as f64 / core_count_f } else { 1.0 };

@@ -43,6 +43,15 @@ Formulas (implemented)
   - l = exp(−|z|/2). Also report length_ratio = Lq/m and length_class:
     - LikelyNTruncated if ratio < 0.8; LikelyNExtended if ratio > 1.2; else InRange.
 
+Start-concordance (gated)
+- Alignment-based assessment of whether the query begins at the consensus N-terminus of its homologs.
+- Requires a homolog panel of at least `min_hits` (default 5). If panel_size < `min_hits`, MAFFT is skipped and `start_concordance`/`start_class` are omitted.
+- Computation (when enabled):
+  - Align query + panel with MAFFT (threads = min(8, --threads)).
+  - Find first non-gap column per sequence; use the panel median as consensus start.
+  - start_concordance = clamp(1 − |query_start − consensus_start|/30, 0, 1).
+  - start_class: LikelyComplete (|Δ|≤3), LikelyNTruncated (Δ>3), LikelyNExtended (Δ<−3).
+
 - Final score
   - final_score = (w_h·h + w_i·i + w_t·t + w_d·d + w_l·l) / max(w_h + w_i + w_t + w_d + w_l, ε)
 
