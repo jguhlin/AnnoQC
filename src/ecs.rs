@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use bevy_app::{App, Startup, Update};
 use bevy_ecs::prelude::*;
@@ -18,6 +18,7 @@ pub struct EcsConfig {
 #[derive(Debug, Clone)]
 pub struct GeneMetrics {
     pub gene_id: String,
+    #[allow(dead_code)]
     pub length: usize,
     pub hits: usize,
 }
@@ -29,7 +30,7 @@ pub struct CompletionState {
 
 #[derive(Resource, Default)]
 struct WorkQueue {
-    ids: VecDeque<String>,
+    queue: Vec<(String, usize)>,
     hit_counts: HashMap<String, usize>,
 }
 
@@ -58,7 +59,7 @@ struct Progress {
 
 fn intake_system(mut commands: Commands, cfg: Res<EcsConfig>) {
     // Parse FASTA ids and lengths
-    let mut ids = VecDeque::new();
+    let mut ids: Vec<(String, usize)> = Vec::new();
     let mut lengths = HashMap::<String, usize>::new();
     let mut reader = parse_fastx_file(&cfg.fasta_path).expect("open fasta");
     while let Some(record) = reader.next() {
@@ -68,7 +69,8 @@ fn intake_system(mut commands: Commands, cfg: Res<EcsConfig>) {
         if gene.is_empty() {
             continue;
         }
-        ids.push_back(gene.clone());
+        // predictive cost: length + 100*hit_count (filled later)
+        ids.push((gene.clone(), 0));
         lengths.insert(gene, rec.seq().len());
     }
 
@@ -87,9 +89,16 @@ fn intake_system(mut commands: Commands, cfg: Res<EcsConfig>) {
         }
     }
 
-    // Convert ids to a queue; lengths needed by tasks
+    // Build predictive costs and sort heavy-first
+    for tup in ids.iter_mut() {
+        let (ref gid, ref mut cost) = tup;
+        let len = *lengths.get(gid).unwrap_or(&0);
+        let hits = *hit_counts.get(gid).unwrap_or(&0);
+        *cost = len + hits * 100;
+    }
+    ids.sort_by(|a, b| a.1.cmp(&b.1)); // ascending
     let total = ids.len();
-    commands.insert_resource(WorkQueue { ids, hit_counts });
+    commands.insert_resource(WorkQueue { queue: ids, hit_counts });
     commands.insert_resource(Results::default());
     commands.insert_resource(InFlight {
         tasks: Vec::new(),
@@ -97,7 +106,13 @@ fn intake_system(mut commands: Commands, cfg: Res<EcsConfig>) {
     });
     commands.insert_resource(LengthMap(lengths));
     let now = Instant::now();
-    commands.insert_resource(Progress { start: now, last_log: now, processed: 0, total, log_json: cfg.log_json });
+    commands.insert_resource(Progress {
+        start: now,
+        last_log: now,
+        processed: 0,
+        total,
+        log_json: cfg.log_json,
+    });
 }
 
 fn schedule_system(
@@ -107,7 +122,7 @@ fn schedule_system(
 ) {
     let pool = AsyncComputeTaskPool::get();
     while inflight.tasks.len() < inflight.max_in_flight {
-        let Some(gene) = queue.ids.pop_front() else {
+        let Some((gene, _cost)) = queue.queue.pop() else {
             break;
         };
         let length = *lengths.0.get(&gene).unwrap_or(&0);
@@ -125,26 +140,40 @@ fn schedule_system(
     }
 }
 
-fn collect_system(mut inflight: ResMut<InFlight>, mut results: ResMut<Results>, mut prog: ResMut<Progress>) {
+fn collect_system(
+    mut inflight: ResMut<InFlight>,
+    mut results: ResMut<Results>,
+    mut prog: ResMut<Progress>,
+) {
     let mut i = 0;
     while i < inflight.tasks.len() {
         let done = block_on(poll_once(&mut inflight.tasks[i]));
         if let Some(metrics) = done {
             results.records.push(metrics);
-            let _ = inflight.tasks.swap_remove(i);
+            drop(inflight.tasks.swap_remove(i));
             prog.processed += 1;
         } else {
             i += 1;
         }
     }
     let now = Instant::now();
-    if now.duration_since(prog.last_log) > Duration::from_secs(1) || (prog.processed % 100 == 0 && prog.processed > 0) {
+    if now.duration_since(prog.last_log) > Duration::from_secs(1)
+        || prog.processed.is_multiple_of(100)
+    {
         let dt = now.duration_since(prog.start).as_secs_f64().max(1e-6);
         let rate = (prog.processed as f64) / dt;
         if prog.log_json {
-            log::info!("{}", serde_json::json!({"event":"progress","processed":prog.processed,"total":prog.total,"rate":format!("{:.2}",rate)}));
+            log::info!(
+                "{}",
+                serde_json::json!({"event":"progress","processed":prog.processed,"total":prog.total,"rate":format!("{:.2}",rate)})
+            );
         } else {
-            log::info!("progress: {}/{} ({:.2} genes/s)", prog.processed, prog.total, rate);
+            log::info!(
+                "progress: {}/{} ({:.2} genes/s)",
+                prog.processed,
+                prog.total,
+                rate
+            );
         }
         prog.last_log = now;
     }
@@ -155,7 +184,7 @@ fn finish_system(
     inflight: Res<InFlight>,
     mut state: ResMut<CompletionState>,
 ) {
-    if queue.ids.is_empty() && inflight.tasks.is_empty() {
+    if queue.queue.is_empty() && inflight.tasks.is_empty() {
         state.finished = true;
     }
 }

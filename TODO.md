@@ -15,21 +15,20 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 
 ## TODO Tracker
 
-- [ ] Stabilize `prepare` flow (download, validation, clustering artifacts).
-- [ ] Implement initial homology + intrinsic scoring with JSONL/CSV outputs.
-- [ ] Expose scoring thresholds/weights via TOML config (`scoring.*`).
-- [ ] Add reciprocal coverage delta + fusion/split heuristic to scorecards.
-- [ ] Add conserved-region analysis (MAFFT conserved fractions & pairwise identity).
-- [ ] Extend intrinsic metrics (low complexity windows, ORF checks, entropy stats).
-- [ ] Integrate Bevy ECS scheduler for workload balancing and task orchestration.
-- [x] Minimal ECS scheduler scaffolding to compute per-gene metrics from FASTA + DIAMOND TSV.
-- [ ] Support batch-mode DIAMOND invocations to reduce process churn.
-- [ ] Implement taxonomy/domain evidence pillar (optional hmmscan integration).
+- [x] Stabilize `prepare` flow (download, validation, clustering artifacts).
+- [x] Implement initial homology + intrinsic scoring with JSONL/CSV outputs.
+- [x] Expose scoring thresholds/weights via TOML config (`scoring.*`).
+- [x] Add reciprocal coverage delta + fusion/split heuristic to scorecards.
+- [x] Add conserved-region analysis (MAFFT conserved fractions & pairwise identity).
+- [x] Extend intrinsic metrics (low complexity windows, ORF checks, entropy stats).
+- [x] Integrate Bevy ECS scheduler for workload balancing and task orchestration.
+- [x] Support batch-mode DIAMOND invocations + Auto heuristic + chunk logs.
+- [x] Implement taxonomy/domain evidence pillar (optional hmmscan integration).
 - [x] Build golden fixtures + CLI smoke tests in CI.
-- [ ] Document metrics & scoring in mdBook (`book/`) with examples.
+- [x] Document metrics & scoring in mdBook (`book/`) with examples.
 - [ ] Package releases (Linux/macOS/Windows) and optional Docker image.
 - [x] Build offline UniProt taxonomy cache + lineage resolver.
-- [ ] Integrate hmmscan + Pfam taxonomy heuristics into scoring model.
+- [ ] Integrate hmmscan + taxonomy congruence heuristics into scoring model (future).
 
 ## Goals
 
@@ -82,9 +81,9 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 
 ## Observability
 
-- [ ] Human-readable logs; optional JSON log format.
-- [ ] Progress and basic counters (genes/sec, queue sizes).
-- [x] Step-level timing and resume logging for prepare stages.
+- [x] Human-readable logs; optional JSON log format.
+- [x] Progress and basic counters (genes/sec, queue sizes).
+- [x] Step-level timing; analyze emits step_start/step_finish JSON; metrics sidecar.
 
 ## Completed in this iteration
 
@@ -103,25 +102,25 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 - [x] JSON log mode and progress counters in analyze loop.
 - [x] Reciprocal coverage delta, fusion/split heuristics, and initial scoring weights.
 - [x] Optional MAFFT conserved-region metrics for top-N hits integrated into CSV.
-- [ ] Taxonomy pillar (Phase 2): lineage resolution + taxonomy_score and outputs
+- [x] Taxonomy pillar (Phase 2): lineage resolution + taxonomy_score and outputs
   - Wire `TaxonomyResolver::from_sources(cache, reference_fasta, taxdump_dir)` and resolve top-hit accessions.
   - JSONL: taxonomy {status, taxid, name, lineage[]} + scalar `taxonomy_score` (presence now, congruence later).
   - CSV: add taxonomy_score when enabled; taxonomy_status already switches enabled/disabled.
   - Scoring: include in `score_components` and weighted `final_score` when `[scoring.weights].taxonomy > 0`.
   - Tests: add resolver unit tests with tiny headers/fixtures; smoke test unchanged when disabled.
 
-- [ ] Pfam/HMMER (Phase 2): domains_score + architecture summary
+- [x] Pfam/HMMER (Phase 2): domains_score + architecture summary
   - Batch/threaded `hmmscan`; parse domtblout (parser present).
   - JSONL: expand domains list (capped) and `domains_score`; config gates execution.
   - Tests: tiny domtblout fixtures; no external calls in CI.
 
-- [ ] DIAMOND batch mode: Auto heuristics and chunk progress logs
+- [x] DIAMOND batch mode: Auto heuristics and chunk progress logs
   - Implement `DiamondMode::Auto` decision by input size; JSON log per chunk (genes, secs, rate).
   - Improve error reporting; capture tool stderr in logs.
 
-- [ ] Observability & Logs
+- [x] Observability & Logs
   - Analyze start/finish JSON events; durations and counters.
-  - Optional text progress bar (off in JSON mode); sidecar metrics file.
+  - Optional text progress bar (off in JSON mode); metrics sidecar implemented.
 
 - [ ] Docs & Packaging
   - mdBook: add “Taxonomy & Domains” and “Scoring” pages; realistic examples.

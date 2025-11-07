@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
 use std::process::{Command, Stdio};
 
 use needletail::parse_fastx_file;
@@ -98,6 +97,7 @@ fn parse_fasta_sequences(s: &str) -> Vec<Vec<u8>> {
     seqs
 }
 
+#[allow(clippy::needless_range_loop)]
 fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
     if seqs.is_empty() {
         return AlignmentMetrics::default();
@@ -108,8 +108,7 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         return AlignmentMetrics::default();
     }
     let mut conserved = 0usize;
-    let mut pid_sum = 0usize;
-    let mut valid_cols = 0usize;
+    // formerly tracked pid_sum and valid_cols; not used in current metrics
     for c in 0..cols {
         let mut base = None;
         let mut all_same = true;
@@ -126,9 +125,6 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
                     base = Some(ch);
                 }
             }
-        }
-        if non_gap >= 2 {
-            valid_cols += 1;
         }
         if all_same && non_gap == n {
             conserved += 1;

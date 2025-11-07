@@ -2,6 +2,7 @@ use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct DiamondConfig {
@@ -20,20 +21,7 @@ impl DiamondConfig {
     }
 }
 
-pub fn version(bin: &str) -> Result<String, String> {
-    let output = Command::new(bin)
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("failed to execute '{} --version': {}", bin, e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "'{} --version' exited with status {}",
-            bin, output.status
-        ));
-    }
-    let v = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(v)
-}
+// version helper moved to preflight module
 
 /// Run DIAMOND blastp and write tabular output. Skips if output exists and is non-empty.
 pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
@@ -49,18 +37,30 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
     fs::create_dir_all(&cfg.out_dir)
         .map_err(|e| format!("create out_dir {}: {}", cfg.out_dir, e))?;
 
-    let outfmt = "6 qseqid sseqid bitscore evalue length qcovhsp scovhsp pident";
+    // Request explicit outfmt 6 columns by passing tokens separately.
+    let outfmt_tokens = [
+        "6",
+        "qseqid",
+        "sseqid",
+        "bitscore",
+        "evalue",
+        "length",
+        "qcovhsp",
+        "scovhsp",
+        "pident",
+    ];
     let mut attempts = 0usize;
     loop {
         attempts += 1;
-        let status = Command::new(&cfg.bin)
+        let mut cmd = Command::new(&cfg.bin);
+        let output = cmd
             .arg("blastp")
             .arg("--db")
             .arg(&cfg.db)
             .arg("--query")
             .arg(&cfg.query_fasta)
             .arg("--outfmt")
-            .arg(outfmt)
+            .args(outfmt_tokens)
             .arg("--threads")
             .arg(cfg.threads.to_string())
             .arg("--max-target-seqs")
@@ -68,38 +68,90 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
             .arg("--quiet")
             .arg("--out")
             .arg(&out_path)
-            .status()
+            .output()
             .map_err(|e| format!("failed to run diamond blastp: {}", e))?;
-        if status.success() { break; }
-        if attempts > cfg.retries.max(1) { return Err(format!("diamond blastp exited with status {} after {} attempts", status, attempts)); }
+        if output.status.success() {
+            break;
+        }
+        if attempts > cfg.retries.max(1) {
+            let mut ctx = String::from_utf8_lossy(&output.stderr).to_string();
+            if ctx.len() > 400 { ctx.truncate(400); }
+            return Err(format!("diamond blastp failed (attempt {}): status={} stderr='{}'", attempts, output.status, ctx));
+        }
         std::thread::sleep(std::time::Duration::from_millis(500 * attempts as u64));
     }
     Ok(out_path)
 }
 
 /// Chunked mode: split queries into chunks of `chunk_size` records and append outputs.
-pub fn blastp_chunked(cfg: &DiamondConfig, chunk_size: usize) -> Result<PathBuf, String> {
+/// If `log_json` is true, emits per-chunk JSON progress events.
+pub fn blastp_chunked(cfg: &DiamondConfig, chunk_size: usize, log_json: bool) -> Result<PathBuf, String> {
     use needletail::parse_fastx_file;
     let out_path = cfg.out_path();
-    if out_path.exists() { std::fs::remove_file(&out_path).ok(); }
+    if out_path.exists() {
+        std::fs::remove_file(&out_path).ok();
+    }
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
-    let outfmt = "6 qseqid sseqid bitscore evalue length qcovhsp scovhsp pident";
+    let outfmt_tokens = [
+        "6",
+        "qseqid",
+        "sseqid",
+        "bitscore",
+        "evalue",
+        "length",
+        "qcovhsp",
+        "scovhsp",
+        "pident",
+    ];
     let mut reader = parse_fastx_file(&cfg.query_fasta).map_err(|e| e.to_string())?;
     let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
     let mut tmp_idx = 0usize;
+    let start = Instant::now();
+    let mut processed = 0usize;
     while let Some(rec) = reader.next() {
         let rec = rec.map_err(|e| e.to_string())?;
         let id = String::from_utf8_lossy(rec.id()).to_string();
         batch.push((id, rec.seq().to_vec()));
         if batch.len() >= chunk_size {
-            run_chunk(&batch, &mut tmp_idx, &out_path, outfmt, cfg)?; batch.clear();
+            run_chunk(&batch, &mut tmp_idx, &out_path, &outfmt_tokens, cfg)?;
+            processed += batch.len();
+            if log_json {
+                let secs = start.elapsed().as_secs_f64();
+                let rate = if secs > 0.0 { processed as f64 / secs } else { 0.0 };
+                log::info!("{}", serde_json::json!({
+                    "event":"diamond_chunk","chunk_index": tmp_idx-1,
+                    "queries": batch.len(),"processed": processed,
+                    "seconds": format!("{:.2}", secs),
+                    "rate": format!("{:.2}", rate)
+                }));
+            }
+            batch.clear();
         }
     }
-    if !batch.is_empty() { run_chunk(&batch, &mut tmp_idx, &out_path, outfmt, cfg)?; }
+    if !batch.is_empty() {
+        run_chunk(&batch, &mut tmp_idx, &out_path, &outfmt_tokens, cfg)?;
+        processed += batch.len();
+        if log_json {
+            let secs = start.elapsed().as_secs_f64();
+            let rate = if secs > 0.0 { processed as f64 / secs } else { 0.0 };
+            log::info!("{}", serde_json::json!({
+                "event":"diamond_chunk","chunk_index": tmp_idx-1,
+                "queries": batch.len(),"processed": processed,
+                "seconds": format!("{:.2}", secs),
+                "rate": format!("{:.2}", rate)
+            }));
+        }
+    }
     Ok(out_path)
 }
 
-fn run_chunk(batch: &[(String, Vec<u8>)], idx: &mut usize, out_path: &Path, outfmt: &str, cfg: &DiamondConfig) -> Result<(), String> {
+fn run_chunk(
+    batch: &[(String, Vec<u8>)],
+    idx: &mut usize,
+    out_path: &Path,
+    outfmt_tokens: &[&str],
+    cfg: &DiamondConfig,
+) -> Result<(), String> {
     use std::io::Write;
     let tmpfasta = out_path.with_extension(format!("chunk{}.fa", *idx));
     *idx += 1;
@@ -114,26 +166,54 @@ fn run_chunk(batch: &[(String, Vec<u8>)], idx: &mut usize, out_path: &Path, outf
     let mut attempts = 0usize;
     loop {
         attempts += 1;
-        let status = Command::new(&cfg.bin)
+        let mut cmd = Command::new(&cfg.bin);
+        let output = cmd
             .arg("blastp")
-            .arg("--db").arg(&cfg.db)
-            .arg("--query").arg(&tmpfasta)
-            .arg("--outfmt").arg(outfmt)
-            .arg("--threads").arg("1")
-            .arg("--max-target-seqs").arg("25")
+            .arg("--db")
+            .arg(&cfg.db)
+            .arg("--query")
+            .arg(&tmpfasta)
+            .arg("--outfmt")
+            .args(outfmt_tokens)
+            .arg("--threads")
+            .arg("1")
+            .arg("--max-target-seqs")
+            .arg("25")
             .arg("--quiet")
-            .arg("--out").arg(&tmpout)
-            .status().map_err(|e| e.to_string())?;
-        if status.success() { break; }
-        if attempts > cfg.retries.max(1) { return Err(format!("diamond chunk blastp failed status {} after {} attempts", status, attempts)); }
+            .arg("--out")
+            .arg(&tmpout)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            break;
+        }
+        if attempts > cfg.retries.max(1) {
+            let mut ctx = String::from_utf8_lossy(&output.stderr).to_string();
+            if ctx.len() > 400 { ctx.truncate(400); }
+            return Err(format!("diamond chunk blastp failed after {} attempts: status={} stderr='{}'", attempts, output.status, ctx));
+        }
         std::thread::sleep(std::time::Duration::from_millis(300 * attempts as u64));
     }
     // Append
-    let mut out = std::fs::OpenOptions::new().create(true).append(true).open(out_path).map_err(|e| e.to_string())?;
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_path)
+        .map_err(|e| e.to_string())?;
     let chunk = std::fs::read(&tmpout).map_err(|e| e.to_string())?;
     out.write_all(&chunk).map_err(|e| e.to_string())?;
-    std::fs::remove_file(tmpfasta).ok(); std::fs::remove_file(tmpout).ok();
+    std::fs::remove_file(tmpfasta).ok();
+    std::fs::remove_file(tmpout).ok();
     Ok(())
+}
+
+/// Count FASTA records for auto mode selection.
+pub fn estimate_query_count(fasta: &str) -> Result<usize, String> {
+    use needletail::parse_fastx_file;
+    let mut reader = parse_fastx_file(fasta).map_err(|e| e.to_string())?;
+    let mut n = 0usize;
+    while let Some(r) = reader.next() { r.map_err(|e| e.to_string())?; n += 1; }
+    Ok(n)
 }
 
 /// Run DIAMOND linclust to quickly cluster a reference FASTA. Idempotent via `.done` file.
@@ -211,6 +291,7 @@ pub struct DiamondHitStats {
 /// Parse diamond tsv produced by `blastp_once` and compute per-query top-hit stats.
 pub fn parse_tsv_stats(
     tsv: &Path,
+    qlen_map: Option<&std::collections::HashMap<String, usize>>,
 ) -> Result<std::collections::HashMap<String, DiamondHitStats>, String> {
     let mut map: std::collections::HashMap<String, DiamondHitStats> = Default::default();
     if !tsv.exists() {
@@ -224,17 +305,37 @@ pub fn parse_tsv_stats(
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 8 {
-            continue;
-        }
         let q = cols[0];
         let sseqid = cols[1].to_string();
-        let bitscore = cols[2].parse::<f64>().unwrap_or(0.0);
-        let evalue = cols[3].to_string();
-        let alen = cols[4].parse::<usize>().unwrap_or(0);
-        let qcov = cols[5].parse::<f64>().unwrap_or(0.0);
-        let scov = cols[6].parse::<f64>().unwrap_or(0.0);
-        let pident = cols[7].parse::<f64>().unwrap_or(0.0);
+        let (bitscore, evalue, alen, qcov, scov, pident) = if cols.len() >= 8 && cols.len() < 12 {
+            // our requested outfmt: 6 qseqid sseqid bitscore evalue length qcovhsp scovhsp pident
+            (
+                cols[2].parse::<f64>().unwrap_or(0.0),
+                cols[3].to_string(),
+                cols[4].parse::<usize>().unwrap_or(0),
+                cols[5].parse::<f64>().unwrap_or(0.0) / 100.0,
+                cols[6].parse::<f64>().unwrap_or(0.0) / 100.0,
+                cols[7].parse::<f64>().unwrap_or(0.0),
+            )
+        } else if cols.len() >= 12 {
+            // default BLAST 6 order
+            let pident = cols[2].parse::<f64>().unwrap_or(0.0);
+            let alen = cols[3].parse::<usize>().unwrap_or(0);
+            let evalue = cols[10].to_string();
+            let bitscore = cols[11].parse::<f64>().unwrap_or(0.0);
+            // compute qcov from qstart/qend if we know query length
+            let qcov = if let Some(map) = qlen_map {
+                if let Some(qlen) = map.get(q) {
+                    let qstart = cols[6].parse::<f64>().unwrap_or(0.0);
+                    let qend = cols[7].parse::<f64>().unwrap_or(0.0);
+                    let span = (qend - qstart).abs() + 1.0;
+                    if *qlen > 0 { (span / (*qlen as f64)).clamp(0.0, 1.0) } else { 0.0 }
+                } else { 0.0 }
+            } else { 0.0 };
+            (bitscore, evalue, alen, qcov, 0.0, pident)
+        } else {
+            continue;
+        };
         let entry = map.entry(q.to_string()).or_default();
         entry.count += 1;
         if bitscore > entry.top_bitscore {

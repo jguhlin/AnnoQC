@@ -272,3 +272,49 @@ pub fn write_cache_from_fasta(fasta_path: &str, out_path: &str) -> Result<usize,
 pub fn infer_taxdump_dir(path: Option<&str>) -> Option<PathBuf> {
     path.map(PathBuf::from).filter(|p| p.exists())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TaxonomyResolver;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resolver_from_fasta_and_taxdump() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let fasta = tmp.path().join("ref.faa");
+        fs::write(
+            &fasta,
+            b">sp|P12345|SOME_PROT OX=562; GN=abc\nMKTIIALSYIFCLVFADYKDDD\n",
+        )?;
+        let taxdump = tmp.path().join("taxdump");
+        fs::create_dir_all(&taxdump)?;
+        fs::write(
+            taxdump.join("nodes.dmp"),
+            b"1 | 1 | no rank |\n562 | 1 | species |\n",
+        )?;
+        fs::write(
+            taxdump.join("names.dmp"),
+            b"1 | root | | scientific name |\n562 | Escherichia coli | | scientific name |\n",
+        )?;
+
+        let resolver = TaxonomyResolver::from_sources(
+            None,
+            Some(fasta.to_str().unwrap()),
+            Some(taxdump.to_str().unwrap()),
+        )?
+        .expect("resolver constructed");
+
+        let ts = resolver
+            .lookup("sp|P12345|SOME_PROT")
+            .expect("lookup returns");
+        assert_eq!(ts.taxid, 562);
+        assert_eq!(ts.name.as_deref(), Some("Escherichia coli"));
+        assert_eq!(
+            ts.lineage,
+            vec!["root".to_string(), "Escherichia coli".to_string()]
+        );
+
+        Ok(())
+    }
+}

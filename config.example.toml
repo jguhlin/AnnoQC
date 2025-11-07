@@ -6,7 +6,7 @@ threads = 16
 approx_id = 50
 member_cover = 80
 out = "results"
-mode = "auto"
+mode = "Auto"
 top = 5
 diamond_bin = "diamond"
 # hmmscan_bin = "/usr/bin/hmmscan"  # optional
@@ -44,3 +44,14 @@ require_domain_match = false
 # taxdump_dir = "share/taxonomy/new_taxdump"
 # pfam_metadata = "share/pfam/Pfam-A.hmm.dat"
 # pfam_clans = "share/pfam/Pfam-A.clans.tsv"
+
+# Optional HMMER and DIAMOND knobs
+pfam_db = "share/pfam/Pfam-A.hmm"
+
+[hmmer]
+top_n = 5
+# threads = 4 # optional override; defaults to global --threads
+
+[diamond]
+# When diamond_mode = "Auto", Single is used up to this threshold
+auto_threshold = 200000

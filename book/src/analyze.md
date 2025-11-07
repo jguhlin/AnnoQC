@@ -1,6 +1,6 @@
 # Analyze
 
-AnnoQC’s `analyze` subcommand combines DIAMOND homology searches, MAFFT conserved-region alignments, and intrinsic sequence checks to produce a per-gene scorecard. The JSONL output exposes detailed evidence, while the CSV mirrors the headline metrics for downstream dashboards.
+AnnoQC’s `analyze` subcommand combines DIAMOND homology searches, MAFFT conserved-region alignments, intrinsic sequence checks, and optional taxonomy resolution to produce a per-gene scorecard. The JSONL output exposes detailed evidence, while the CSV mirrors the headline metrics for downstream dashboards.
 
 ## Prerequisites
 
@@ -40,8 +40,9 @@ Each JSON line records the final score, per-pillar components, evidence blocks, 
 ```json
 {
   "gene_id": "Gene00042",
+  "taxonomy": { "status": "enabled", "taxid": 562, "name": "Escherichia coli", "lineage": ["root", "Escherichia coli"] },
   "final_score": 0.87,
-  "score_components": { "homology": 0.92, "intrinsic": 0.81 },
+  "score_components": { "homology": 0.92, "intrinsic": 0.81, "taxonomy": 1.0 },
   "homology": {
     "hits_count": 12,
     "top_hit": "sp|P12345|REF_HUMAN",
@@ -91,3 +92,15 @@ Gene00042,12,sp|P12345|REF_HUMAN,212.600,3.20e-68,0.940,0.910,3.210,0.030,1.030,
 ```
 
 The CSV is suitable for spreadsheets or dashboards, while the JSONL is richer for downstream pipelines.
+
+## Useful Options
+
+- HMMER/Pfam
+  - `--hmmscan-bin /path/to/hmmscan` and `pfam_db` in config enable domain summaries.
+  - `--hmmer-top-n N` or `[hmmer].top_n` (default 5) caps per-gene domain hits in JSONL.
+  - `--hmmer-threads N` or `[hmmer].threads` overrides threads used for hmmscan; otherwise uses global `--threads`.
+
+- DIAMOND mode
+  - `--diamond-mode auto|single|batch` (default `auto`).
+  - Auto uses Single up to `--diamond-auto-threshold` or `[diamond].auto_threshold` (default 200,000 queries), otherwise Batch.
+  - In Batch and `--log-format json`, per-chunk progress events are logged.
