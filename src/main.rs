@@ -33,7 +33,7 @@ use metrics::compute_intrinsic;
 use preflight::preflight;
 use provenance::filehash_xx64;
 use scoring::{
-    combine_scores3, compute_homology_score, compute_intrinsic_score, compute_taxonomy_score,
+    compute_homology_score, compute_intrinsic_score, compute_taxonomy_score,
 };
 use taxonomy::{TaxonSummary, TaxonomyResolver};
 
@@ -160,6 +160,8 @@ struct AnalyzeArgs {
     dump_matches_gene: Option<String>,
     #[arg(long, default_value_t = false)]
     nucleotide: bool,
+    #[arg(long)]
+    diamond_max_hsps: Option<usize>,
 }
 
 #[derive(Args, Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +246,7 @@ struct HmmerConfigOverride {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct DiamondConfigOverride {
     auto_threshold: Option<usize>,
+    max_hsps: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -360,6 +363,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 out_dir: cfg.out.clone(),
                 out_name: "diamond.blastp.tsv".to_string(),
                 retries: 2,
+                max_hsps: args
+                    .diamond_max_hsps
+                    .or_else(|| file_cfg.diamond.as_ref().and_then(|d| d.max_hsps))
+                    .unwrap_or(5),
             };
             let log_json = matches!(args.log_format, LogFormat::Json);
             let t_diamond = step_start("diamond", log_json);
@@ -1053,9 +1060,9 @@ fn write_csv_metrics(
     let path = Path::new(out_dir).join("qc_summary.csv");
     let mut f = File::create(path)?;
     if csv_verbose {
-        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,length_score,length_ratio,length_class,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,start_concordance,start_class,structvar_class,taxonomy_status,warnings")?;
+        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,length_score,length_ratio,length_class,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,start_concordance,start_class,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,taxonomy_status,warnings")?;
     } else {
-        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,structvar_class,taxonomy_score,taxonomy_status,warnings")?;
+        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,taxonomy_score,taxonomy_status,warnings")?;
     }
     for m in metrics {
         let warnings = if m.hits == 0 { "No DIAMOND hits" } else { "" };
@@ -1101,7 +1108,14 @@ fn write_csv_metrics(
             } else {
                 (0, 0.0, 0.0, 0, 0.0, 0, 0, 0.0, String::new())
             };
-        let structvar_class = sv_map.and_then(|sm| sm.get(&m.gene_id)).map(|sv| sv.classification.clone()).unwrap_or_default();
+        let (structvar_class, structvar_gap, structvar_left_len, structvar_right_len) = if let Some(sv) = sv_map.and_then(|sm| sm.get(&m.gene_id)) {
+            (
+                sv.classification.clone(),
+                sv.fusion_gap.map(|v| v.to_string()).unwrap_or_default(),
+                sv.fusion_left_len.map(|v| v.to_string()).unwrap_or_default(),
+                sv.fusion_right_len.map(|v| v.to_string()).unwrap_or_default(),
+            )
+        } else { (String::new(), String::new(), String::new(), String::new()) };
         let taxonomy_score = if taxonomy_enabled {
             compute_taxonomy_score(
                 taxsum_map
@@ -1167,42 +1181,47 @@ fn write_csv_metrics(
                 format!("{:.3}", start_conc),
                 start_class,
                 structvar_class,
+                structvar_gap,
+                structvar_left_len,
+                structvar_right_len,
                 taxonomy_status.to_string(),
                 warnings.to_string(),
             ].join(",");
             writeln!(f, "{}", row)?;
             continue;
         }
-        writeln!(
-            f,
-            "{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{},{:.3},{},{},{},{},{},{:.4},{},{}",
-            m.gene_id,
-            m.hits,
+        let row = vec![
+            m.gene_id.clone(),
+            m.hits.to_string(),
             top_hit,
-            top_bitscore,
+            format!("{:.3}", top_bitscore),
             top_evalue,
-            top_qcov,
-            top_scov,
-            bsd,
-            cov_delta,
-            cov_ratio,
-            fusion,
-            final_score,
+            format!("{:.3}", top_qcov),
+            format!("{:.3}", top_scov),
+            format!("{:.3}", bsd),
+            format!("{:.3}", cov_delta),
+            format!("{:.3}", cov_ratio),
+            fusion.to_string(),
+            format!("{:.3}", final_score),
             classif,
-            mafft_enabled,
-            conserved,
-            pid,
-            seqs_aln,
-            qgap,
-            gap_runs,
-            max_gap,
-            domains_arch_field,
+            mafft_enabled.to_string(),
+            format!("{:.3}", conserved),
+            format!("{:.3}", pid),
+            seqs_aln.to_string(),
+            format!("{:.3}", qgap),
+            gap_runs.to_string(),
+            max_gap.to_string(),
             domains_score_field,
+            domains_arch_field,
             structvar_class,
-            taxonomy_score,
-            taxonomy_status,
-            warnings
-        )?;
+            structvar_gap,
+            structvar_left_len,
+            structvar_right_len,
+            format!("{:.4}", taxonomy_score),
+            taxonomy_status.to_string(),
+            warnings.to_string(),
+        ].join(",");
+        writeln!(f, "{}", row)?;
     }
     Ok(())
 }

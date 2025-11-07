@@ -9,8 +9,7 @@ Core parity tasks
 - [ ] Nucleotide input + ORF validation
   - Add nt mode: FASTA(nt) → ORF calling → AA; run same pipeline.
   - Validate ORF vs homolog panel: frameshifts, early stops, retained introns.
-- [ ] Interactive HTML report
-  - Static overview + per-gene pages; plots for coverage, domains, scores; links to FASTA and alignment snippets.
+  - Status: paused (we added a simple placeholder to enable nt mode; robust ORF finder and validations will follow later).
 - [ ] Detailed alignment-based warnings
   - From MAFFT, detect missing exons (large query gaps) and retained introns (large insertions); flag motif disruptions.
 

@@ -13,6 +13,7 @@ pub struct DiamondConfig {
     pub out_dir: String,
     pub out_name: String,
     pub retries: usize,
+    pub max_hsps: usize,
 }
 
 impl DiamondConfig {
@@ -71,6 +72,8 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
             .arg(cfg.threads.to_string())
             .arg("--max-target-seqs")
             .arg("25")
+            .arg("--max-hsps")
+            .arg(cfg.max_hsps.to_string())
             .arg("--quiet")
             .arg("--out")
             .arg(&out_path)
@@ -191,6 +194,8 @@ fn run_chunk(
             .arg("1")
             .arg("--max-target-seqs")
             .arg("25")
+            .arg("--max-hsps")
+            .arg(cfg.max_hsps.to_string())
             .arg("--quiet")
             .arg("--out")
             .arg(&tmpout)
