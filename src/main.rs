@@ -379,7 +379,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Build consensus panels per gene from DIAMOND hits
             let t_consensus = step_start("consensus", log_json);
             let qlen_map: HashMap<String, usize> = metrics.iter().map(|m| (m.gene_id.clone(), m.length)).collect();
-            let grouped = diamond::parse_tsv_grouped(&diamond_tsv, Some(&qlen_map), Some(500)).unwrap_or_default();
+            let grouped = diamond::parse_tsv_grouped(&diamond_tsv, Some(&qlen_map), Some(1000)).unwrap_or_default();
             let cons_cfg = consensus::ConsensusConfig {
                 min_hits: file_cfg
                     .consensus
@@ -394,11 +394,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..Default::default()
             };
             let mut panel_map: HashMap<String, Vec<String>> = HashMap::new();
+            let mut len_map: HashMap<String, (f64, f64, f64, String)> = HashMap::new();
             for m in &metrics {
                 if let Some(hits) = grouped.get(&m.gene_id) {
                     let ids = consensus::select_panel(hits, &cons_cfg);
                     if !ids.is_empty() {
                         panel_map.insert(m.gene_id.clone(), ids);
+                    }
+                    // Length consistency against available subject lengths from these hits
+                    let slens: Vec<usize> = hits.iter().filter(|h| panel_map.get(&m.gene_id).map(|v| v.contains(&h.sseqid)).unwrap_or(false)).map(|h| h.slen).filter(|&x| x>0).collect();
+                    if slens.len() >= cons_cfg.min_hits {
+                        let lq = m.length as f64;
+                        let mut sorted = slens.iter().map(|&x| x as f64).collect::<Vec<_>>();
+                        sorted.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let med = if sorted.is_empty() { 0.0 } else { sorted[sorted.len()/2] };
+                        let mut devs = sorted.iter().map(|v| (v - med).abs()).collect::<Vec<_>>();
+                        devs.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let mad = if devs.is_empty() { 0.0 } else { devs[devs.len()/2] };
+                        let madn = (1.4826 * mad).max(1.0); // guard
+                        let z = if med>0.0 { (lq - med) / madn } else { 0.0 };
+                        let ratio = if med>0.0 { lq / med } else { 0.0 };
+                        let score = (-(z.abs())/2.0).exp().clamp(0.0, 1.0);
+                        let class = if ratio < 0.8 { "LikelyNTruncated" } else if ratio > 1.2 { "LikelyNExtended" } else { "InRange" };
+                        len_map.insert(m.gene_id.clone(), (score, z, ratio, class.to_string()));
                     }
                 }
             }
@@ -410,6 +428,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (cfg.reference_fasta.as_ref(), args.mafft_bin.as_ref())
             {
                 let t_mafft = step_start("mafft", log_json);
+                // Choose MAFFT threads smartly: 8 if available, else 4 if available, else 1
+                let mafft_threads = if cfg.threads >= 8 { 8 } else if cfg.threads >= 4 { 4 } else { 1 };
+                std::env::set_var("MAFFT_THREADS", mafft_threads.to_string());
                 let all_ids: Vec<String> = panel_map.values().flat_map(|v| v.clone()).collect();
                 let seqs = load_sequences_by_ids(ref_fasta, &all_ids).unwrap_or_default();
                 for g in &metrics {
@@ -569,6 +590,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.enable_taxonomy,
                 &taxsum_map,
                 Some(&domains_arch_map),
+                Some(&len_map),
             )?;
             write_csv_metrics(
                 &cfg.out,
@@ -584,6 +606,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(&comp_map),
                 args.classify_no_data,
                 Some(&domains_arch_map),
+                Some(&len_map),
             )?;
             let emit_secs = step_finish("emit_outputs", t_emit, log_json);
 
@@ -741,6 +764,7 @@ fn write_jsonl_metrics(
     taxonomy_enabled: bool,
     taxsum_map: &HashMap<String, Option<TaxonSummary>>,
     arch_map: Option<&HashMap<String, f64>>,
+    len_map: Option<&HashMap<String, (f64, f64, f64, String)>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_report.jsonl");
     let mut f = File::create(path)?;
@@ -773,12 +797,18 @@ fn write_jsonl_metrics(
             .as_ref()
             .and_then(|s| s.weights.get("domains").cloned())
             .unwrap_or(0.0);
+        let w_l = scoring
+            .as_ref()
+            .and_then(|s| s.weights.get("length").cloned())
+            .unwrap_or(0.0);
         let domains_arch_score = arch_map.and_then(|am| am.get(&m.gene_id).cloned()).unwrap_or(0.0);
-        let denom = (w_h + w_i + w_t + w_d).max(1e-6);
+        let length_score = len_map.and_then(|lm| lm.get(&m.gene_id).map(|t| t.0)).unwrap_or(0.0);
+        let denom = (w_h + w_i + w_t + w_d + w_l).max(1e-6);
         let final_score = (w_h * homology_score
             + w_i * intrinsic_score
             + w_t * taxonomy_score.unwrap_or(0.0)
-            + w_d * domains_arch_score)
+            + w_d * domains_arch_score
+            + w_l * length_score)
             / denom;
         let fusion_split_flag = summary
             .map(|s| s.coverage_delta > cov_delta_thresh)
@@ -816,10 +846,16 @@ fn write_jsonl_metrics(
                 })).collect::<Vec<_>>()
             })
         });
+        let length_block = len_map.and_then(|lm| lm.get(&m.gene_id)).map(|(s, z, r, c)| serde_json::json!({
+            "length_score": s,
+            "length_z": z,
+            "length_ratio": r,
+            "length_class": c,
+        }));
             let record = serde_json::json!({
                 "gene_id": m.gene_id,
                 "taxonomy": taxonomy,
-                "score_components": {"taxonomy": taxonomy_score, "homology": homology_score, "intrinsic": intrinsic_score, "domains": domains_arch_score},
+                "score_components": {"taxonomy": taxonomy_score, "homology": homology_score, "intrinsic": intrinsic_score, "domains": domains_arch_score, "length": length_score},
                 "final_score": final_score,
                 "homology": {
                 "hits_count": m.hits,
@@ -852,6 +888,7 @@ fn write_jsonl_metrics(
                 "motif_mismatch_fraction": a.motif_mismatch_fraction,
             })),
             "domains": domains,
+            "length": length_block,
             "warnings": warnings,
         });
         writeln!(f, "{}", serde_json::to_string(&record)?)?;
@@ -875,11 +912,12 @@ fn write_csv_metrics(
     comp_map: Option<&HashMap<String, (f64, f64, Option<f64>, f64)>>,
     classify_no_data: bool,
     arch_map: Option<&HashMap<String, f64>>,
+    len_map: Option<&HashMap<String, (f64, f64, f64, String)>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_summary.csv");
     let mut f = File::create(path)?;
     if csv_verbose {
-        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,start_concordance,start_class,taxonomy_status,warnings")?;
+        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,length_score,length_ratio,length_class,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,start_concordance,start_class,taxonomy_status,warnings")?;
     } else {
         writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,taxonomy_score,taxonomy_status,warnings")?;
     }
@@ -959,6 +997,7 @@ fn write_csv_metrics(
         if csv_verbose {
             let (hs, is, ts_opt, _fs) = comp_map.and_then(|cm| cm.get(&m.gene_id).cloned()).unwrap_or((0.0,0.0,None,final_score));
             let ts_str = if taxonomy_enabled { format!("{:.4}", ts_opt.unwrap_or(0.0)) } else { String::new() };
+            let (len_s, _len_z, len_r, len_c) = len_map.and_then(|lm| lm.get(&m.gene_id)).cloned().unwrap_or((0.0,0.0,0.0,String::new()));
             let row = vec![
                 m.gene_id.clone(),
                 m.hits.to_string(),
@@ -978,6 +1017,9 @@ fn write_csv_metrics(
                 ts_str,
                 domains_score_field,
                 domains_arch_field.clone(),
+                format!("{:.4}", len_s),
+                if len_r>0.0 { format!("{:.3}", len_r) } else { String::new() },
+                len_c,
                 mafft_enabled.to_string(),
                 format!("{:.3}", conserved),
                 pid.to_string(),

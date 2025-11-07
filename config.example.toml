@@ -21,6 +21,7 @@ homology = 0.6
 intrinsic = 0.4
 taxonomy = 0.0
 domains = 0.0
+length = 0.0
 taxonomy = 0.0
 
 [scoring.thresholds]

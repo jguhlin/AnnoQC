@@ -58,10 +58,11 @@ pub fn run_mafft(
         writeln!(&mut fasta_data, "{}", String::from_utf8_lossy(seq)).unwrap();
     }
 
+    let threads_env = std::env::var("MAFFT_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
     let mut child = Command::new(mafft_bin)
         .arg("--auto")
         .arg("--thread")
-        .arg("1")
+        .arg(threads_env.to_string())
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
