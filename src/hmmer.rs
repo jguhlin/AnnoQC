@@ -27,13 +27,17 @@ pub fn run_hmmscan(
     id: &str,
     seq: &[u8],
 ) -> Result<HmmscanSummary, String> {
+    let tmpdir = std::env::temp_dir();
+    let domtbl = tmpdir.join(format!("hmmscan_{}_{}.domtblout", std::process::id(), id));
     let mut child = Command::new(bin)
+        .arg("-o").arg("/dev/null")
+        .arg("--noali")
         .arg("--domtblout")
-        .arg("/dev/stdout")
+        .arg(&domtbl)
         .arg(db_path)
         .arg("-")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("failed to start hmmscan: {}", e))?;
@@ -44,11 +48,14 @@ pub fn run_hmmscan(
         stdin.write_all(seq).map_err(|e| e.to_string())?;
         writeln!(stdin).map_err(|e| e.to_string())?;
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!("hmmscan exited with status {}", out.status));
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("hmmscan exited with status {}", status));
     }
-    parse_domtblout(&out.stdout[..])
+    let bytes = std::fs::read(&domtbl).map_err(|e| format!("read domtblout: {}", e))?;
+    let res = parse_domtblout(&bytes[..]);
+    let _ = std::fs::remove_file(&domtbl);
+    res
 }
 
 pub fn parse_domtblout(bytes: &[u8]) -> Result<HmmscanSummary, String> {
@@ -139,8 +146,54 @@ pub fn run_hmmscan_batch(
                     guard.next()
                 };
                 let Some((gid, seq)) = next else { break; };
-                let sum = run_hmmscan(&bin_s, &db_s, &gid, &seq)
-                    .unwrap_or_default();
+                let sum = run_hmmscan(&bin_s, &db_s, &gid, &seq).unwrap_or_default();
+                let mut trimmed = sum.clone();
+                if trimmed.hits.len() > top_n {
+                    trimmed.hits.truncate(top_n);
+                }
+                let mut out = r.lock().unwrap();
+                out.insert(gid, trimmed);
+            }
+        });
+        handles.push(handle);
+    }
+    for h in handles { h.join().map_err(|_| "hmmscan thread panicked".to_string())?; }
+    let map = Arc::try_unwrap(results).map_err(|_| "results arc busy".to_string())
+        .and_then(|m| m.into_inner().map_err(|_| "results poisoned".to_string()))?;
+    Ok(map)
+}
+
+/// Batch hmmscan with optional i-Evalue filtering before truncation.
+pub fn run_hmmscan_batch_opts(
+    bin: &str,
+    db_path: &str,
+    items: Vec<(String, Vec<u8>)>,
+    threads: usize,
+    top_n: usize,
+    max_ievalue: Option<f64>,
+) -> Result<std::collections::HashMap<String, HmmscanSummary>, String> {
+    let nthreads = threads.max(1);
+    let queue = Arc::new(Mutex::new(items.into_iter()));
+    let results: Arc<Mutex<std::collections::HashMap<String, HmmscanSummary>>> =
+        Arc::new(Mutex::new(Default::default()));
+    let mut handles = Vec::new();
+    for _ in 0..nthreads {
+        let q = Arc::clone(&queue);
+        let r = Arc::clone(&results);
+        let bin_s = bin.to_string();
+        let db_s = db_path.to_string();
+        let max_ev = max_ievalue.clone();
+        let handle = thread::spawn(move || {
+            loop {
+                let next = {
+                    let mut guard = q.lock().unwrap();
+                    guard.next()
+                };
+                let Some((gid, seq)) = next else { break; };
+                let mut sum = run_hmmscan(&bin_s, &db_s, &gid, &seq).unwrap_or_default();
+                if let Some(th) = max_ev {
+                    sum.hits.retain(|h| h.evalue <= th);
+                }
                 let mut trimmed = sum.clone();
                 if trimmed.hits.len() > top_n {
                     trimmed.hits.truncate(top_n);
@@ -209,6 +262,80 @@ pub fn domains_architecture_score(
     (w_core*recall_core + w_acc*precision_acc - w_extra*extras_pen - w_ord*order_pen).clamp(0.0, 1.0)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DomainsArchDiagnostics {
+    pub panel_size: usize,
+    pub refs_with_domains: usize,
+    pub query_domains: usize,
+    pub core_count: usize,
+    pub accessory_count: usize,
+    pub overlap_core: usize,
+    pub overlap_accessory: usize,
+    pub extras_count: usize,
+    pub recall_core: f64,
+    pub precision_acc: f64,
+    pub extras_pen: f64,
+    pub score: f64,
+}
+
+/// Same logic as `domains_architecture_score` but returns detailed diagnostics to aid debugging.
+/// Assumes inputs are already clan-collapsed if desired by caller.
+pub fn domains_architecture_diagnostics(
+    query: &HmmscanSummary,
+    ref_ids: &[String],
+    ref_map: &std::collections::HashMap<String, HmmscanSummary>,
+) -> DomainsArchDiagnostics {
+    use std::collections::{HashMap, HashSet};
+    let mut diag = DomainsArchDiagnostics::default();
+    diag.panel_size = ref_ids.len();
+    if ref_ids.is_empty() { return diag; }
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    let mut denom = 0usize;
+    for rid in ref_ids {
+        if let Some(s) = ref_map.get(rid) {
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut had = false;
+            for h in &s.hits {
+                let acc = h.accession.as_str();
+                if seen.insert(acc) {
+                    *freq.entry(acc.to_string()).or_insert(0) += 1;
+                    had = true;
+                }
+            }
+            if had { diag.refs_with_domains += 1; }
+            denom += 1;
+        }
+    }
+    if denom == 0 { return diag; }
+    let denom_f = denom as f64;
+    let core_thresh = 0.7;
+    let acc_thresh = 0.3;
+    let mut core: HashSet<&str> = HashSet::new();
+    let mut acc: HashSet<&str> = HashSet::new();
+    for (k, v) in &freq {
+        let f = (*v as f64) / denom_f;
+        if f >= core_thresh { core.insert(k.as_str()); }
+        else if f >= acc_thresh { acc.insert(k.as_str()); }
+    }
+    diag.core_count = core.len();
+    diag.accessory_count = acc.len();
+    let qset: HashSet<&str> = query.hits.iter().map(|h| h.accession.as_str()).collect();
+    diag.query_domains = qset.len();
+    let core_count_f = diag.core_count as f64;
+    diag.overlap_core = qset.iter().filter(|d| core.contains(**d)).count();
+    diag.recall_core = if core_count_f > 0.0 { diag.overlap_core as f64 / core_count_f } else { 1.0 };
+    let dq_minus_core: Vec<&str> = qset.iter().copied().filter(|d| !core.contains(*d)).collect();
+    let denom_acc = dq_minus_core.len() as f64;
+    diag.overlap_accessory = dq_minus_core.iter().filter(|d| acc.contains(**d)).count();
+    diag.precision_acc = if denom_acc > 0.0 { diag.overlap_accessory as f64 / denom_acc } else { 1.0 };
+    diag.extras_count = dq_minus_core.iter().filter(|d| !acc.contains(**d)).count();
+    diag.extras_pen = if denom_acc > 0.0 { diag.extras_count as f64 / denom_acc } else { 0.0 };
+    let w_core = 0.6; let w_acc = 0.3; let w_extra = 0.1; let w_ord = 0.0;
+    let order_pen = 0.0;
+    diag.score = (w_core*diag.recall_core + w_acc*diag.precision_acc - w_extra*diag.extras_pen - w_ord*order_pen).clamp(0.0, 1.0);
+    diag
+}
+
 /// Load Pfam clans mapping from a TSV with columns: Pfam_Acc\tClan_Acc
 pub fn load_pfam_clans(path: &str) -> Result<std::collections::HashMap<String, String>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -231,10 +358,17 @@ pub fn collapse_by_clan(
     use std::collections::HashMap;
     let mut best: HashMap<String, HmmscanHit> = HashMap::new();
     for h in &sum.hits {
-        let key = clan_map.get(&h.accession).cloned().unwrap_or_else(|| h.accession.clone());
-        let entry = best.entry(key).or_insert_with(|| HmmscanHit {
+        // Normalize PFAM accession by dropping version suffix (PF00476.27 -> PF00476)
+        let base_acc = h.accession.split('.').next().unwrap_or(&h.accession).to_string();
+        // Use clan id as the grouping key; if no clan, fall back to base accession
+        let key = clan_map
+            .get(&base_acc)
+            .cloned()
+            .unwrap_or(base_acc);
+        // Store the collapsed hit using the clan id (or base accession) in accession field
+        let entry = best.entry(key.clone()).or_insert_with(|| HmmscanHit {
             target_name: h.target_name.clone(),
-            accession: h.accession.clone(),
+            accession: key.clone(),
             evalue: h.evalue,
             score: h.score,
             bias: h.bias,
@@ -243,7 +377,7 @@ pub fn collapse_by_clan(
         if h.evalue < entry.evalue || (h.evalue == entry.evalue && h.score > entry.score) {
             *entry = HmmscanHit {
                 target_name: h.target_name.clone(),
-                accession: h.accession.clone(),
+                accession: key.clone(),
                 evalue: h.evalue,
                 score: h.score,
                 bias: h.bias,

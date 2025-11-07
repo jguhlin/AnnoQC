@@ -84,11 +84,10 @@ mod tests {
     #[test]
     fn basic_selection() {
         let q = "Q".to_string();
-        let mk = |i: usize, p: f64| DiamondHitRow { qseqid: q.clone(), sseqid: format!("S{}", i), bitscore: 100.0 - i as f64, evalue: "1e-20".to_string(), length: 100, qcov: 0.8, scov: 0.7, pident: p };
+        let mk = |i: usize, p: f64| DiamondHitRow { qseqid: q.clone(), sseqid: format!("S{}", i), bitscore: 100.0 - i as f64, evalue: "1e-20".to_string(), length: 100, qcov: 0.8, scov: 0.7, pident: p, qlen: 100, slen: 100 };
         let hits = vec![mk(1, 60.0), mk(2, 55.0), mk(3, 40.0), mk(4, 30.0), mk(5, 28.0), mk(6, 26.0), mk(7, 24.0)];
         let cfg = ConsensusConfig::default();
         let sel = select_panel(&hits, &cfg);
         assert!(sel.len() >= 5 && sel.len() <= cfg.max_panel);
     }
 }
-

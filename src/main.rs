@@ -15,6 +15,7 @@ mod consensus;
 mod hmmer;
 mod mafft;
 mod metrics;
+mod length;
 mod preflight;
 mod provenance;
 mod scoring;
@@ -139,6 +140,10 @@ struct AnalyzeArgs {
     hmmer_top_n: Option<usize>,
     #[arg(long)]
     hmmer_threads: Option<usize>,
+    #[arg(long)]
+    hmmer_ievalue: Option<f64>,
+    #[arg(long)]
+    hmmer_ref_ievalue: Option<f64>,
     #[arg(long, value_enum, default_value_t = DiamondMode::Auto)]
     diamond_mode: DiamondMode,
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
@@ -147,6 +152,10 @@ struct AnalyzeArgs {
     coverage_delta_threshold: f64,
     #[arg(long)]
     diamond_auto_threshold: Option<usize>,
+    #[arg(long)]
+    dump_matches_best: bool,
+    #[arg(long)]
+    dump_matches_gene: Option<String>,
 }
 
 #[derive(Args, Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +233,8 @@ struct TaxonomyConfigOverride {
 struct HmmerConfigOverride {
     top_n: Option<usize>,
     threads: Option<usize>,
+    ievalue: Option<f64>,
+    ref_ievalue: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -401,22 +412,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !ids.is_empty() {
                         panel_map.insert(m.gene_id.clone(), ids);
                     }
-                    // Length consistency against available subject lengths from these hits
-                    let slens: Vec<usize> = hits.iter().filter(|h| panel_map.get(&m.gene_id).map(|v| v.contains(&h.sseqid)).unwrap_or(false)).map(|h| h.slen).filter(|&x| x>0).collect();
-                    if slens.len() >= cons_cfg.min_hits {
-                        let lq = m.length as f64;
-                        let mut sorted = slens.iter().map(|&x| x as f64).collect::<Vec<_>>();
-                        sorted.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        let med = if sorted.is_empty() { 0.0 } else { sorted[sorted.len()/2] };
-                        let mut devs = sorted.iter().map(|v| (v - med).abs()).collect::<Vec<_>>();
-                        devs.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        let mad = if devs.is_empty() { 0.0 } else { devs[devs.len()/2] };
-                        let madn = (1.4826 * mad).max(1.0); // guard
-                        let z = if med>0.0 { (lq - med) / madn } else { 0.0 };
-                        let ratio = if med>0.0 { lq / med } else { 0.0 };
-                        let score = (-(z.abs())/2.0).exp().clamp(0.0, 1.0);
-                        let class = if ratio < 0.8 { "LikelyNTruncated" } else if ratio > 1.2 { "LikelyNExtended" } else { "InRange" };
-                        len_map.insert(m.gene_id.clone(), (score, z, ratio, class.to_string()));
+                    // Length consistency against available subject lengths from the selected panel only
+                    if let Some(panel_ids) = panel_map.get(&m.gene_id) {
+                        let slens: Vec<usize> = hits
+                            .iter()
+                            .filter(|h| panel_ids.contains(&h.sseqid))
+                            .map(|h| h.slen)
+                            .filter(|&x| x>0)
+                            .collect();
+                        if slens.len() >= cons_cfg.min_hits {
+                            if let Some(lc) = length::compute_length_consistency(m.length, &slens) {
+                                len_map.insert(m.gene_id.clone(), (lc.score, lc.z, lc.ratio, lc.class_));
+                            }
+                        }
                     }
                 }
             }
@@ -456,11 +464,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = step_finish("mafft", t_mafft, log_json);
             }
 
+            // Optional: dump matches for inspection
+            if let Some(ref_fasta) = cfg.reference_fasta.as_ref() {
+                let mut target_gene: Option<String> = None;
+                if let Some(g) = args.dump_matches_gene.as_ref() {
+                    target_gene = Some(g.clone());
+                } else if args.dump_matches_best {
+                    // pick gene with largest panel size
+                    let mut best: Option<(String, usize)> = None;
+                    for m in &metrics {
+                        let n = panel_map.get(&m.gene_id).map(|v| v.len()).unwrap_or(0);
+                        if best.as_ref().map(|b| n > b.1).unwrap_or(true) {
+                            best = Some((m.gene_id.clone(), n));
+                        }
+                    }
+                    if let Some((gid, _)) = best { target_gene = Some(gid); }
+                }
+                if let Some(gid) = target_gene {
+                    let ids = panel_map.get(&gid).cloned().unwrap_or_default();
+                    if !ids.is_empty() {
+                        let seqs = load_sequences_by_ids(ref_fasta, &ids).unwrap_or_default();
+                        let path = std::path::Path::new(&cfg.out).join("matches.fasta");
+                        let mut f = std::fs::File::create(path)?;
+                        use std::io::Write as _;
+                        // write query first
+                        if let Some((_im, qseq)) = intrinsic_map.get(&gid) {
+                            writeln!(f, ">{}", gid)?;
+                            writeln!(f, "{}", String::from_utf8_lossy(qseq))?;
+                        }
+                        for id in &ids {
+                            let key = taxonomy::canonical_accession(id);
+                            if let Some(s) = seqs.get(&key) {
+                                writeln!(f, ">{}", key)?;
+                                writeln!(f, "{}", String::from_utf8_lossy(s))?;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Optional HMMER/Pfam domain summary (JSONL)
             let mut hmmsum_map: HashMap<String, HmmscanSummary> = HashMap::new();
             let mut _ref_hmmsum_map: HashMap<String, HmmscanSummary> = HashMap::new();
             let mut domains_arch_map: HashMap<String, f64> = HashMap::new();
-            if let (Some(hmm), Some(pfam_db)) = (args.hmmscan_bin.as_ref(), args.pfam_db.as_ref().or(file_cfg.pfam_db.as_ref())) {
+            let mut domains_arch_dbg: Vec<(String, usize, usize, usize, usize, usize, usize, usize, f64, f64, f64, f64)> = Vec::new();
+            if let (Some(hmm), Some(pfam_db)) = (args.hmmscan_bin.as_ref(), args.pfam_db.as_ref().or(file_cfg.pfam_db.as_ref()).or(file_cfg.pfam_db.as_ref())) {
                 let t_hmmer = step_start("hmmer", log_json);
                 let items: Vec<(String, Vec<u8>)> = intrinsic_map.iter().map(|(gid, (_im, qseq))| (gid.clone(), qseq.clone())).collect();
                 let top_n = args
@@ -471,7 +519,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .hmmer_threads
                     .or_else(|| file_cfg.hmmer.as_ref().and_then(|h| h.threads))
                     .unwrap_or(cfg.threads);
-                if let Ok(m) = hmmer::run_hmmscan_batch(hmm, pfam_db, items, hmmer_threads, top_n) {
+                let ievalue = args
+                    .hmmer_ievalue
+                    .or_else(|| file_cfg.hmmer.as_ref().and_then(|h| h.ievalue));
+                if let Ok(m) = hmmer::run_hmmscan_batch_opts(hmm, pfam_db, items, hmmer_threads, top_n, ievalue) {
                     hmmsum_map = m;
                 }
                 if let Some(ref_fasta) = cfg.reference_fasta.as_ref() {
@@ -479,7 +530,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let ref_seqs = load_sequences_by_ids(ref_fasta, &all_ids).unwrap_or_default();
                     if !ref_seqs.is_empty() {
                         let ref_items: Vec<(String, Vec<u8>)> = ref_seqs.into_iter().collect();
-                        if let Ok(m) = hmmer::run_hmmscan_batch(hmm, pfam_db, ref_items, hmmer_threads, top_n) {
+                        let ref_ievalue = args
+                            .hmmer_ref_ievalue
+                            .or_else(|| file_cfg.hmmer.as_ref().and_then(|h| h.ref_ievalue));
+                        if let Ok(m) = hmmer::run_hmmscan_batch_opts(hmm, pfam_db, ref_items, hmmer_threads, top_n, ref_ievalue) {
                             _ref_hmmsum_map = m;
                         }
                     }
@@ -502,8 +556,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ref_map_c.insert(key.clone(), val);
                             }
                         }
-                        let score = hmmer::domains_architecture_score(&qsum_c, &ref_ids, &ref_map_c);
+                        let dbg = hmmer::domains_architecture_diagnostics(&qsum_c, &ref_ids, &ref_map_c);
+                        let score = dbg.score;
                         domains_arch_map.insert(g.gene_id.clone(), score);
+                        domains_arch_dbg.push((
+                            g.gene_id.clone(),
+                            dbg.panel_size,
+                            dbg.refs_with_domains,
+                            dbg.query_domains,
+                            dbg.core_count,
+                            dbg.accessory_count,
+                            dbg.overlap_core,
+                            dbg.overlap_accessory,
+                            dbg.recall_core,
+                            dbg.precision_acc,
+                            dbg.extras_pen,
+                            dbg.score,
+                        ));
                     }
                 }
                 let _ = step_finish("hmmer", t_hmmer, log_json);
@@ -608,6 +677,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(&domains_arch_map),
                 Some(&len_map),
             )?;
+            // Emit domains architecture diagnostics CSV
+            if !domains_arch_dbg.is_empty() {
+                let dbg_path = std::path::Path::new(&cfg.out).join("domains_arch_debug.csv");
+                let mut fdbg = std::fs::File::create(dbg_path)?;
+                use std::io::Write as _;
+                writeln!(fdbg, "gene_id,panel_size,refs_with_domains,query_domains,core_count,accessory_count,overlap_core,overlap_accessory,recall_core,precision_acc,extras_pen,score")?;
+                for (gid, ps, rwd, qd, cc, ac, oc, oa, rc, pa, ep, sc) in domains_arch_dbg {
+                    writeln!(fdbg, "{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4}", gid, ps, rwd, qd, cc, ac, oc, oa, rc, pa, ep, sc)?;
+                }
+            }
             let emit_secs = step_finish("emit_outputs", t_emit, log_json);
 
             // Write compact run_metrics.json sidecar

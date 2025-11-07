@@ -1,3 +1,116 @@
+# Next Feature: Orphan Domain Analysis
+
+This is the next priority feature to implement.
+
+### Implementation Plan
+
+**1. Objective**
+
+To improve the accuracy of protein "completeness" assessment by detecting partial (i.e., "orphan") protein domains at the N- or C-terminus of a query sequence. The presence of a partial domain is a strong indicator of a truncated gene model.
+
+**2. Background**
+
+Currently, AnnoQC's HMMER integration checks for the *presence* of domains and calculates a `domains_arch_score` based on the set of domains found. It does not evaluate the *completeness* of the individual domain hits themselves. A protein that is missing its true start codon may be annotated with a partial N-terminal domain. This feature will explicitly detect and score this.
+
+**3. Detailed Implementation Steps**
+
+*   **A. Enhance HMMER Output Parsing:**
+    *   The current `hmmscan` runs with `--domtblout`. This format contains the necessary information.
+    *   The key columns to parse are `ali from`, `ali to` (coordinates on the alignment), `hmm from`, `hmm to` (coordinates on the HMM model), and `hmm length`.
+    *   The `hmmer.rs:parse_domtblout` function and the `HmmscanHit` struct need to be extended to parse and store these additional fields.
+
+*   **B. Define "Orphan" Domain Logic:**
+    *   For each domain hit, calculate its completeness. A simple metric would be `(hmm_to - hmm_from + 1) / hmm_length`.
+    *   Define a domain as an **N-terminal orphan** if:
+        1.  It's the first domain in the protein.
+        2.  The protein sequence alignment starts far from the beginning of the HMM model (e.g., `hmm from` > 20 amino acids, threshold is tunable).
+        3.  The domain hit itself is not a small, repetitive domain that is expected to be partial.
+    *   Define a domain as a **C-terminal orphan** if:
+        1.  It's the last domain in the protein.
+        2.  The protein sequence alignment ends far from the end of the HMM model (e.g., `hmm_length - hmm_to` > 20 amino acids).
+    *   Create a new function in `scoring.rs` or `hmmer.rs` that takes an `HmmscanSummary` and returns an `OrphanDomainResult` (e.g., an enum: `None`, `NTerminalOrphan`, `CTerminalOrphan`, `Both`).
+
+*   **C. Integrate into Scoring Model:**
+    *   Create a new score component, `orphan_domain_score`. This could be a simple binary score (1.0 if no orphans, 0.0-0.5 if orphans are detected).
+    *   Add a new weight, `weights.orphan`, to the `[scoring]` section of the config file to control its influence on the `final_score`.
+    *   Update `scoring.rs` to incorporate this new score into the final weighted average.
+
+*   **D. Update Output Files:**
+    *   **`qc_report.jsonl`:**
+        *   Add a new block, e.g., `"orphan_analysis": { "status": "NTerminalOrphan", "details": "PfamID:PF00069, completeness:0.6" }`.
+        *   Add `orphan_domain_score` to the `score_components` object.
+    *   **`qc_summary.csv`:**
+        *   Add new columns: `orphan_status` (e.g., "None", "N_Orphan") and `orphan_domain_score`.
+
+**4. Acceptance Criteria**
+
+*   A new feature flag or config setting under `[hmmer]` or `[scoring]` enables/disables this analysis.
+*   When enabled, the `final_score` for proteins with terminal domain fragments is penalized.
+*   The JSONL and CSV outputs are updated with the new fields describing the orphan status and score.
+*   Unit tests are added for the orphan detection logic using fixture `domtblout` data representing complete, N-truncated, and C-truncated domain hits.
+*   Documentation in the `mdBook` is updated to explain the new analysis and its corresponding outputs.
+
+---
+
+# Next Feature: Advanced Taxonomic Analysis
+
+### Implementation Plan
+
+**1. Objective**
+
+To move beyond single-hit taxonomic validation and instead analyze the entire taxonomic neighborhood of a query's homologs. This will enable robust detection of taxonomic outliers and potential sequence contamination.
+
+**2. Background**
+
+The current taxonomy feature provides a score based on whether the single top DIAMOND hit can be resolved to a taxon. This is a good first step, but it's sensitive to the top hit being an outlier itself. By analyzing the distribution of the top N hits, we can generate a much more stable "consensus" taxonomy and identify queries that don't belong with their neighbors, which is a strong signal of either contamination or interesting biological events like horizontal gene transfer.
+
+**3. Detailed Implementation Steps**
+
+*   **A. Broaden Taxonomic Data Collection:**
+    *   In `main.rs`, after parsing the DIAMOND results, don't just look at the top hit for each query. Instead, for each query, collect the top N (e.g., N=20, configurable) `sseqid`s from its `DiamondHitRow` list.
+    *   Modify the `TaxonomyResolver` lookup logic to accept a list of accessions and efficiently return a list of `TaxonSummary` objects. This may involve batching lookups for performance.
+
+*   **B. Implement Lowest Common Ancestor (LCA) Algorithm:**
+    *   In `taxonomy.rs`, create a new function `find_lca(taxids: &[u32]) -> Option<u32>`.
+    *   This function will take a list of NCBI taxonomy IDs. For each ID, it will retrieve its lineage (parent chain up to the root) from the `TaxonomyResolver`.
+    *   It will then find the deepest node that is common to all (or a quorum, e.g., >80%) of the lineages. This node is the LCA. The algorithm involves traversing the lineage paths.
+
+*   **C. Develop Contamination & Congruence Scores:**
+    *   **Consensus Taxon:** For each query, find the LCA of its top N hits. This is the "consensus taxon" for the query's homologs.
+    *   **Congruence Score:** If the query itself has a known taxonomy (e.g., from the input file's metadata, if available), compare its lineage to the consensus taxon's lineage. The score is higher the closer they are. For example, sharing a Family is better than only sharing a Kingdom.
+    *   **Contamination Score:** Calculate the fraction of the top N hits that fall outside the consensus taxon's phylum or class. A high score (e.g., >0.9) where most hits are from a completely different domain of life (e.g., a bacterial gene with all eukaryotic hits) is a strong flag for contamination.
+
+*   **D. Integrate into Scoring and Output:**
+    *   **Scoring:**
+        *   Replace the current simple `taxonomy_score` with the more nuanced `congruence_score`.
+        *   The `contamination_score` can be a separate, standalone metric used for flagging rather than for the main quality score.
+    *   **`qc_report.jsonl`:**
+        *   Modify the `taxonomy` block to include the new information:
+            ```json
+            "taxonomy": {
+              "status": "enabled",
+              "top_hit_taxid": 123,
+              "consensus_taxid": 456,
+              "consensus_name": "Some Consensus Name",
+              "consensus_lineage": [...],
+              "congruence_score": 0.85,
+              "contamination_score": 0.05
+            }
+            ```
+    *   **`qc_summary.csv`:**
+        *   Replace `taxonomy_score` with `congruence_score`.
+        *   Add new columns: `consensus_taxon`, `contamination_score`.
+
+**4. Acceptance Criteria**
+
+*   A new section in the config file (e.g., `[taxonomy]`) allows configuration of N (number of hits to consider) and thresholds for scoring.
+*   The `TaxonomyResolver` is updated with an efficient LCA implementation.
+*   The final JSONL and CSV reports contain the new consensus and contamination fields.
+*   The overall `final_score` is influenced by the new `congruence_score`.
+*   Unit tests are added for the LCA algorithm.
+*   The mdBook documentation is updated to explain the new taxonomic analysis, how to interpret the scores, and how it can be used to detect contamination.
+
+---
 # AnnoQC TODO
 
 Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
