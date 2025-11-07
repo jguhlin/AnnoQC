@@ -5,6 +5,7 @@ Actionable items to reach (or surpass) GeneValidator parity. Boxes indicate stat
 Core parity tasks
 - [ ] Advanced structural variation detection (fusion/split/duplication)
   - Group DIAMOND HSPs per subject; classify tiling/overlap patterns; emit explicit JSONL warnings and CSV columns.
+  - Status: partial (multi-HSP tiling implemented; fusion gap/length diagnostics in CSV/JSON; subject-side pairing recorded; unit tests added). Next: subject orientation/order checks, per-segment coverage fractions.
   - Inputs: BLAST6 with HSP coordinates; thresholds for minimal span and gap.
 - [ ] Nucleotide input + ORF validation
   - Add nt mode: FASTA(nt) → ORF calling → AA; run same pipeline.
