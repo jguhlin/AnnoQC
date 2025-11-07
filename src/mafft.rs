@@ -17,6 +17,8 @@ pub struct AlignmentMetrics {
     pub gap_run_count: usize,
     pub max_gap_run: usize,
     pub motif_mismatch_fraction: f64,
+    pub start_concordance: f64,
+    pub start_class: String,
 }
 
 pub fn load_sequences_by_ids(
@@ -174,6 +176,37 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         max_gap_run = max_gap_run.max(gap_run);
     }
 
+    // Start-concordance: compute first non-gap column per sequence
+    let starts: Vec<usize> = seqs
+        .iter()
+        .map(|s| s.iter().position(|&c| c != b'-').unwrap_or(0))
+        .collect();
+    let query_start = *starts.get(0).unwrap_or(&0);
+    let mut others: Vec<usize> = starts.iter().cloned().skip(1).collect();
+    others.sort_unstable();
+    let modal = if others.is_empty() {
+        query_start
+    } else {
+        // median as a robust proxy for consensus start
+        let mid = others.len() / 2;
+        others[mid]
+    };
+    let diff = if query_start > modal {
+        (query_start - modal) as i64
+    } else {
+        -((modal - query_start) as i64)
+    };
+    let start_concordance = (1.0 - (diff.unsigned_abs() as f64 / 30.0)).clamp(0.0, 1.0);
+    let start_class = if diff.abs() <= 3 {
+        "LikelyComplete"
+    } else if diff > 3 {
+        // query starts later -> likely N-truncated
+        "LikelyNTruncated"
+    } else {
+        // query starts earlier -> likely N-extended
+        "LikelyNExtended"
+    };
+
     AlignmentMetrics {
         mafft_enabled: true,
         strategy_used: "auto".to_string(),
@@ -192,5 +225,7 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         gap_run_count: gap_runs,
         max_gap_run,
         motif_mismatch_fraction: 0.0,
+        start_concordance,
+        start_class: start_class.to_string(),
     }
 }

@@ -208,3 +208,55 @@ pub fn domains_architecture_score(
     let order_pen = 0.0;
     (w_core*recall_core + w_acc*precision_acc - w_extra*extras_pen - w_ord*order_pen).clamp(0.0, 1.0)
 }
+
+/// Load Pfam clans mapping from a TSV with columns: Pfam_Acc\tClan_Acc
+pub fn load_pfam_clans(path: &str) -> Result<std::collections::HashMap<String, String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        if line.trim().is_empty() { continue; }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 { continue; }
+        map.insert(cols[0].to_string(), cols[1].to_string());
+    }
+    Ok(map)
+}
+
+/// Collapse a domain summary by clan: replace accessions with clan ids when available, and
+/// deduplicate hits per clan keeping the lowest e-value/ highest score.
+pub fn collapse_by_clan(
+    sum: &HmmscanSummary,
+    clan_map: &std::collections::HashMap<String, String>,
+) -> HmmscanSummary {
+    use std::collections::HashMap;
+    let mut best: HashMap<String, HmmscanHit> = HashMap::new();
+    for h in &sum.hits {
+        let key = clan_map.get(&h.accession).cloned().unwrap_or_else(|| h.accession.clone());
+        let entry = best.entry(key).or_insert_with(|| HmmscanHit {
+            target_name: h.target_name.clone(),
+            accession: h.accession.clone(),
+            evalue: h.evalue,
+            score: h.score,
+            bias: h.bias,
+        });
+        // keep better (lower evalue, then higher score)
+        if h.evalue < entry.evalue || (h.evalue == entry.evalue && h.score > entry.score) {
+            *entry = HmmscanHit {
+                target_name: h.target_name.clone(),
+                accession: h.accession.clone(),
+                evalue: h.evalue,
+                score: h.score,
+                bias: h.bias,
+            };
+        }
+    }
+    let mut hits: Vec<HmmscanHit> = best.into_values().collect();
+    hits.sort_by(|a,b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
+    let top = hits.first();
+    HmmscanSummary {
+        hits_count: hits.len(),
+        top_accession: top.map(|h| h.accession.clone()),
+        top_evalue: top.map(|h| h.evalue),
+        hits,
+    }
+}

@@ -288,6 +288,18 @@ pub struct DiamondHitStats {
     pub coverage_ratio: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DiamondHitRow {
+    pub qseqid: String,
+    pub sseqid: String,
+    pub bitscore: f64,
+    pub evalue: String,
+    pub length: usize,
+    pub qcov: f64,
+    pub scov: f64,
+    pub pident: f64,
+}
+
 /// Parse diamond tsv produced by `blastp_once` and compute per-query top-hit stats.
 pub fn parse_tsv_stats(
     tsv: &Path,
@@ -349,6 +361,60 @@ pub fn parse_tsv_stats(
             entry.coverage_delta = (qcov - scov).abs();
             entry.coverage_ratio = if scov > 0.0 { qcov / scov } else { 0.0 };
         }
+    }
+    Ok(map)
+}
+
+/// Parse diamond tsv into grouped hit rows per query. Best-effort parsing of either our
+/// explicit outfmt or default BLAST 6, using optional qlen_map to compute qcov.
+pub fn parse_tsv_grouped(
+    tsv: &Path,
+    qlen_map: Option<&std::collections::HashMap<String, usize>>,
+    max_per_query: Option<usize>,
+) -> Result<std::collections::HashMap<String, Vec<DiamondHitRow>>, String> {
+    let mut map: std::collections::HashMap<String, Vec<DiamondHitRow>> = Default::default();
+    if !tsv.exists() { return Ok(map); }
+    let file = std::fs::File::open(tsv).map_err(|e| e.to_string())?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() { continue; }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 { continue; }
+        let q = cols[0].to_string();
+        let s = cols[1].to_string();
+        let (bitscore, evalue, alen, qcov, scov, pident) = if cols.len() >= 8 && cols.len() < 12 {
+            (
+                cols[2].parse::<f64>().unwrap_or(0.0),
+                cols[3].to_string(),
+                cols[4].parse::<usize>().unwrap_or(0),
+                cols[5].parse::<f64>().unwrap_or(0.0) / 100.0,
+                cols[6].parse::<f64>().unwrap_or(0.0) / 100.0,
+                cols[7].parse::<f64>().unwrap_or(0.0),
+            )
+        } else if cols.len() >= 12 {
+            let pident = cols[2].parse::<f64>().unwrap_or(0.0);
+            let alen = cols[3].parse::<usize>().unwrap_or(0);
+            let evalue = cols[10].to_string();
+            let bitscore = cols[11].parse::<f64>().unwrap_or(0.0);
+            let qcov = if let Some(map) = qlen_map {
+                if let Some(qlen) = map.get(&q) {
+                    let qstart = cols[6].parse::<f64>().unwrap_or(0.0);
+                    let qend = cols[7].parse::<f64>().unwrap_or(0.0);
+                    let span = (qend - qstart).abs() + 1.0;
+                    if *qlen > 0 { (span / (*qlen as f64)).clamp(0.0, 1.0) } else { 0.0 }
+                } else { 0.0 }
+            } else { 0.0 };
+            (bitscore, evalue, alen, qcov, 0.0, pident)
+        } else { continue; };
+        let row = DiamondHitRow { qseqid: q.clone(), sseqid: s, bitscore, evalue, length: alen, qcov, scov, pident };
+        let entry = map.entry(q).or_default();
+        entry.push(row);
+        if let Some(k) = max_per_query { if entry.len() >= k { continue; } }
+    }
+    // Sort each vector by decreasing bitscore
+    for v in map.values_mut() {
+        v.sort_by(|a,b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal));
     }
     Ok(map)
 }
