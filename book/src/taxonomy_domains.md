@@ -20,8 +20,13 @@ This page outlines how AnnoQC enriches results with taxonomy lineage and protein
   - Adds `taxonomy_score` and `taxonomy_status` columns; currently presence/absence based.
 
 - Domains (hmmscan)
-  - When `--hmmscan-bin` and `pfam_db` are provided, JSONL includes a `domains` block with `hits_count`, `top_accession`, and `top_evalue` (parser placeholder; scoring to be expanded).
+  - When `--hmmscan-bin` and `pfam_db` are provided, JSONL includes a `domains` block with `hits_count`, `top_accession`, `top_evalue`, and per-hit details (`target_name`, `accession`, `evalue`, `score`, `bias`).
+  - `domains_score` = clamp(-log10(top_evalue)/20, 0, 1) (fast proxy for domain strength).
+  - Clan collapse (recommended): provide `pfam_clans` TSV to collapse Pfam accessions to clans for cross-gene architecture comparisons.
+  - Architecture score (`domains_arch_score`): compare the query’s clan set to the consensus homolog panel.
+    - Compute clan frequency across homologs; Core if ≥0.7; Accessory if ≥0.3.
+    - Score = clamp(0.6·recall_core + 0.3·precision_acc − 0.1·extras_pen, 0, 1).
+  - CSV (`--csv-verbose`) exposes `domains_score` and `domains_arch_score`.
   - Flags/config:
     - `--hmmer-top-n` or `[hmmer].top_n` to cap per-gene hits in JSONL (default 5).
     - `--hmmer-threads` or `[hmmer].threads` to override thread count for hmmscan.
-  - JSONL also includes `domains_score` (placeholder: 1.0 if any domain hit, else 0.0) and a `hits` array with `target_name`, `accession`, `evalue`, `score`, and `bias`.

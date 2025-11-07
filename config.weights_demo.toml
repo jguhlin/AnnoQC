@@ -1,0 +1,17 @@
+[scoring.weights]
+homology = 0.5
+intrinsic = 0.3
+taxonomy = 0.0
+domains = 0.1
+length = 0.1
+
+[consensus]
+min_hits = 5
+max_panel = 10
+
+[taxonomy]
+enabled = false
+
+# Pfam locations (adjust if different on your machine)
+pfam_db = "share/pfam/Pfam-A.hmm"
+pfam_clans = "share/pfam/Pfam-A.clans.tsv"
