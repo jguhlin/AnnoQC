@@ -20,6 +20,8 @@ mod preflight;
 mod provenance;
 mod scoring;
 mod taxonomy;
+mod orf;
+mod structvar;
 use diamond::{
     blastp_once, cluster as diamond_cluster, linclust as diamond_linclust, parse_tsv_stats,
     DiamondConfig,
@@ -156,6 +158,8 @@ struct AnalyzeArgs {
     dump_matches_best: bool,
     #[arg(long)]
     dump_matches_gene: Option<String>,
+    #[arg(long, default_value_t = false)]
+    nucleotide: bool,
 }
 
 #[derive(Args, Debug, Clone, Serialize, Deserialize)]
@@ -330,7 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 FileConfig::default()
             };
-            let cfg = resolve_effective_config(&file_cfg, &args)?;
+            let mut cfg = resolve_effective_config(&file_cfg, &args)?;
 
             fs::create_dir_all(&cfg.out)?;
 
@@ -340,6 +344,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.mafft_bin.as_deref(),
                 args.hmmscan_bin.as_deref(),
             );
+
+            // If nucleotide mode, translate to protein first
+            if args.nucleotide {
+                let prot_fa = orf::translate_nt_fasta_to_protein(&cfg.fasta)?;
+                cfg.fasta = prot_fa;
+            }
 
             // DIAMOND pre-run
             let dia_cfg = DiamondConfig {
@@ -429,6 +439,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let consensus_secs = step_finish("consensus", t_consensus, log_json);
+
+            // Structural variation analysis (heuristic)
+            let mut structvar_map: HashMap<String, structvar::StructVar> = HashMap::new();
+            for m in &metrics {
+                if let Some(hits) = grouped.get(&m.gene_id) {
+                    let sv = structvar::analyze(hits);
+                    structvar_map.insert(m.gene_id.clone(), sv);
+                }
+            }
 
             // Optional MAFFT alignment metrics
             let mut alignment_map: HashMap<String, AlignmentMetrics> = HashMap::new();
@@ -672,6 +691,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &taxsum_map,
                 Some(&domains_arch_map),
                 Some(&len_map),
+                Some(&structvar_map),
             )?;
             write_csv_metrics(
                 &cfg.out,
@@ -688,6 +708,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.classify_no_data,
                 Some(&domains_arch_map),
                 Some(&len_map),
+                Some(&structvar_map),
             )?;
             // Emit domains architecture diagnostics CSV
             if !domains_arch_dbg.is_empty() {
@@ -856,12 +877,13 @@ fn write_jsonl_metrics(
     taxsum_map: &HashMap<String, Option<TaxonSummary>>,
     arch_map: Option<&HashMap<String, f64>>,
     len_map: Option<&HashMap<String, (f64, f64, f64, String)>>,
+    sv_map: Option<&HashMap<String, structvar::StructVar>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_report.jsonl");
     let mut f = File::create(path)?;
     for m in metrics {
-        let warnings = if m.hits == 0 {
-            vec!["No DIAMOND hits"]
+        let mut warnings: Vec<String> = if m.hits == 0 {
+            vec!["No DIAMOND hits".to_string()]
         } else {
             Vec::new()
         };
@@ -919,6 +941,21 @@ fn write_jsonl_metrics(
             serde_json::json!({"status":"disabled"})
         };
         let cur_gene = &m.gene_id;
+        // Build alignment/struct-var warnings
+        let mut warn_extra: Vec<String> = Vec::new();
+        if let Some(a) = aln {
+            if a.missing_exon_run >= 30 { warn_extra.push("MissingExonPossible".into()); }
+            if a.retained_intron_run >= 30 { warn_extra.push("RetainedIntronPossible".into()); }
+        }
+        let sv_obj = sv_map.and_then(|mm| mm.get(cur_gene));
+        if let Some(sv) = sv_obj {
+            match sv.classification.as_str() {
+                "FusionPossible" => warn_extra.push("FusionPossible".into()),
+                "SplitPossible" => warn_extra.push("SplitPossible".into()),
+                "InternalDuplicationPossible" => warn_extra.push("InternalDuplicationPossible".into()),
+                _ => {}
+            }
+        }
         let domains = hmmsum_map.get(cur_gene).map(|d| {
             let score = if let Some(ev) = d.top_evalue { let le = if ev>0.0 { -ev.log10() } else { 100.0 }; (le/20.0).clamp(0.0, 1.0) } else { 0.0 };
             let arch_score = arch_map.and_then(|am| am.get(cur_gene)).cloned().unwrap_or(0.0);
@@ -980,7 +1017,14 @@ fn write_jsonl_metrics(
             })),
             "domains": domains,
             "length": length_block,
-            "warnings": warnings,
+            "structvar": sv_obj.map(|sv| serde_json::json!({
+                "classification": sv.classification,
+                "fusion_possible": sv.fusion_possible,
+                "split_possible": sv.split_possible,
+                "duplication_possible": sv.duplication_possible,
+                "spans": sv.spans
+            })),
+            "warnings": if warn_extra.is_empty() { warnings } else { warn_extra },
         });
         writeln!(f, "{}", serde_json::to_string(&record)?)?;
     }
@@ -1004,13 +1048,14 @@ fn write_csv_metrics(
     classify_no_data: bool,
     arch_map: Option<&HashMap<String, f64>>,
     len_map: Option<&HashMap<String, (f64, f64, f64, String)>>,
+    sv_map: Option<&HashMap<String, structvar::StructVar>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_summary.csv");
     let mut f = File::create(path)?;
     if csv_verbose {
-        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,length_score,length_ratio,length_class,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,start_concordance,start_class,taxonomy_status,warnings")?;
+        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,length_score,length_ratio,length_class,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,start_concordance,start_class,structvar_class,taxonomy_status,warnings")?;
     } else {
-        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,taxonomy_score,taxonomy_status,warnings")?;
+        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,structvar_class,taxonomy_score,taxonomy_status,warnings")?;
     }
     for m in metrics {
         let warnings = if m.hits == 0 { "No DIAMOND hits" } else { "" };
@@ -1056,6 +1101,7 @@ fn write_csv_metrics(
             } else {
                 (0, 0.0, 0.0, 0, 0.0, 0, 0, 0.0, String::new())
             };
+        let structvar_class = sv_map.and_then(|sm| sm.get(&m.gene_id)).map(|sv| sv.classification.clone()).unwrap_or_default();
         let taxonomy_score = if taxonomy_enabled {
             compute_taxonomy_score(
                 taxsum_map
@@ -1120,6 +1166,7 @@ fn write_csv_metrics(
                 max_gap.to_string(),
                 format!("{:.3}", start_conc),
                 start_class,
+                structvar_class,
                 taxonomy_status.to_string(),
                 warnings.to_string(),
             ].join(",");
@@ -1128,7 +1175,7 @@ fn write_csv_metrics(
         }
         writeln!(
             f,
-            "{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{},{:.3},{},{},{},{},{:.4},{},{}",
+            "{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{},{:.3},{},{},{},{},{},{:.4},{},{}",
             m.gene_id,
             m.hits,
             top_hit,
@@ -1151,6 +1198,7 @@ fn write_csv_metrics(
             max_gap,
             domains_arch_field,
             domains_score_field,
+            structvar_class,
             taxonomy_score,
             taxonomy_status,
             warnings

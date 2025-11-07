@@ -48,6 +48,10 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
         "qcovhsp",
         "scovhsp",
         "pident",
+        "qstart",
+        "qend",
+        "sstart",
+        "send",
         "qlen",
         "slen",
     ];
@@ -104,6 +108,10 @@ pub fn blastp_chunked(cfg: &DiamondConfig, chunk_size: usize, log_json: bool) ->
         "qcovhsp",
         "scovhsp",
         "pident",
+        "qstart",
+        "qend",
+        "sstart",
+        "send",
         "qlen",
         "slen",
     ];
@@ -302,6 +310,10 @@ pub struct DiamondHitRow {
     pub qcov: f64,
     pub scov: f64,
     pub pident: f64,
+    pub qstart: usize,
+    pub qend: usize,
+    pub sstart: usize,
+    pub send: usize,
     pub qlen: usize,
     pub slen: usize,
 }
@@ -325,7 +337,7 @@ pub fn parse_tsv_stats(
         let cols: Vec<&str> = line.split('\t').collect();
         let q = cols[0];
         let sseqid = cols[1].to_string();
-        let (bitscore, evalue, alen, qcov, scov, pident) = if cols.len() >= 10 && cols.len() < 12 {
+        let (bitscore, evalue, alen, qcov, scov, pident) = if cols.len() >= 14 && cols.len() < 16 {
             // our requested outfmt: 6 qseqid sseqid bitscore evalue length qcovhsp scovhsp pident
             (
                 cols[2].parse::<f64>().unwrap_or(0.0),
@@ -389,7 +401,7 @@ pub fn parse_tsv_grouped(
         if cols.len() < 2 { continue; }
         let q = cols[0].to_string();
         let s = cols[1].to_string();
-        let (bitscore, evalue, alen, qcov, scov, pident, qlen, slen) = if cols.len() >= 10 && cols.len() < 12 {
+        let (bitscore, evalue, alen, qcov, scov, pident, qstart, qend, sstart, send, qlen, slen) = if cols.len() >= 14 && cols.len() < 16 {
             (
                 cols[2].parse::<f64>().unwrap_or(0.0),
                 cols[3].to_string(),
@@ -399,6 +411,10 @@ pub fn parse_tsv_grouped(
                 cols[7].parse::<f64>().unwrap_or(0.0),
                 cols[8].parse::<usize>().unwrap_or(0),
                 cols[9].parse::<usize>().unwrap_or(0),
+                cols[10].parse::<usize>().unwrap_or(0),
+                cols[11].parse::<usize>().unwrap_or(0),
+                cols[12].parse::<usize>().unwrap_or(0),
+                cols[13].parse::<usize>().unwrap_or(0),
             )
         } else if cols.len() >= 12 {
             let pident = cols[2].parse::<f64>().unwrap_or(0.0);
@@ -413,9 +429,15 @@ pub fn parse_tsv_grouped(
                     if *qlen > 0 { (span / (*qlen as f64)).clamp(0.0, 1.0) } else { 0.0 }
                 } else { 0.0 }
             } else { 0.0 };
-            (bitscore, evalue, alen, qcov, 0.0, pident, qlen_map.and_then(|m| m.get(&q).cloned()).unwrap_or(0), 0)
+            (bitscore, evalue, alen, qcov, 0.0, pident,
+             cols[6].parse::<usize>().unwrap_or(0),
+             cols[7].parse::<usize>().unwrap_or(0),
+             cols[8].parse::<usize>().unwrap_or(0),
+             cols[9].parse::<usize>().unwrap_or(0),
+             qlen_map.and_then(|m| m.get(&q).cloned()).unwrap_or(0),
+             0)
         } else { continue; };
-        let row = DiamondHitRow { qseqid: q.clone(), sseqid: s, bitscore, evalue, length: alen, qcov, scov, pident, qlen, slen };
+        let row = DiamondHitRow { qseqid: q.clone(), sseqid: s, bitscore, evalue, length: alen, qcov, scov, pident, qstart, qend, sstart, send, qlen, slen };
         let entry = map.entry(q).or_default();
         entry.push(row);
         if let Some(k) = max_per_query { if entry.len() >= k { continue; } }

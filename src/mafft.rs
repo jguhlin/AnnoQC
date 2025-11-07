@@ -19,6 +19,8 @@ pub struct AlignmentMetrics {
     pub motif_mismatch_fraction: f64,
     pub start_concordance: f64,
     pub start_class: String,
+    pub missing_exon_run: usize,
+    pub retained_intron_run: usize,
 }
 
 pub fn load_sequences_by_ids(
@@ -228,5 +230,25 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         motif_mismatch_fraction: 0.0,
         start_concordance,
         start_class: start_class.to_string(),
+        missing_exon_run: compute_consensus_gap_run(&seqs, true),
+        retained_intron_run: compute_consensus_gap_run(&seqs, false),
     }
+}
+
+// If `query_gap=true`, measure the longest run where query is gap and ≥70% of others are residues.
+// If `query_gap=false`, measure the longest run where query is residue and ≥70% of others are gaps.
+fn compute_consensus_gap_run(seqs: &[Vec<u8>], query_gap: bool) -> usize {
+    if seqs.len() < 2 { return 0; }
+    let n = seqs.len();
+    let cols = seqs[0].len();
+    let mut run = 0usize;
+    let mut best = 0usize;
+    for c in 0..cols {
+        let q = seqs[0][c] == b'-';
+        let others_non_gap = (1..n).filter(|&r| seqs[r][c] != b'-').count();
+        let others_gap = (1..n).filter(|&r| seqs[r][c] == b'-').count();
+        let cond = if query_gap { q && (others_non_gap as f64)/(n as f64 - 1.0) >= 0.7 } else { !q && (others_gap as f64)/(n as f64 - 1.0) >= 0.7 };
+        if cond { run += 1; } else { best = best.max(run); run = 0; }
+    }
+    best.max(run)
 }
