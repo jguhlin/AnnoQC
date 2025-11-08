@@ -98,7 +98,10 @@ fn intake_system(mut commands: Commands, cfg: Res<EcsConfig>) {
     }
     ids.sort_by(|a, b| a.1.cmp(&b.1)); // ascending
     let total = ids.len();
-    commands.insert_resource(WorkQueue { queue: ids, hit_counts });
+    commands.insert_resource(WorkQueue {
+        queue: ids,
+        hit_counts,
+    });
     commands.insert_resource(Results::default());
     commands.insert_resource(InFlight {
         tasks: Vec::new(),

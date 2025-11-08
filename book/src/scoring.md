@@ -7,6 +7,7 @@ AnnoQC combines pillar scores in [0,1] into a weighted average. Pillars:
 - Taxonomy (t, optional): presence-only for now (1.0 if taxid resolved).
 - Domains Architecture (d, optional): Pfam clan-collapsed architecture agreement vs homolog panel.
 - Length Consistency (l, optional): query length vs homolog panel median using robust z-scores.
+- Orphan Domain Integrity (o, optional): detects N- or C-terminal Pfam domains that align far from the model edges, a strong hint of truncated gene models.
 
 Weights and thresholds
 - Configure in `config.example.toml` under `[scoring.weights]` and `[scoring.thresholds]`.
@@ -14,7 +15,7 @@ Weights and thresholds
 
 Outputs
 - JSONL: `score_components` lists per-pillar scores; `final_score` is the weighted average.
-- CSV (`--csv-verbose`): includes homology_score, intrinsic_score, taxonomy_score, domains_score, domains_arch_score, length_score, length_ratio, length_class, start_concordance, start_class.
+- CSV (`--csv-verbose`): includes homology_score, intrinsic_score, taxonomy_score, domains_score, domains_arch_score, orphan_domain_score, length_score, length_ratio, length_class, start_concordance, start_class (compact mode keeps `domains_score`, `domains_arch_score`, `orphan_domain_score`, and `orphan_status`).
 
 Formulas (implemented)
 
@@ -43,6 +44,12 @@ Formulas (implemented)
   - l = exp(−|z|/2). Also report length_ratio = Lq/m and length_class:
     - LikelyNTruncated if ratio < 0.8; LikelyNExtended if ratio > 1.2; else InRange.
 
+- Orphan domain integrity o
+  - Enabled when `hmmscan` runs (`--hmmscan-bin …`) and `[hmmer].orphan_analysis = true` (override with `--disable-orphan-analysis`).
+  - Collapse Pfam hits (clan-aware), sort domains by alignment start, and inspect the first and last domains only.
+  - Flag the N-terminal domain if it begins >20 HMM residues away from the model start (and the HMM length ≥60 aa). Flag the C-terminal domain if it ends >20 residues shy of the model end.
+  - o = 1.0 when no domain is flagged, 0.5 when only one terminus looks truncated, and 0.0 when both N and C appear truncated. JSON/CSV expose `orphan_status` along with the Pfam accession(s) that triggered the warning.
+
 Start-concordance (gated)
 - Alignment-based assessment of whether the query begins at the consensus N-terminus of its homologs.
 - Requires a homolog panel of at least `min_hits` (default 5). If panel_size < `min_hits`, MAFFT is skipped and `start_concordance`/`start_class` are omitted.
@@ -53,7 +60,7 @@ Start-concordance (gated)
   - start_class: LikelyComplete (|Δ|≤3), LikelyNTruncated (Δ>3), LikelyNExtended (Δ<−3).
 
 - Final score
-  - final_score = (w_h·h + w_i·i + w_t·t + w_d·d + w_l·l) / max(w_h + w_i + w_t + w_d + w_l, ε)
+  - final_score = (w_h·h + w_i·i + w_t·t + w_d·d + w_l·l + w_o·o) / max(w_h + w_i + w_t + w_d + w_l + w_o, ε)
 
 Thresholds and classification
 - High if final_score ≥ high; Medium if final_score ≥ medium; else Low. Defaults: high=0.8, medium=0.5.

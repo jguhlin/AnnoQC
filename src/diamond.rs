@@ -40,21 +40,8 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
 
     // Request explicit outfmt 6 columns by passing tokens separately.
     let outfmt_tokens = [
-        "6",
-        "qseqid",
-        "sseqid",
-        "bitscore",
-        "evalue",
-        "length",
-        "qcovhsp",
-        "scovhsp",
-        "pident",
-        "qstart",
-        "qend",
-        "sstart",
-        "send",
-        "qlen",
-        "slen",
+        "6", "qseqid", "sseqid", "bitscore", "evalue", "length", "qcovhsp", "scovhsp", "pident",
+        "qstart", "qend", "sstart", "send", "qlen", "slen",
     ];
     let mut attempts = 0usize;
     loop {
@@ -84,8 +71,13 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
         }
         if attempts > cfg.retries.max(1) {
             let mut ctx = String::from_utf8_lossy(&output.stderr).to_string();
-            if ctx.len() > 400 { ctx.truncate(400); }
-            return Err(format!("diamond blastp failed (attempt {}): status={} stderr='{}'", attempts, output.status, ctx));
+            if ctx.len() > 400 {
+                ctx.truncate(400);
+            }
+            return Err(format!(
+                "diamond blastp failed (attempt {}): status={} stderr='{}'",
+                attempts, output.status, ctx
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(500 * attempts as u64));
     }
@@ -94,7 +86,11 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
 
 /// Chunked mode: split queries into chunks of `chunk_size` records and append outputs.
 /// If `log_json` is true, emits per-chunk JSON progress events.
-pub fn blastp_chunked(cfg: &DiamondConfig, chunk_size: usize, log_json: bool) -> Result<PathBuf, String> {
+pub fn blastp_chunked(
+    cfg: &DiamondConfig,
+    chunk_size: usize,
+    log_json: bool,
+) -> Result<PathBuf, String> {
     use needletail::parse_fastx_file;
     let out_path = cfg.out_path();
     if out_path.exists() {
@@ -102,21 +98,8 @@ pub fn blastp_chunked(cfg: &DiamondConfig, chunk_size: usize, log_json: bool) ->
     }
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
     let outfmt_tokens = [
-        "6",
-        "qseqid",
-        "sseqid",
-        "bitscore",
-        "evalue",
-        "length",
-        "qcovhsp",
-        "scovhsp",
-        "pident",
-        "qstart",
-        "qend",
-        "sstart",
-        "send",
-        "qlen",
-        "slen",
+        "6", "qseqid", "sseqid", "bitscore", "evalue", "length", "qcovhsp", "scovhsp", "pident",
+        "qstart", "qend", "sstart", "send", "qlen", "slen",
     ];
     let mut reader = parse_fastx_file(&cfg.query_fasta).map_err(|e| e.to_string())?;
     let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
@@ -132,13 +115,20 @@ pub fn blastp_chunked(cfg: &DiamondConfig, chunk_size: usize, log_json: bool) ->
             processed += batch.len();
             if log_json {
                 let secs = start.elapsed().as_secs_f64();
-                let rate = if secs > 0.0 { processed as f64 / secs } else { 0.0 };
-                log::info!("{}", serde_json::json!({
-                    "event":"diamond_chunk","chunk_index": tmp_idx-1,
-                    "queries": batch.len(),"processed": processed,
-                    "seconds": format!("{:.2}", secs),
-                    "rate": format!("{:.2}", rate)
-                }));
+                let rate = if secs > 0.0 {
+                    processed as f64 / secs
+                } else {
+                    0.0
+                };
+                log::info!(
+                    "{}",
+                    serde_json::json!({
+                        "event":"diamond_chunk","chunk_index": tmp_idx-1,
+                        "queries": batch.len(),"processed": processed,
+                        "seconds": format!("{:.2}", secs),
+                        "rate": format!("{:.2}", rate)
+                    })
+                );
             }
             batch.clear();
         }
@@ -148,13 +138,20 @@ pub fn blastp_chunked(cfg: &DiamondConfig, chunk_size: usize, log_json: bool) ->
         processed += batch.len();
         if log_json {
             let secs = start.elapsed().as_secs_f64();
-            let rate = if secs > 0.0 { processed as f64 / secs } else { 0.0 };
-            log::info!("{}", serde_json::json!({
-                "event":"diamond_chunk","chunk_index": tmp_idx-1,
-                "queries": batch.len(),"processed": processed,
-                "seconds": format!("{:.2}", secs),
-                "rate": format!("{:.2}", rate)
-            }));
+            let rate = if secs > 0.0 {
+                processed as f64 / secs
+            } else {
+                0.0
+            };
+            log::info!(
+                "{}",
+                serde_json::json!({
+                    "event":"diamond_chunk","chunk_index": tmp_idx-1,
+                    "queries": batch.len(),"processed": processed,
+                    "seconds": format!("{:.2}", secs),
+                    "rate": format!("{:.2}", rate)
+                })
+            );
         }
     }
     Ok(out_path)
@@ -206,8 +203,13 @@ fn run_chunk(
         }
         if attempts > cfg.retries.max(1) {
             let mut ctx = String::from_utf8_lossy(&output.stderr).to_string();
-            if ctx.len() > 400 { ctx.truncate(400); }
-            return Err(format!("diamond chunk blastp failed after {} attempts: status={} stderr='{}'", attempts, output.status, ctx));
+            if ctx.len() > 400 {
+                ctx.truncate(400);
+            }
+            return Err(format!(
+                "diamond chunk blastp failed after {} attempts: status={} stderr='{}'",
+                attempts, output.status, ctx
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(300 * attempts as u64));
     }
@@ -229,7 +231,10 @@ pub fn estimate_query_count(fasta: &str) -> Result<usize, String> {
     use needletail::parse_fastx_file;
     let mut reader = parse_fastx_file(fasta).map_err(|e| e.to_string())?;
     let mut n = 0usize;
-    while let Some(r) = reader.next() { r.map_err(|e| e.to_string())?; n += 1; }
+    while let Some(r) = reader.next() {
+        r.map_err(|e| e.to_string())?;
+        n += 1;
+    }
     Ok(n)
 }
 
@@ -364,9 +369,17 @@ pub fn parse_tsv_stats(
                     let qstart = cols[6].parse::<f64>().unwrap_or(0.0);
                     let qend = cols[7].parse::<f64>().unwrap_or(0.0);
                     let span = (qend - qstart).abs() + 1.0;
-                    if *qlen > 0 { (span / (*qlen as f64)).clamp(0.0, 1.0) } else { 0.0 }
-                } else { 0.0 }
-            } else { 0.0 };
+                    if *qlen > 0 {
+                        (span / (*qlen as f64)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
             (bitscore, evalue, alen, qcov, 0.0, pident)
         } else {
             continue;
@@ -396,60 +409,107 @@ pub fn parse_tsv_grouped(
     max_per_query: Option<usize>,
 ) -> Result<std::collections::HashMap<String, Vec<DiamondHitRow>>, String> {
     let mut map: std::collections::HashMap<String, Vec<DiamondHitRow>> = Default::default();
-    if !tsv.exists() { return Ok(map); }
+    if !tsv.exists() {
+        return Ok(map);
+    }
     let file = std::fs::File::open(tsv).map_err(|e| e.to_string())?;
     let reader = std::io::BufReader::new(file);
     for line in reader.lines() {
         let line = line.map_err(|e| e.to_string())?;
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 2 { continue; }
+        if cols.len() < 2 {
+            continue;
+        }
         let q = cols[0].to_string();
         let s = cols[1].to_string();
-        let (bitscore, evalue, alen, qcov, scov, pident, qstart, qend, sstart, send, qlen, slen) = if cols.len() >= 14 && cols.len() < 16 {
-            (
-                cols[2].parse::<f64>().unwrap_or(0.0),
-                cols[3].to_string(),
-                cols[4].parse::<usize>().unwrap_or(0),
-                cols[5].parse::<f64>().unwrap_or(0.0) / 100.0,
-                cols[6].parse::<f64>().unwrap_or(0.0) / 100.0,
-                cols[7].parse::<f64>().unwrap_or(0.0),
-                cols[8].parse::<usize>().unwrap_or(0),
-                cols[9].parse::<usize>().unwrap_or(0),
-                cols[10].parse::<usize>().unwrap_or(0),
-                cols[11].parse::<usize>().unwrap_or(0),
-                cols[12].parse::<usize>().unwrap_or(0),
-                cols[13].parse::<usize>().unwrap_or(0),
-            )
-        } else if cols.len() >= 12 {
-            let pident = cols[2].parse::<f64>().unwrap_or(0.0);
-            let alen = cols[3].parse::<usize>().unwrap_or(0);
-            let evalue = cols[10].to_string();
-            let bitscore = cols[11].parse::<f64>().unwrap_or(0.0);
-            let qcov = if let Some(map) = qlen_map {
-                if let Some(qlen) = map.get(&q) {
-                    let qstart = cols[6].parse::<f64>().unwrap_or(0.0);
-                    let qend = cols[7].parse::<f64>().unwrap_or(0.0);
-                    let span = (qend - qstart).abs() + 1.0;
-                    if *qlen > 0 { (span / (*qlen as f64)).clamp(0.0, 1.0) } else { 0.0 }
-                } else { 0.0 }
-            } else { 0.0 };
-            (bitscore, evalue, alen, qcov, 0.0, pident,
-             cols[6].parse::<usize>().unwrap_or(0),
-             cols[7].parse::<usize>().unwrap_or(0),
-             cols[8].parse::<usize>().unwrap_or(0),
-             cols[9].parse::<usize>().unwrap_or(0),
-             qlen_map.and_then(|m| m.get(&q).cloned()).unwrap_or(0),
-             0)
-        } else { continue; };
-        let row = DiamondHitRow { qseqid: q.clone(), sseqid: s, bitscore, evalue, length: alen, qcov, scov, pident, qstart, qend, sstart, send, qlen, slen };
+        let (bitscore, evalue, alen, qcov, scov, pident, qstart, qend, sstart, send, qlen, slen) =
+            if cols.len() >= 14 && cols.len() < 16 {
+                (
+                    cols[2].parse::<f64>().unwrap_or(0.0),
+                    cols[3].to_string(),
+                    cols[4].parse::<usize>().unwrap_or(0),
+                    cols[5].parse::<f64>().unwrap_or(0.0) / 100.0,
+                    cols[6].parse::<f64>().unwrap_or(0.0) / 100.0,
+                    cols[7].parse::<f64>().unwrap_or(0.0),
+                    cols[8].parse::<usize>().unwrap_or(0),
+                    cols[9].parse::<usize>().unwrap_or(0),
+                    cols[10].parse::<usize>().unwrap_or(0),
+                    cols[11].parse::<usize>().unwrap_or(0),
+                    cols[12].parse::<usize>().unwrap_or(0),
+                    cols[13].parse::<usize>().unwrap_or(0),
+                )
+            } else if cols.len() >= 12 {
+                let pident = cols[2].parse::<f64>().unwrap_or(0.0);
+                let alen = cols[3].parse::<usize>().unwrap_or(0);
+                let evalue = cols[10].to_string();
+                let bitscore = cols[11].parse::<f64>().unwrap_or(0.0);
+                let qcov = if let Some(map) = qlen_map {
+                    if let Some(qlen) = map.get(&q) {
+                        let qstart = cols[6].parse::<f64>().unwrap_or(0.0);
+                        let qend = cols[7].parse::<f64>().unwrap_or(0.0);
+                        let span = (qend - qstart).abs() + 1.0;
+                        if *qlen > 0 {
+                            (span / (*qlen as f64)).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                (
+                    bitscore,
+                    evalue,
+                    alen,
+                    qcov,
+                    0.0,
+                    pident,
+                    cols[6].parse::<usize>().unwrap_or(0),
+                    cols[7].parse::<usize>().unwrap_or(0),
+                    cols[8].parse::<usize>().unwrap_or(0),
+                    cols[9].parse::<usize>().unwrap_or(0),
+                    qlen_map.and_then(|m| m.get(&q).cloned()).unwrap_or(0),
+                    0,
+                )
+            } else {
+                continue;
+            };
+        let row = DiamondHitRow {
+            qseqid: q.clone(),
+            sseqid: s,
+            bitscore,
+            evalue,
+            length: alen,
+            qcov,
+            scov,
+            pident,
+            qstart,
+            qend,
+            sstart,
+            send,
+            qlen,
+            slen,
+        };
         let entry = map.entry(q).or_default();
         entry.push(row);
-        if let Some(k) = max_per_query { if entry.len() >= k { continue; } }
+        if let Some(k) = max_per_query {
+            if entry.len() >= k {
+                continue;
+            }
+        }
     }
     // Sort each vector by decreasing bitscore
     for v in map.values_mut() {
-        v.sort_by(|a,b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal));
+        v.sort_by(|a, b| {
+            b.bitscore
+                .partial_cmp(&a.bitscore)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
     Ok(map)
 }

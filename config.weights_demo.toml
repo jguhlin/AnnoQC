@@ -1,20 +1,38 @@
-pfam_db = "share/pfam/Pfam-A.hmm"
-pfam_clans = "share/pfam/Pfam-A.clans.tsv"
-
 [scoring.weights]
 homology = 0.5
 intrinsic = 0.3
 taxonomy = 0.0
 domains = 0.1
 length = 0.1
+orphan = 0.0
 
 [consensus]
 min_hits = 5
 max_panel = 20
+filt_qcov = 0.70
+filt_scov = 0.50
+filt_evalue = 1e-5
+filt_pident = 25.0
+len_ratio_tolerance = 0.30
+redundancy_pident = 90.0
+max_high_identity = 3
 
 [taxonomy]
 enabled = false
 
+# Structural variation defaults tuned from head200 summary (fusion gap≈160 aa, subject coverage≈0.27)
+[structvar]
+min_hsp_len = 50
+min_hsp_frac = 0.20
+fusion_min_gap = 160
+dup_max_gap = 20
+split_delta = 0.30
+min_subject_cov = 0.27
+orient_majority = 0.70
+
 # Top-level Pfam paths for HMMER (must be at root, not under [taxonomy])
 pfam_db = "share/pfam/Pfam-A.hmm"
 pfam_clans = "share/pfam/Pfam-A.clans.tsv"
+
+[hmmer]
+orphan_analysis = true

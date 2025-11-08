@@ -1,5 +1,7 @@
 # Next Feature: Orphan Domain Analysis
 
+_Status: implemented — hmmscan now parses HMM coordinates, detects N/C-terminal orphan domains, emits `orphan_status`/`orphan_domain_score`, and wires the new pillar into scoring/docs._
+
 This is the next priority feature to implement.
 
 ### Implementation Plan
@@ -151,17 +153,17 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 
 ## Architecture & Data Flow
 
-- [ ] CLI with `prepare` and `analyze` subcommands.
+- [x] CLI with `prepare` and `analyze` subcommands.
 - [x] Implemented `prepare` (makedb only) and `analyze`.
-- [ ] External tools wired: DIAMOND, optional MAFFT/HMMER.
+- [x] External tools wired: DIAMOND, optional MAFFT/HMMER.
 - [x] DIAMOND wired: `--version`, `blastp` pre-run, `makedb` in `prepare`.
 - [x] DIAMOND TSV parsed for top-hit stats (bitscore, evalue, coverage, density).
-- [ ] FASTA handling via `needletail` (gz supported).
+- [x] FASTA handling via `needletail` (gz supported).
 - [x] FASTA parse for ids/lengths via needletail.
 - [ ] `prepare`: makedb → cluster → realign → recluster artifacts.
 - [x] Implement makedb + linclust + cluster with `.done` checkpoints; recluster placeholder.
 - [x] Add `--resume` support and progress logs for all prepare steps (checkpointed).
-- [ ] `analyze`: read input → schedule tasks → parse DIAMOND → compute metrics → emit outputs.
+- [x] `analyze`: read input → schedule tasks → parse DIAMOND → compute metrics → emit outputs.
 - [x] Read input + schedule tasks + emit minimal outputs.
 - [x] Emit enriched homology fields in JSONL and CSV.
 - [x] Add final_score and classification to CSV; JSONL contains per-pillar scores and final_score.
@@ -176,12 +178,12 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 ## Performance & Reliability
 
 - [ ] Streaming I/O and bounded memory usage.
-- [ ] Expose threads/approx-id/member-cover; sensible defaults.
-- [ ] Retry transient DIAMOND errors; concise diagnostics.
+- [x] Expose threads/approx-id/member-cover; sensible defaults.
+- [x] Retry transient DIAMOND errors; concise diagnostics.
 
 ## Reproducibility
 
-- [ ] Run manifest (tool versions, config snapshot, checksums) at `results/run.json`.
+- [x] Run manifest (tool versions, config snapshot, checksums) at `results/run.json`.
 - [x] Basic run manifest with tool versions (diamond/mafft/hmmscan) and inputs.
 - [x] Add file hashes for FASTA and DB (xx64).
 - [x] Manifest includes schema_version and a config snapshot (resolved settings & weights).

@@ -60,7 +60,10 @@ pub fn run_mafft(
         writeln!(&mut fasta_data, "{}", String::from_utf8_lossy(seq)).unwrap();
     }
 
-    let threads_env = std::env::var("MAFFT_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+    let threads_env = std::env::var("MAFFT_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);
     let mut child = Command::new(mafft_bin)
         .arg("--auto")
         .arg("--thread")
@@ -102,24 +105,24 @@ fn parse_fasta_sequences(s: &str) -> Vec<Vec<u8>> {
     seqs
 }
 
-#[allow(clippy::needless_range_loop)]
 fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
     if seqs.is_empty() {
         return AlignmentMetrics::default();
     }
     let cols = seqs[0].len();
     let n = seqs.len();
+    let query = &seqs[0];
     if n == 0 || cols == 0 {
         return AlignmentMetrics::default();
     }
     let mut conserved = 0usize;
     // formerly tracked pid_sum and valid_cols; not used in current metrics
-    for c in 0..cols {
+    for (c, _) in seqs[0].iter().enumerate() {
         let mut base = None;
         let mut all_same = true;
         let mut non_gap = 0usize;
-        for r in 0..n {
-            let ch = seqs[r][c];
+        for seq in seqs.iter() {
+            let ch = seq[c];
             if ch != b'-' {
                 non_gap += 1;
                 if let Some(b) = base {
@@ -138,10 +141,8 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
     // pairwise identity: between first and others averaged
     let mut matches = 0usize;
     let mut compared = 0usize;
-    for r in 1..n {
-        for c in 0..cols {
-            let a = seqs[0][c];
-            let b = seqs[r][c];
+    for seq in seqs.iter().skip(1) {
+        for (&a, &b) in query.iter().zip(seq.iter()) {
             if a == b && a != b'-' {
                 matches += 1;
             }
@@ -157,7 +158,6 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
     };
 
     // gap metrics on query
-    let query = &seqs[0];
     let mut gap_count = 0usize;
     let mut gap_run = 0usize;
     let mut max_gap_run = 0usize;
@@ -184,7 +184,7 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         .iter()
         .map(|s| s.iter().position(|&c| c != b'-').unwrap_or(0))
         .collect();
-    let query_start = *starts.get(0).unwrap_or(&0);
+    let query_start = *starts.first().unwrap_or(&0);
     let mut others: Vec<usize> = starts.iter().cloned().skip(1).collect();
     others.sort_unstable();
     let modal = if others.is_empty() {
@@ -230,25 +230,35 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         motif_mismatch_fraction: 0.0,
         start_concordance,
         start_class: start_class.to_string(),
-        missing_exon_run: compute_consensus_gap_run(&seqs, true),
-        retained_intron_run: compute_consensus_gap_run(&seqs, false),
+        missing_exon_run: compute_consensus_gap_run(seqs, true),
+        retained_intron_run: compute_consensus_gap_run(seqs, false),
     }
 }
 
 // If `query_gap=true`, measure the longest run where query is gap and ≥70% of others are residues.
 // If `query_gap=false`, measure the longest run where query is residue and ≥70% of others are gaps.
 fn compute_consensus_gap_run(seqs: &[Vec<u8>], query_gap: bool) -> usize {
-    if seqs.len() < 2 { return 0; }
+    if seqs.len() < 2 {
+        return 0;
+    }
     let n = seqs.len();
-    let cols = seqs[0].len();
     let mut run = 0usize;
     let mut best = 0usize;
-    for c in 0..cols {
-        let q = seqs[0][c] == b'-';
+    for (c, &query_char) in seqs[0].iter().enumerate() {
+        let q = query_char == b'-';
         let others_non_gap = (1..n).filter(|&r| seqs[r][c] != b'-').count();
         let others_gap = (1..n).filter(|&r| seqs[r][c] == b'-').count();
-        let cond = if query_gap { q && (others_non_gap as f64)/(n as f64 - 1.0) >= 0.7 } else { !q && (others_gap as f64)/(n as f64 - 1.0) >= 0.7 };
-        if cond { run += 1; } else { best = best.max(run); run = 0; }
+        let cond = if query_gap {
+            q && (others_non_gap as f64) / (n as f64 - 1.0) >= 0.7
+        } else {
+            !q && (others_gap as f64) / (n as f64 - 1.0) >= 0.7
+        };
+        if cond {
+            run += 1;
+        } else {
+            best = best.max(run);
+            run = 0;
+        }
     }
     best.max(run)
 }

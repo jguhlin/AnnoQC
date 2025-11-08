@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -9,19 +9,19 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 mod checkpoint;
+mod consensus;
 mod diamond;
 mod ecs;
-mod consensus;
 mod hmmer;
+mod length;
 mod mafft;
 mod metrics;
-mod length;
+mod orf;
 mod preflight;
 mod provenance;
 mod scoring;
-mod taxonomy;
-mod orf;
 mod structvar;
+mod taxonomy;
 use diamond::{
     blastp_once, cluster as diamond_cluster, linclust as diamond_linclust, parse_tsv_stats,
     DiamondConfig,
@@ -32,10 +32,24 @@ use mafft::{load_sequences_by_ids, run_mafft, AlignmentMetrics};
 use metrics::compute_intrinsic;
 use preflight::preflight;
 use provenance::filehash_xx64;
-use scoring::{
-    compute_homology_score, compute_intrinsic_score, compute_taxonomy_score,
-};
+use scoring::{compute_homology_score, compute_intrinsic_score, compute_taxonomy_score};
 use taxonomy::{TaxonSummary, TaxonomyResolver};
+
+type DomainsArchDebugRow = (
+    String,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    f64,
+    f64,
+    f64,
+    f64,
+);
+type LengthSummary = (f64, f64, f64, String);
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -146,6 +160,8 @@ struct AnalyzeArgs {
     hmmer_ievalue: Option<f64>,
     #[arg(long)]
     hmmer_ref_ievalue: Option<f64>,
+    #[arg(long, default_value_t = false)]
+    disable_orphan_analysis: bool,
     #[arg(long, value_enum, default_value_t = DiamondMode::Auto)]
     diamond_mode: DiamondMode,
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
@@ -162,6 +178,21 @@ struct AnalyzeArgs {
     nucleotide: bool,
     #[arg(long)]
     diamond_max_hsps: Option<usize>,
+    // StructVar thresholds (optional overrides)
+    #[arg(long)]
+    sv_min_hsp_len: Option<usize>,
+    #[arg(long)]
+    sv_min_hsp_frac: Option<f64>,
+    #[arg(long)]
+    sv_fusion_min_gap: Option<usize>,
+    #[arg(long)]
+    sv_dup_max_gap: Option<usize>,
+    #[arg(long)]
+    sv_split_delta: Option<f64>,
+    #[arg(long)]
+    sv_min_subject_cov: Option<f64>,
+    #[arg(long)]
+    sv_orient_majority: Option<f64>,
 }
 
 #[derive(Args, Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +253,7 @@ struct FileConfig {
     hmmer: Option<HmmerConfigOverride>,
     diamond: Option<DiamondConfigOverride>,
     consensus: Option<ConsensusConfigOverride>,
+    structvar: Option<StructVarConfigOverride>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -241,6 +273,7 @@ struct HmmerConfigOverride {
     threads: Option<usize>,
     ievalue: Option<f64>,
     ref_ievalue: Option<f64>,
+    orphan_analysis: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -250,9 +283,27 @@ struct DiamondConfigOverride {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct StructVarConfigOverride {
+    min_hsp_len: Option<usize>,
+    min_hsp_frac: Option<f64>,
+    fusion_min_gap: Option<usize>,
+    dup_max_gap: Option<usize>,
+    split_delta: Option<f64>,
+    min_subject_cov: Option<f64>,
+    orient_majority: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct ConsensusConfigOverride {
     min_hits: Option<usize>,
     max_panel: Option<usize>,
+    filt_qcov: Option<f64>,
+    filt_scov: Option<f64>,
+    filt_evalue: Option<f64>,
+    filt_pident: Option<f64>,
+    redundancy_pident: Option<f64>,
+    max_high_identity: Option<usize>,
+    len_ratio_tolerance: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -313,7 +364,10 @@ fn step_finish(name: &str, start: Instant, json_logs: bool) -> f64 {
     secs
 }
 
-fn write_run_metrics(out_dir: &str, metrics: &RunMetrics) -> Result<(), Box<dyn std::error::Error>> {
+fn write_run_metrics(
+    out_dir: &str,
+    metrics: &RunMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::path::Path::new(out_dir).join("run_metrics.json");
     let text = serde_json::to_string_pretty(metrics)?;
     std::fs::write(path, text)?;
@@ -372,7 +426,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t_diamond = step_start("diamond", log_json);
             let diamond_tsv = match args.diamond_mode {
                 DiamondMode::Single => blastp_once(&dia_cfg)?,
-                DiamondMode::Batch => diamond::blastp_chunked(&dia_cfg, args.batch_size.max(1), log_json)?,
+                DiamondMode::Batch => {
+                    diamond::blastp_chunked(&dia_cfg, args.batch_size.max(1), log_json)?
+                }
                 DiamondMode::Auto => {
                     let n = diamond::estimate_query_count(&cfg.fasta).unwrap_or(0);
                     // Heuristic: use config/flag threshold, default 200k
@@ -406,52 +462,156 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Build consensus panels per gene from DIAMOND hits
             let t_consensus = step_start("consensus", log_json);
-            let qlen_map: HashMap<String, usize> = metrics.iter().map(|m| (m.gene_id.clone(), m.length)).collect();
-            let grouped = diamond::parse_tsv_grouped(&diamond_tsv, Some(&qlen_map), Some(1000)).unwrap_or_default();
-            let cons_cfg = consensus::ConsensusConfig {
-                min_hits: file_cfg
-                    .consensus
-                    .as_ref()
-                    .and_then(|c| c.min_hits)
-                    .unwrap_or(5),
-                max_panel: file_cfg
-                    .consensus
-                    .as_ref()
-                    .and_then(|c| c.max_panel)
-                    .unwrap_or(10),
-                ..Default::default()
-            };
+            let qlen_map: HashMap<String, usize> = metrics
+                .iter()
+                .map(|m| (m.gene_id.clone(), m.length))
+                .collect();
+            let grouped = diamond::parse_tsv_grouped(&diamond_tsv, Some(&qlen_map), Some(1000))
+                .unwrap_or_default();
+            let mut cons_cfg = consensus::ConsensusConfig::default();
+            if let Some(cfg_override) = file_cfg.consensus.as_ref() {
+                if let Some(v) = cfg_override.min_hits {
+                    cons_cfg.min_hits = v;
+                }
+                if let Some(v) = cfg_override.max_panel {
+                    cons_cfg.max_panel = v;
+                }
+                if let Some(v) = cfg_override.filt_qcov {
+                    cons_cfg.filt_qcov = v;
+                }
+                if let Some(v) = cfg_override.filt_scov {
+                    cons_cfg.filt_scov = v;
+                }
+                if let Some(v) = cfg_override.filt_evalue {
+                    cons_cfg.filt_evalue = v;
+                }
+                if let Some(v) = cfg_override.filt_pident {
+                    cons_cfg.filt_pident = v;
+                }
+                if let Some(v) = cfg_override.redundancy_pident {
+                    cons_cfg.redundancy_pident = v;
+                }
+                if let Some(v) = cfg_override.max_high_identity {
+                    cons_cfg.max_high_identity = v;
+                }
+                if let Some(v) = cfg_override.len_ratio_tolerance {
+                    cons_cfg.len_ratio_tolerance = v;
+                }
+            }
             let mut panel_map: HashMap<String, Vec<String>> = HashMap::new();
-            let mut len_map: HashMap<String, (f64, f64, f64, String)> = HashMap::new();
+            let mut panel_stats_rows: Vec<(String, consensus::PanelStats)> = Vec::new();
+            let mut len_map: HashMap<String, LengthSummary> = HashMap::new();
             for m in &metrics {
                 if let Some(hits) = grouped.get(&m.gene_id) {
-                    let ids = consensus::select_panel(hits, &cons_cfg);
-                    if !ids.is_empty() {
-                        panel_map.insert(m.gene_id.clone(), ids);
-                    }
-                    // Length consistency against available subject lengths from the selected panel only
-                    if let Some(panel_ids) = panel_map.get(&m.gene_id) {
+                    let selection = consensus::select_panel(hits, &cons_cfg);
+                    let panel_ids = selection.ids.clone();
+                    panel_stats_rows.push((m.gene_id.clone(), selection.stats.clone()));
+                    if !panel_ids.is_empty() {
+                        panel_map.insert(m.gene_id.clone(), panel_ids.clone());
+                        // Length consistency against available subject lengths from the selected panel only
+                        let id_set: HashSet<String> = panel_ids.iter().cloned().collect();
                         let slens: Vec<usize> = hits
                             .iter()
-                            .filter(|h| panel_ids.contains(&h.sseqid))
+                            .filter(|h| id_set.contains(&h.sseqid))
                             .map(|h| h.slen)
-                            .filter(|&x| x>0)
+                            .filter(|&x| x > 0)
                             .collect();
                         if slens.len() >= cons_cfg.min_hits {
                             if let Some(lc) = length::compute_length_consistency(m.length, &slens) {
-                                len_map.insert(m.gene_id.clone(), (lc.score, lc.z, lc.ratio, lc.class_));
+                                len_map.insert(
+                                    m.gene_id.clone(),
+                                    (lc.score, lc.z, lc.ratio, lc.class_),
+                                );
                             }
                         }
                     }
+                } else {
+                    panel_stats_rows.push((
+                        m.gene_id.clone(),
+                        consensus::PanelStats {
+                            total_hits: 0,
+                            ..Default::default()
+                        },
+                    ));
                 }
             }
             let consensus_secs = step_finish("consensus", t_consensus, log_json);
+            if !panel_stats_rows.is_empty() {
+                let panel_dbg = Path::new(&cfg.out).join("panel_debug.csv");
+                let mut f = File::create(panel_dbg)?;
+                writeln!(f, "gene_id,total_hits,phase,selected,filtered_hits,len_ratio_window_min,len_ratio_window_max,median_len_ratio,len_ratio_min,len_ratio_max,median_pident,high_identity_dropped")?;
+                for (gid, st) in panel_stats_rows {
+                    writeln!(
+                        f,
+                        "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
+                        gid,
+                        st.total_hits,
+                        st.phase,
+                        st.selected,
+                        st.filtered_hits,
+                        st.len_ratio_window_min,
+                        st.len_ratio_window_max,
+                        st.median_len_ratio,
+                        st.len_ratio_min,
+                        st.len_ratio_max,
+                        st.median_pident,
+                        st.high_identity_dropped,
+                    )?;
+                }
+            }
 
             // Structural variation analysis (heuristic)
             let mut structvar_map: HashMap<String, structvar::StructVar> = HashMap::new();
+            // Build thresholds from flags/config
+            let mut sv_th = structvar::StructVarThresholds::default();
+            if let Some(ref svcfg) = file_cfg.structvar {
+                if let Some(v) = svcfg.min_hsp_len {
+                    sv_th.min_strong_len = v;
+                }
+                if let Some(v) = svcfg.min_hsp_frac {
+                    sv_th.min_strong_frac = v;
+                }
+                if let Some(v) = svcfg.fusion_min_gap {
+                    sv_th.fusion_min_gap = v;
+                }
+                if let Some(v) = svcfg.dup_max_gap {
+                    sv_th.dup_max_gap = v;
+                }
+                if let Some(v) = svcfg.split_delta {
+                    sv_th.split_delta = v;
+                }
+                if let Some(v) = svcfg.min_subject_cov {
+                    sv_th.min_subject_cov = v;
+                }
+                if let Some(v) = svcfg.orient_majority {
+                    sv_th.orient_majority = v;
+                }
+            }
+            if let Some(v) = args.sv_min_hsp_len {
+                sv_th.min_strong_len = v;
+            }
+            if let Some(v) = args.sv_min_hsp_frac {
+                sv_th.min_strong_frac = v;
+            }
+            if let Some(v) = args.sv_fusion_min_gap {
+                sv_th.fusion_min_gap = v;
+            }
+            if let Some(v) = args.sv_dup_max_gap {
+                sv_th.dup_max_gap = v;
+            }
+            if let Some(v) = args.sv_split_delta {
+                sv_th.split_delta = v;
+            }
+            if let Some(v) = args.sv_min_subject_cov {
+                sv_th.min_subject_cov = v;
+            }
+            if let Some(v) = args.sv_orient_majority {
+                sv_th.orient_majority = v;
+            }
+
             for m in &metrics {
                 if let Some(hits) = grouped.get(&m.gene_id) {
-                    let sv = structvar::analyze(hits);
+                    let sv = structvar::analyze(hits, &sv_th);
                     structvar_map.insert(m.gene_id.clone(), sv);
                 }
             }
@@ -463,7 +623,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let t_mafft = step_start("mafft", log_json);
                 // Choose MAFFT threads smartly: 8 if available, else 4 if available, else 1
-                let mafft_threads = if cfg.threads >= 8 { 8 } else if cfg.threads >= 4 { 4 } else { 1 };
+                let mafft_threads = if cfg.threads >= 8 {
+                    8
+                } else if cfg.threads >= 4 {
+                    4
+                } else {
+                    1
+                };
                 std::env::set_var("MAFFT_THREADS", mafft_threads.to_string());
                 let all_ids: Vec<String> = panel_map.values().flat_map(|v| v.clone()).collect();
                 let seqs = load_sequences_by_ids(ref_fasta, &all_ids).unwrap_or_default();
@@ -505,7 +671,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             best = Some((m.gene_id.clone(), n));
                         }
                     }
-                    if let Some((gid, _)) = best { target_gene = Some(gid); }
+                    if let Some((gid, _)) = best {
+                        target_gene = Some(gid);
+                    }
                 }
                 if let Some(gid) = target_gene {
                     let ids = panel_map.get(&gid).cloned().unwrap_or_default();
@@ -534,10 +702,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut hmmsum_map: HashMap<String, HmmscanSummary> = HashMap::new();
             let mut _ref_hmmsum_map: HashMap<String, HmmscanSummary> = HashMap::new();
             let mut domains_arch_map: HashMap<String, f64> = HashMap::new();
-            let mut domains_arch_dbg: Vec<(String, usize, usize, usize, usize, usize, usize, usize, f64, f64, f64, f64)> = Vec::new();
-            if let (Some(hmm), Some(pfam_db)) = (args.hmmscan_bin.as_ref(), args.pfam_db.as_ref().or(file_cfg.pfam_db.as_ref()).or(file_cfg.pfam_db.as_ref())) {
+            let mut domains_arch_dbg: Vec<DomainsArchDebugRow> = Vec::new();
+            let mut orphan_map: HashMap<String, hmmer::OrphanAnalysis> = HashMap::new();
+            let mut orphan_analysis_enabled = false;
+            if let (Some(hmm), Some(pfam_db)) = (
+                args.hmmscan_bin.as_ref(),
+                args.pfam_db
+                    .as_ref()
+                    .or(file_cfg.pfam_db.as_ref())
+                    .or(file_cfg.pfam_db.as_ref()),
+            ) {
                 let t_hmmer = step_start("hmmer", log_json);
-                let items: Vec<(String, Vec<u8>)> = intrinsic_map.iter().map(|(gid, (_im, qseq))| (gid.clone(), qseq.clone())).collect();
+                let items: Vec<(String, Vec<u8>)> = intrinsic_map
+                    .iter()
+                    .map(|(gid, (_im, qseq))| (gid.clone(), qseq.clone()))
+                    .collect();
                 let top_n = args
                     .hmmer_top_n
                     .or_else(|| file_cfg.hmmer.as_ref().and_then(|h| h.top_n))
@@ -549,8 +728,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ievalue = args
                     .hmmer_ievalue
                     .or_else(|| file_cfg.hmmer.as_ref().and_then(|h| h.ievalue));
-                if let Ok(m) = hmmer::run_hmmscan_batch_opts(hmm, pfam_db, items, hmmer_threads, top_n, ievalue) {
+                if let Ok(m) = hmmer::run_hmmscan_batch_opts(
+                    hmm,
+                    pfam_db,
+                    items,
+                    hmmer_threads,
+                    top_n,
+                    ievalue,
+                ) {
                     hmmsum_map = m;
+                }
+                let orphan_cfg = file_cfg
+                    .hmmer
+                    .as_ref()
+                    .and_then(|h| h.orphan_analysis)
+                    .unwrap_or(true);
+                orphan_analysis_enabled = orphan_cfg && !args.disable_orphan_analysis;
+                if orphan_analysis_enabled {
+                    orphan_map = hmmsum_map
+                        .iter()
+                        .filter(|(_, summary)| !summary.hits.is_empty())
+                        .map(|(gid, summary)| (gid.clone(), hmmer::analyze_orphan_domains(summary)))
+                        .collect();
+                } else {
+                    orphan_map.clear();
                 }
                 if let Some(ref_fasta) = cfg.reference_fasta.as_ref() {
                     let all_ids: Vec<String> = panel_map.values().flat_map(|v| v.clone()).collect();
@@ -560,7 +761,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let ref_ievalue = args
                             .hmmer_ref_ievalue
                             .or_else(|| file_cfg.hmmer.as_ref().and_then(|h| h.ref_ievalue));
-                        if let Ok(m) = hmmer::run_hmmscan_batch_opts(hmm, pfam_db, ref_items, hmmer_threads, top_n, ref_ievalue) {
+                        if let Ok(m) = hmmer::run_hmmscan_batch_opts(
+                            hmm,
+                            pfam_db,
+                            ref_items,
+                            hmmer_threads,
+                            top_n,
+                            ref_ievalue,
+                        ) {
                             _ref_hmmsum_map = m;
                         }
                     }
@@ -573,14 +781,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|p| hmmer::load_pfam_clans(p).ok());
                 for g in &metrics {
                     if let Some(qsum) = hmmsum_map.get(&g.gene_id) {
-                        let qsum_c = if let Some(ref clans) = clan_map { hmmer::collapse_by_clan(qsum, clans) } else { qsum.clone() };
+                        let qsum_c = if let Some(ref clans) = clan_map {
+                            hmmer::collapse_by_clan(qsum, clans)
+                        } else {
+                            qsum.clone()
+                        };
                         let ref_ids = panel_map.get(&g.gene_id).cloned().unwrap_or_default();
                         // Canonicalize panel IDs to match keys used in reference hmmscan map
-                        let ref_ids_canonical: Vec<String> = ref_ids.iter().map(|rid| taxonomy::canonical_accession(rid)).collect();
+                        let ref_ids_canonical: Vec<String> = ref_ids
+                            .iter()
+                            .map(|rid| taxonomy::canonical_accession(rid))
+                            .collect();
                         let mut ref_map_c: HashMap<String, HmmscanSummary> = HashMap::new();
                         for key in &ref_ids_canonical {
                             if let Some(s) = _ref_hmmsum_map.get(key) {
-                                let val = if let Some(ref clans) = clan_map { hmmer::collapse_by_clan(s, clans) } else { s.clone() };
+                                let val = if let Some(ref clans) = clan_map {
+                                    hmmer::collapse_by_clan(s, clans)
+                                } else {
+                                    s.clone()
+                                };
                                 ref_map_c.insert(key.clone(), val);
                             }
                         }
@@ -594,7 +813,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ref_hmmsum_map.len()
                             );
                         }
-                        let dbg = hmmer::domains_architecture_diagnostics(&qsum_c, &ref_ids_canonical, &ref_map_c);
+                        let dbg = hmmer::domains_architecture_diagnostics(
+                            &qsum_c,
+                            &ref_ids_canonical,
+                            &ref_map_c,
+                        );
                         let score = dbg.score;
                         domains_arch_map.insert(g.gene_id.clone(), score);
                         domains_arch_dbg.push((
@@ -618,7 +841,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Emit outputs
             let t_emit = step_start("emit_outputs", log_json);
-            let qlen_map: HashMap<String, usize> = metrics.iter().map(|m| (m.gene_id.clone(), m.length)).collect();
+            let qlen_map: HashMap<String, usize> = metrics
+                .iter()
+                .map(|m| (m.gene_id.clone(), m.length))
+                .collect();
             let stats = parse_tsv_stats(&diamond_tsv, Some(&qlen_map)).unwrap_or_default();
             let checksums = collect_checksums(&cfg)?;
             let snapshot = build_config_snapshot(&cfg, &args, &file_cfg);
@@ -676,13 +902,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &file_cfg.scoring,
                 args.enable_taxonomy,
                 Some(&domains_arch_map),
+                Some(&len_map),
+                if orphan_analysis_enabled {
+                    Some(&orphan_map)
+                } else {
+                    None
+                },
             );
             let comp_map = build_component_scores(
                 &metrics,
                 &stats,
                 &intrinsic_map,
-                &file_cfg.scoring,
                 args.enable_taxonomy,
+                if orphan_analysis_enabled {
+                    Some(&orphan_map)
+                } else {
+                    None
+                },
             );
             let _ = step_finish("scoring", t_scoring, log_json);
             write_jsonl_metrics(
@@ -698,6 +934,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &taxsum_map,
                 Some(&domains_arch_map),
                 Some(&len_map),
+                if orphan_analysis_enabled {
+                    Some(&orphan_map)
+                } else {
+                    None
+                },
                 Some(&structvar_map),
             )?;
             write_csv_metrics(
@@ -715,6 +956,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.classify_no_data,
                 Some(&domains_arch_map),
                 Some(&len_map),
+                if orphan_analysis_enabled {
+                    Some(&orphan_map)
+                } else {
+                    None
+                },
                 Some(&structvar_map),
             )?;
             // Emit domains architecture diagnostics CSV
@@ -724,8 +970,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 use std::io::Write as _;
                 writeln!(fdbg, "gene_id,panel_size,refs_with_domains,query_domains,core_count,accessory_count,overlap_core,overlap_accessory,recall_core,precision_acc,extras_pen,score")?;
                 for (gid, ps, rwd, qd, cc, ac, oc, oa, rc, pa, ep, sc) in domains_arch_dbg {
-                    writeln!(fdbg, "{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4}", gid, ps, rwd, qd, cc, ac, oc, oa, rc, pa, ep, sc)?;
+                    writeln!(
+                        fdbg,
+                        "{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4}",
+                        gid, ps, rwd, qd, cc, ac, oc, oa, rc, pa, ep, sc
+                    )?;
                 }
+            }
+            // Emit structvar summary (counts and simple distributions) for tuning
+            if !structvar_map.is_empty() {
+                let mut counts: std::collections::HashMap<&str, usize> = Default::default();
+                let mut gaps: Vec<usize> = Vec::new();
+                let mut covs: Vec<f64> = Vec::new();
+                for sv in structvar_map.values() {
+                    let k = sv.classification.as_str();
+                    *counts.entry(k).or_insert(0) += 1;
+                    if let Some(g) = sv.fusion_gap {
+                        gaps.push(g);
+                    }
+                    if let Some((a, b)) = sv.fusion_cover_fracs {
+                        covs.push(a);
+                        covs.push(b);
+                    }
+                }
+                covs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                gaps.sort_unstable();
+                let pct = |v: &[usize], p: f64| -> usize {
+                    if v.is_empty() {
+                        0
+                    } else {
+                        let i = ((p * (v.len() as f64)).clamp(0.0, (v.len() - 1) as f64)) as usize;
+                        v[i]
+                    }
+                };
+                let pctf = |v: &[f64], p: f64| -> f64 {
+                    if v.is_empty() {
+                        0.0
+                    } else {
+                        let i = ((p * (v.len() as f64)).clamp(0.0, (v.len() - 1) as f64)) as usize;
+                        v[i]
+                    }
+                };
+                let summ = serde_json::json!({
+                    "counts": counts,
+                    "gap_percentiles": {"p10": pct(&gaps,0.10), "p50": pct(&gaps,0.50), "p90": pct(&gaps,0.90)},
+                    "cov_percentiles": {"p10": format!("{:.3}", pctf(&covs,0.10)), "p50": format!("{:.3}", pctf(&covs,0.50)), "p90": format!("{:.3}", pctf(&covs,0.90))},
+                    "suggested_cutoffs": {"fusion_min_gap": pct(&gaps,0.10).max(50), "min_subject_cov": pctf(&covs,0.10)},
+                });
+                std::fs::write(
+                    std::path::Path::new(&cfg.out).join("structvar_summary.json"),
+                    serde_json::to_string_pretty(&summ)?,
+                )?;
             }
             let emit_secs = step_finish("emit_outputs", t_emit, log_json);
 
@@ -738,15 +1033,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             totals.insert("hmmer_genes", serde_json::json!(hmmer_genes));
             totals.insert("hmmer_hits_total", serde_json::json!(hmmer_hits_total));
             totals.insert("mafft_alignments", serde_json::json!(mafft_alignments));
-            totals.insert("diamond_mode", serde_json::json!(format!("{:?}", args.diamond_mode)));
+            totals.insert(
+                "diamond_mode",
+                serde_json::json!(format!("{:?}", args.diamond_mode)),
+            );
             let steps = vec![
-                StepDuration { name: "diamond", seconds: diamond_secs },
-                StepDuration { name: "ecs", seconds: ecs_secs },
-                StepDuration { name: "intrinsic", seconds: intrinsic_secs },
-                StepDuration { name: "consensus", seconds: consensus_secs },
-                StepDuration { name: "emit_outputs", seconds: emit_secs },
+                StepDuration {
+                    name: "diamond",
+                    seconds: diamond_secs,
+                },
+                StepDuration {
+                    name: "ecs",
+                    seconds: ecs_secs,
+                },
+                StepDuration {
+                    name: "intrinsic",
+                    seconds: intrinsic_secs,
+                },
+                StepDuration {
+                    name: "consensus",
+                    seconds: consensus_secs,
+                },
+                StepDuration {
+                    name: "emit_outputs",
+                    seconds: emit_secs,
+                },
             ];
-            let runm = RunMetrics { schema_version: "1.0", steps, totals };
+            let runm = RunMetrics {
+                schema_version: "1.0",
+                steps,
+                totals,
+            };
             write_run_metrics(&cfg.out, &runm)?;
             Ok(())
         }
@@ -883,13 +1200,14 @@ fn write_jsonl_metrics(
     taxonomy_enabled: bool,
     taxsum_map: &HashMap<String, Option<TaxonSummary>>,
     arch_map: Option<&HashMap<String, f64>>,
-    len_map: Option<&HashMap<String, (f64, f64, f64, String)>>,
+    len_map: Option<&HashMap<String, LengthSummary>>,
+    orphan_map: Option<&HashMap<String, hmmer::OrphanAnalysis>>,
     sv_map: Option<&HashMap<String, structvar::StructVar>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_report.jsonl");
     let mut f = File::create(path)?;
     for m in metrics {
-        let mut warnings: Vec<String> = if m.hits == 0 {
+        let warnings: Vec<String> = if m.hits == 0 {
             vec!["No DIAMOND hits".to_string()]
         } else {
             Vec::new()
@@ -912,23 +1230,24 @@ fn write_jsonl_metrics(
         } else {
             None
         };
-        let (w_h, w_i, w_t) = scoring_weights3(scoring);
-        let w_d = scoring
-            .as_ref()
-            .and_then(|s| s.weights.get("domains").cloned())
+        let weights = scoring_weights(scoring);
+        let domains_arch_score = arch_map
+            .and_then(|am| am.get(&m.gene_id).cloned())
             .unwrap_or(0.0);
-        let w_l = scoring
-            .as_ref()
-            .and_then(|s| s.weights.get("length").cloned())
+        let length_score = len_map
+            .and_then(|lm| lm.get(&m.gene_id).map(|t| t.0))
             .unwrap_or(0.0);
-        let domains_arch_score = arch_map.and_then(|am| am.get(&m.gene_id).cloned()).unwrap_or(0.0);
-        let length_score = len_map.and_then(|lm| lm.get(&m.gene_id).map(|t| t.0)).unwrap_or(0.0);
-        let denom = (w_h + w_i + w_t + w_d + w_l).max(1e-6);
-        let final_score = (w_h * homology_score
-            + w_i * intrinsic_score
-            + w_t * taxonomy_score.unwrap_or(0.0)
-            + w_d * domains_arch_score
-            + w_l * length_score)
+        let orphan_score = orphan_map
+            .and_then(|om| om.get(&m.gene_id))
+            .map(|o| o.score)
+            .unwrap_or(1.0);
+        let denom = weights.sum().max(1e-6);
+        let final_score = (weights.homology * homology_score
+            + weights.intrinsic * intrinsic_score
+            + weights.taxonomy * taxonomy_score.unwrap_or(0.0)
+            + weights.domains * domains_arch_score
+            + weights.length * length_score
+            + weights.orphan * orphan_score)
             / denom;
         let fusion_split_flag = summary
             .map(|s| s.coverage_delta > cov_delta_thresh)
@@ -951,21 +1270,35 @@ fn write_jsonl_metrics(
         // Build alignment/struct-var warnings
         let mut warn_extra: Vec<String> = Vec::new();
         if let Some(a) = aln {
-            if a.missing_exon_run >= 30 { warn_extra.push("MissingExonPossible".into()); }
-            if a.retained_intron_run >= 30 { warn_extra.push("RetainedIntronPossible".into()); }
+            if a.missing_exon_run >= 30 {
+                warn_extra.push("MissingExonPossible".into());
+            }
+            if a.retained_intron_run >= 30 {
+                warn_extra.push("RetainedIntronPossible".into());
+            }
         }
         let sv_obj = sv_map.and_then(|mm| mm.get(cur_gene));
         if let Some(sv) = sv_obj {
             match sv.classification.as_str() {
                 "FusionPossible" => warn_extra.push("FusionPossible".into()),
                 "SplitPossible" => warn_extra.push("SplitPossible".into()),
-                "InternalDuplicationPossible" => warn_extra.push("InternalDuplicationPossible".into()),
+                "InternalDuplicationPossible" => {
+                    warn_extra.push("InternalDuplicationPossible".into())
+                }
                 _ => {}
             }
         }
         let domains = hmmsum_map.get(cur_gene).map(|d| {
-            let score = if let Some(ev) = d.top_evalue { let le = if ev>0.0 { -ev.log10() } else { 100.0 }; (le/20.0).clamp(0.0, 1.0) } else { 0.0 };
-            let arch_score = arch_map.and_then(|am| am.get(cur_gene)).cloned().unwrap_or(0.0);
+            let score = if let Some(ev) = d.top_evalue {
+                let le = if ev > 0.0 { -ev.log10() } else { 100.0 };
+                (le / 20.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let arch_score = arch_map
+                .and_then(|am| am.get(cur_gene))
+                .cloned()
+                .unwrap_or(0.0);
             serde_json::json!({
                 "hits_count": d.hits_count,
                 "top_accession": d.top_accession,
@@ -981,16 +1314,21 @@ fn write_jsonl_metrics(
                 })).collect::<Vec<_>>()
             })
         });
-        let length_block = len_map.and_then(|lm| lm.get(&m.gene_id)).map(|(s, z, r, c)| serde_json::json!({
-            "length_score": s,
-            "length_z": z,
-            "length_ratio": r,
-            "length_class": c,
-        }));
-            let record = serde_json::json!({
+        let length_block = len_map
+            .and_then(|lm| lm.get(&m.gene_id))
+            .map(|(s, z, r, c)| {
+                serde_json::json!({
+                    "length_score": s,
+                    "length_z": z,
+                    "length_ratio": r,
+                    "length_class": c,
+                })
+            });
+        let orphan_entry = orphan_map.and_then(|om| om.get(cur_gene));
+        let record = serde_json::json!({
                 "gene_id": m.gene_id,
                 "taxonomy": taxonomy,
-                "score_components": {"taxonomy": taxonomy_score, "homology": homology_score, "intrinsic": intrinsic_score, "domains": domains_arch_score, "length": length_score},
+                "score_components": {"taxonomy": taxonomy_score, "homology": homology_score, "intrinsic": intrinsic_score, "domains": domains_arch_score, "length": length_score, "orphan": orphan_score},
                 "final_score": final_score,
                 "homology": {
                 "hits_count": m.hits,
@@ -1024,12 +1362,30 @@ fn write_jsonl_metrics(
             })),
             "domains": domains,
             "length": length_block,
+            "orphan_analysis": orphan_entry.map(|oa| serde_json::json!({
+                "status": oa.status.as_str(),
+                "score": oa.score,
+                "details": oa.details.iter().map(|d| serde_json::json!({
+                    "accession": d.accession,
+                    "domain_index": d.domain_index,
+                    "total_domains": d.total_domains,
+                    "completeness": d.completeness,
+                    "hmm_from": d.hmm_from,
+                    "hmm_to": d.hmm_to,
+                    "hmm_len": d.hmm_len,
+                })).collect::<Vec<_>>()
+            })),
             "structvar": sv_obj.map(|sv| serde_json::json!({
                 "classification": sv.classification,
                 "fusion_possible": sv.fusion_possible,
                 "split_possible": sv.split_possible,
                 "duplication_possible": sv.duplication_possible,
-                "spans": sv.spans
+                "spans": sv.spans,
+                "fusion_subjects": sv.fusion_subjects,
+                "fusion_gap": sv.fusion_gap,
+                "fusion_left_len": sv.fusion_left_len,
+                "fusion_right_len": sv.fusion_right_len,
+                "fusion_cover_fracs": sv.fusion_cover_fracs,
             })),
             "warnings": if warn_extra.is_empty() { warnings } else { warn_extra },
         });
@@ -1051,18 +1407,19 @@ fn write_csv_metrics(
     taxsum_map: &HashMap<String, Option<TaxonSummary>>,
     hmmsum_map: &std::collections::HashMap<String, hmmer::HmmscanSummary>,
     csv_verbose: bool,
-    comp_map: Option<&HashMap<String, (f64, f64, Option<f64>, f64)>>,
+    comp_map: Option<&HashMap<String, ComponentScores>>,
     classify_no_data: bool,
     arch_map: Option<&HashMap<String, f64>>,
-    len_map: Option<&HashMap<String, (f64, f64, f64, String)>>,
+    len_map: Option<&HashMap<String, LengthSummary>>,
+    orphan_map: Option<&HashMap<String, hmmer::OrphanAnalysis>>,
     sv_map: Option<&HashMap<String, structvar::StructVar>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join("qc_summary.csv");
     let mut f = File::create(path)?;
     if csv_verbose {
-        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,length_score,length_ratio,length_class,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,start_concordance,start_class,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,taxonomy_status,warnings")?;
+        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,orphan_domain_score,length_score,length_ratio,length_class,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,start_concordance,start_class,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_status,warnings")?;
     } else {
-        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,taxonomy_score,taxonomy_status,warnings")?;
+        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,orphan_domain_score,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_score,taxonomy_status,warnings")?;
     }
     for m in metrics {
         let warnings = if m.hits == 0 { "No DIAMOND hits" } else { "" };
@@ -1092,30 +1449,65 @@ fn write_csv_metrics(
             .cloned()
             .unwrap_or((0.0, String::new()));
         let aln = alignment_map.get(&m.gene_id);
-        let (mafft_enabled, conserved, pid, seqs_aln, qgap, gap_runs, max_gap, start_conc, start_class) =
-            if let Some(a) = aln {
-                (
-                    a.mafft_enabled as i32,
-                    a.conserved_fraction,
-                    a.pairwise_identity,
-                    a.sequences_aligned,
-                    a.query_gap_fraction,
-                    a.gap_run_count,
-                    a.max_gap_run,
-                    a.start_concordance,
-                    a.start_class.clone(),
-                )
-            } else {
-                (0, 0.0, 0.0, 0, 0.0, 0, 0, 0.0, String::new())
-            };
-        let (structvar_class, structvar_gap, structvar_left_len, structvar_right_len) = if let Some(sv) = sv_map.and_then(|sm| sm.get(&m.gene_id)) {
+        let (
+            mafft_enabled,
+            conserved,
+            pid,
+            seqs_aln,
+            qgap,
+            gap_runs,
+            max_gap,
+            start_conc,
+            start_class,
+        ) = if let Some(a) = aln {
+            (
+                a.mafft_enabled as i32,
+                a.conserved_fraction,
+                a.pairwise_identity,
+                a.sequences_aligned,
+                a.query_gap_fraction,
+                a.gap_run_count,
+                a.max_gap_run,
+                a.start_concordance,
+                a.start_class.clone(),
+            )
+        } else {
+            (0, 0.0, 0.0, 0, 0.0, 0, 0, 0.0, String::new())
+        };
+        let (
+            structvar_class,
+            structvar_gap,
+            structvar_left_len,
+            structvar_right_len,
+            structvar_cov_left,
+            structvar_cov_right,
+        ) = if let Some(sv) = sv_map.and_then(|sm| sm.get(&m.gene_id)) {
             (
                 sv.classification.clone(),
                 sv.fusion_gap.map(|v| v.to_string()).unwrap_or_default(),
-                sv.fusion_left_len.map(|v| v.to_string()).unwrap_or_default(),
-                sv.fusion_right_len.map(|v| v.to_string()).unwrap_or_default(),
+                sv.fusion_left_len
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                sv.fusion_right_len
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                sv.fusion_cover_fracs
+                    .map(|t| format!("{:.3}", t.0))
+                    .unwrap_or_default(),
+                sv.fusion_cover_fracs
+                    .map(|t| format!("{:.3}", t.1))
+                    .unwrap_or_default(),
             )
-        } else { (String::new(), String::new(), String::new(), String::new()) };
+        } else {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            )
+        };
         let taxonomy_score = if taxonomy_enabled {
             compute_taxonomy_score(
                 taxsum_map
@@ -1132,23 +1524,53 @@ fn write_csv_metrics(
             "disabled"
         };
         let domains_score_field = if let Some(d) = hmmsum_map.get(&m.gene_id) {
-            let s = if let Some(ev) = d.top_evalue { let le = if ev>0.0 { -ev.log10() } else { 100.0 }; (le/20.0).clamp(0.0, 1.0) } else { 0.0 };
+            let s = if let Some(ev) = d.top_evalue {
+                let le = if ev > 0.0 { -ev.log10() } else { 100.0 };
+                (le / 20.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             format!("{:.4}", s)
         } else {
             String::new()
         };
-        let domains_arch_field = arch_map.and_then(|am| am.get(&m.gene_id)).map(|v| format!("{:.4}", v)).unwrap_or_else(|| String::new());
+        let domains_arch_field = arch_map
+            .and_then(|am| am.get(&m.gene_id))
+            .map(|v| format!("{:.4}", v))
+            .unwrap_or_default();
+        let (orphan_status_str, orphan_score_field) = if let Some(map) = orphan_map {
+            if let Some(oa) = map.get(&m.gene_id) {
+                (oa.status.as_str().to_string(), format!("{:.4}", oa.score))
+            } else {
+                (String::new(), String::new())
+            }
+        } else {
+            (String::new(), String::new())
+        };
         // Optional NoData classification override
         if classify_no_data && m.hits == 0 {
-            let nonzero_domains = hmmsum_map.get(&m.gene_id).map(|d| d.hits_count > 0).unwrap_or(false);
+            let nonzero_domains = hmmsum_map
+                .get(&m.gene_id)
+                .map(|d| d.hits_count > 0)
+                .unwrap_or(false);
             if !nonzero_domains {
                 classif = "NoData".to_string();
             }
         }
         if csv_verbose {
-            let (hs, is, ts_opt, _fs) = comp_map.and_then(|cm| cm.get(&m.gene_id).cloned()).unwrap_or((0.0,0.0,None,final_score));
-            let ts_str = if taxonomy_enabled { format!("{:.4}", ts_opt.unwrap_or(0.0)) } else { String::new() };
-            let (len_s, _len_z, len_r, len_c) = len_map.and_then(|lm| lm.get(&m.gene_id)).cloned().unwrap_or((0.0,0.0,0.0,String::new()));
+            let (hs, is, ts_opt, orphan_component) = comp_map
+                .and_then(|cm| cm.get(&m.gene_id))
+                .map(|c| (c.homology, c.intrinsic, c.taxonomy, c.orphan))
+                .unwrap_or((0.0, 0.0, None, 1.0));
+            let ts_str = if taxonomy_enabled {
+                format!("{:.4}", ts_opt.unwrap_or(0.0))
+            } else {
+                String::new()
+            };
+            let (len_s, _len_z, len_r, len_c) = len_map
+                .and_then(|lm| lm.get(&m.gene_id))
+                .cloned()
+                .unwrap_or((0.0, 0.0, 0.0, String::new()));
             let row = vec![
                 m.gene_id.clone(),
                 m.hits.to_string(),
@@ -1168,8 +1590,21 @@ fn write_csv_metrics(
                 ts_str,
                 domains_score_field,
                 domains_arch_field.clone(),
+                if orphan_map.is_some() {
+                    if orphan_score_field.is_empty() {
+                        format!("{:.4}", orphan_component)
+                    } else {
+                        orphan_score_field.clone()
+                    }
+                } else {
+                    String::new()
+                },
                 format!("{:.4}", len_s),
-                if len_r>0.0 { format!("{:.3}", len_r) } else { String::new() },
+                if len_r > 0.0 {
+                    format!("{:.3}", len_r)
+                } else {
+                    String::new()
+                },
                 len_c,
                 mafft_enabled.to_string(),
                 format!("{:.3}", conserved),
@@ -1184,9 +1619,13 @@ fn write_csv_metrics(
                 structvar_gap,
                 structvar_left_len,
                 structvar_right_len,
+                structvar_cov_left,
+                structvar_cov_right,
+                orphan_status_str.clone(),
                 taxonomy_status.to_string(),
                 warnings.to_string(),
-            ].join(",");
+            ]
+            .join(",");
             writeln!(f, "{}", row)?;
             continue;
         }
@@ -1213,14 +1652,19 @@ fn write_csv_metrics(
             max_gap.to_string(),
             domains_score_field,
             domains_arch_field,
+            orphan_score_field,
             structvar_class,
             structvar_gap,
             structvar_left_len,
             structvar_right_len,
+            structvar_cov_left,
+            structvar_cov_right,
+            orphan_status_str,
             format!("{:.4}", taxonomy_score),
             taxonomy_status.to_string(),
             warnings.to_string(),
-        ].join(",");
+        ]
+        .join(",");
         writeln!(f, "{}", row)?;
     }
     Ok(())
@@ -1302,7 +1746,6 @@ fn prepare_cmd(p: PrepareArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
 fn scoring_thresholds(scoring: &Option<ScoringConfigOverride>) -> (f64, f64) {
     if let Some(cfg) = scoring {
         let h = cfg.thresholds.as_ref().and_then(|t| t.high).unwrap_or(0.8);
@@ -1317,15 +1760,60 @@ fn scoring_thresholds(scoring: &Option<ScoringConfigOverride>) -> (f64, f64) {
     }
 }
 
-fn scoring_weights3(scoring: &Option<ScoringConfigOverride>) -> (f64, f64, f64) {
-    if let Some(cfg) = scoring {
-        let wh = *cfg.weights.get("homology").unwrap_or(&0.6);
-        let wi = *cfg.weights.get("intrinsic").unwrap_or(&0.4);
-        let wt = *cfg.weights.get("taxonomy").unwrap_or(&0.0);
-        (wh, wi, wt)
-    } else {
-        (0.6, 0.4, 0.0)
+#[derive(Clone, Copy, Debug)]
+struct WeightSet {
+    homology: f64,
+    intrinsic: f64,
+    taxonomy: f64,
+    domains: f64,
+    length: f64,
+    orphan: f64,
+}
+
+impl WeightSet {
+    fn sum(&self) -> f64 {
+        self.homology + self.intrinsic + self.taxonomy + self.domains + self.length + self.orphan
     }
+}
+
+fn scoring_weights(scoring: &Option<ScoringConfigOverride>) -> WeightSet {
+    let mut ws = WeightSet {
+        homology: 0.6,
+        intrinsic: 0.4,
+        taxonomy: 0.0,
+        domains: 0.0,
+        length: 0.0,
+        orphan: 0.0,
+    };
+    if let Some(cfg) = scoring {
+        if let Some(v) = cfg.weights.get("homology") {
+            ws.homology = *v;
+        }
+        if let Some(v) = cfg.weights.get("intrinsic") {
+            ws.intrinsic = *v;
+        }
+        if let Some(v) = cfg.weights.get("taxonomy") {
+            ws.taxonomy = *v;
+        }
+        if let Some(v) = cfg.weights.get("domains") {
+            ws.domains = *v;
+        }
+        if let Some(v) = cfg.weights.get("length") {
+            ws.length = *v;
+        }
+        if let Some(v) = cfg.weights.get("orphan") {
+            ws.orphan = *v;
+        }
+    }
+    ws
+}
+
+#[derive(Clone, Debug, Default)]
+struct ComponentScores {
+    homology: f64,
+    intrinsic: f64,
+    taxonomy: Option<f64>,
+    orphan: f64,
 }
 
 #[allow(clippy::type_complexity)]
@@ -1349,35 +1837,6 @@ fn compute_intrinsic_for_ids(
         map.insert(gid, (im, seq));
     }
     Ok(map)
-}
-
-fn top_ids_for_gene(
-    gene_id: &str,
-    stats: &HashMap<String, diamond::DiamondHitStats>,
-    top_n: usize,
-) -> Vec<String> {
-    stats
-        .get(gene_id)
-        .and_then(|s| s.top_sseqid.clone())
-        .map(|t| vec![t])
-        .unwrap_or_default()
-        .into_iter()
-        .take(top_n)
-        .collect()
-}
-
-fn stats_top_ids_for(
-    metrics: &[GeneMetrics],
-    stats: &HashMap<String, diamond::DiamondHitStats>,
-    top_n: usize,
-) -> Vec<String> {
-    let mut ids = Vec::new();
-    for m in metrics {
-        ids.extend(top_ids_for_gene(&m.gene_id, stats, top_n));
-    }
-    ids.sort();
-    ids.dedup();
-    ids
 }
 
 fn build_config_snapshot<'a>(
@@ -1407,6 +1866,7 @@ fn build_config_snapshot<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_scores_map(
     metrics: &[GeneMetrics],
     stats: &HashMap<String, diamond::DiamondHitStats>,
@@ -1414,8 +1874,10 @@ fn build_scores_map(
     scoring: &Option<ScoringConfigOverride>,
     taxonomy_enabled: bool,
     arch_map: Option<&HashMap<String, f64>>,
+    len_map: Option<&HashMap<String, LengthSummary>>,
+    orphan_map: Option<&HashMap<String, hmmer::OrphanAnalysis>>,
 ) -> HashMap<String, (f64, String)> {
-    let (w_h, w_i, w_t) = scoring_weights3(scoring);
+    let weights = scoring_weights(scoring);
     let (th_high, th_med) = scoring_thresholds(scoring);
     let mut out: HashMap<String, (f64, String)> = HashMap::new();
     for m in metrics {
@@ -1432,10 +1894,25 @@ fn build_scores_map(
         } else {
             0.0
         };
-        let w_d = scoring.as_ref().and_then(|sc| sc.weights.get("domains")).cloned().unwrap_or(0.0);
-        let d = arch_map.and_then(|am| am.get(&m.gene_id)).cloned().unwrap_or(0.0);
-        let denom = (w_h + w_i + w_t + w_d).max(1e-6);
-        let score = (w_h*h + w_i*i + w_t*t + w_d*d) / denom;
+        let d = arch_map
+            .and_then(|am| am.get(&m.gene_id))
+            .cloned()
+            .unwrap_or(0.0);
+        let l = len_map
+            .and_then(|lm| lm.get(&m.gene_id).map(|t| t.0))
+            .unwrap_or(0.0);
+        let o = orphan_map
+            .and_then(|om| om.get(&m.gene_id))
+            .map(|oa| oa.score)
+            .unwrap_or(1.0);
+        let denom = weights.sum().max(1e-6);
+        let score = (weights.homology * h
+            + weights.intrinsic * i
+            + weights.taxonomy * t
+            + weights.domains * d
+            + weights.length * l
+            + weights.orphan * o)
+            / denom;
         let classif = if score >= th_high {
             "High"
         } else if score >= th_med {
@@ -1452,23 +1929,37 @@ fn build_component_scores(
     metrics: &[GeneMetrics],
     stats: &HashMap<String, diamond::DiamondHitStats>,
     intrinsic: &HashMap<String, (metrics::IntrinsicMetrics, Vec<u8>)>,
-    scoring: &Option<ScoringConfigOverride>,
     taxonomy_enabled: bool,
-) -> HashMap<String, (f64, f64, Option<f64>, f64)> {
-    let (w_h, w_i, w_t) = scoring_weights3(scoring);
-    let w_d = scoring.as_ref().and_then(|s| s.weights.get("domains").cloned()).unwrap_or(0.0);
-    let mut out: HashMap<String, (f64, f64, Option<f64>, f64)> = HashMap::new();
+    orphan_map: Option<&HashMap<String, hmmer::OrphanAnalysis>>,
+) -> HashMap<String, ComponentScores> {
+    let mut out: HashMap<String, ComponentScores> = HashMap::new();
     for m in metrics {
         let s = stats.get(&m.gene_id);
         let default_im = metrics::IntrinsicMetrics::default();
-        let im = intrinsic.get(&m.gene_id).map(|t| &t.0).unwrap_or(&default_im);
+        let im = intrinsic
+            .get(&m.gene_id)
+            .map(|t| &t.0)
+            .unwrap_or(&default_im);
         let h = compute_homology_score(s);
         let i = compute_intrinsic_score(im);
-        let t_opt = if taxonomy_enabled { Some(compute_taxonomy_score(s.is_some())) } else { None };
-        let t_val = t_opt.unwrap_or(0.0);
-        let denom = (w_h + w_i + w_t + w_d).max(1e-6);
-        let final_score = (w_h*h + w_i*i + w_t*t_val) / denom; // domains added elsewhere for JSONL; CSV uses this for classification unless w_d>0
-        out.insert(m.gene_id.clone(), (h, i, t_opt, final_score));
+        let taxonomy_component = if taxonomy_enabled {
+            Some(compute_taxonomy_score(s.is_some()))
+        } else {
+            None
+        };
+        let orphan_component = orphan_map
+            .and_then(|om| om.get(&m.gene_id))
+            .map(|oa| oa.score)
+            .unwrap_or(1.0);
+        out.insert(
+            m.gene_id.clone(),
+            ComponentScores {
+                homology: h,
+                intrinsic: i,
+                taxonomy: taxonomy_component,
+                orphan: orphan_component,
+            },
+        );
     }
     out
 }

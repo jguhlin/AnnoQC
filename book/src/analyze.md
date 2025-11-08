@@ -99,8 +99,20 @@ The CSV is suitable for spreadsheets or dashboards, while the JSONL is richer fo
   - `--hmmscan-bin /path/to/hmmscan` and `pfam_db` in config enable domain summaries.
   - `--hmmer-top-n N` or `[hmmer].top_n` (default 5) caps per-gene domain hits in JSONL.
   - `--hmmer-threads N` or `[hmmer].threads` overrides threads used for hmmscan; otherwise uses global `--threads`.
+  - Disable the orphan-domain integrity pillar with `--disable-orphan-analysis` (or set `[hmmer].orphan_analysis = false`).
 
 - DIAMOND mode
   - `--diamond-mode auto|single|batch` (default `auto`).
   - Auto uses Single up to `--diamond-auto-threshold` or `[diamond].auto_threshold` (default 200,000 queries), otherwise Batch.
   - In Batch and `--log-format json`, per-chunk progress events are logged.
+
+## Consensus Panels & Diagnostics
+
+Before MAFFT, domain comparisons, and length scoring kick in, AnnoQC builds a consensus panel for each query from its ranked DIAMOND hits. The selector enforces:
+
+- Minimum informative hits (`[consensus].min_hits`, default 5) and a maximum panel size (`max_panel`, default 20).
+- Phase-based filters on query/subject coverage, e-value, and identity. The primary phase honors `[consensus].filt_qcov`, `filt_scov`, `filt_evalue`, and `filt_pident`; later phases relax toward GeneValidator-like heuristics when the panel would otherwise be too small.
+- Length-ratio windows anchored to the query. `[consensus].len_ratio_tolerance` (default ±30%) defines the tight window; later phases widen to 0.5–1.5× and 0.4–2.0× if more homology evidence is needed.
+- Redundancy trimming. Hits with DIAMOND `pident` ≥ `[consensus].redundancy_pident` (default 90%) are capped by `max_high_identity` (default 3) so near-identical isoforms do not crowd out diverse evidence.
+
+Each run now emits `panel_debug.csv` in the results directory. Columns capture how many hits passed the filters, which phase produced the selected panel, the observed length-ratio span, median % identity, and how many high-identity hits were dropped. Use this file to tune cutoffs on new datasets (e.g., loosen coverage filters for fragmented assemblies or tighten identity caps for clonal panels).

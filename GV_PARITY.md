@@ -25,6 +25,6 @@ Implemented / partial
 - [x] Dump matched reference sequences (`--dump-matches-best/--dump-matches-gene`).
 
 Planned enhancements (GV-inspired)
-- [ ] Improved panel selection heuristics (length/score distributions; maintain ≥5 informative homologs).
+- [x] Improved panel selection heuristics (length/score distributions; maintain ≥5 informative homologs via coverage/identity phases, length-ratio windows, and redundancy trimming; emits panel_debug.csv diagnostics).
 - [ ] Taxonomy pillar 2.0 (congruence vs expected lineage, not just presence).
 - [ ] Per-step observability (ECS inflight/queue traces; phase timing; optional TTY progress bar when not JSON).

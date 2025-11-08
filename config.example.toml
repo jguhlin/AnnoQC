@@ -22,6 +22,7 @@ intrinsic = 0.4
 taxonomy = 0.0
 domains = 0.0
 length = 0.0
+orphan = 0.0
 taxonomy = 0.0
 
 [scoring.thresholds]
@@ -56,11 +57,22 @@ pfam_clans = "share/pfam/Pfam-A.clans.tsv"
 # Minimum number of homologs required for consensus-based analyses (MAFFT/start, domain architecture)
 min_hits = 5
 # Maximum homologs to keep after redundancy reduction
-max_panel = 10
+max_panel = 20
+# Primary filter thresholds; later phases relax automatically when needed
+filt_qcov = 0.70
+filt_scov = 0.50
+filt_evalue = 1e-5
+filt_pident = 25.0
+# Tight length-ratio window around the query length (±30% by default)
+len_ratio_tolerance = 0.30
+# Redundancy trimming: limit hits ≥90% identity to the query
+redundancy_pident = 90.0
+max_high_identity = 3
 
 [hmmer]
 top_n = 5
 # threads = 4 # optional override; defaults to global --threads
+orphan_analysis = true
 
 [diamond]
 # When diamond_mode = "Auto", Single is used up to this threshold
