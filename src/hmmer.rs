@@ -342,6 +342,7 @@ PF00001.1  PF00001.1  250  Q12345  -  120  1e-20  100.0  0.1  1  1  2e-20  1e-20
 }
 
 /// Batch hmmscan with optional i-Evalue filtering before truncation.
+#[allow(dead_code)]
 pub fn run_hmmscan_batch_opts(
     bin: &str,
     db_path: &str,

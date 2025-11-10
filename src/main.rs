@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -6,8 +6,6 @@ use std::path::Path;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mimalloc::MiMalloc;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Instant;
 
 mod checkpoint;
@@ -28,9 +26,9 @@ use diamond::{
     blastp_once, cluster as diamond_cluster, linclust as diamond_linclust, parse_tsv_stats,
     DiamondConfig,
 };
-use ecs::{run_scheduler, EcsConfig, GeneMetrics};
+use ecs::{run_alignment_pipeline, run_hmmer_pipeline, run_scheduler, EcsConfig, GeneMetrics};
 use hmmer::HmmscanSummary;
-use mafft::{load_sequences_by_ids, run_mafft, AlignmentMetrics};
+use mafft::{load_sequences_by_ids, AlignmentMetrics};
 use metrics::compute_intrinsic;
 use preflight::preflight;
 use provenance::filehash_xx64;
@@ -664,23 +662,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(default_per_job)
                     .clamp(1, total_threads);
                 let default_workers = (total_threads / mafft_threads_per_job).max(1);
-                let default_workers = default_workers.max(1);
-                let max_jobs = args
+                let requested_workers = args
                     .mafft_max_jobs
                     .or_else(|| file_cfg.mafft_max_jobs)
                     .unwrap_or(default_workers)
                     .max(1);
-                let mafft_workers = max_jobs.min(default_workers).max(1);
+                let mafft_workers = requested_workers.min(default_workers).max(1);
                 std::env::set_var("MAFFT_THREADS", mafft_threads_per_job.to_string());
 
                 let all_ids: Vec<String> = panel_map.values().flat_map(|v| v.clone()).collect();
-                let seqs = load_sequences_by_ids(ref_fasta, &all_ids).unwrap_or_default();
-                let seqs = Arc::new(seqs);
+                let ref_seqs = load_sequences_by_ids(ref_fasta, &all_ids).unwrap_or_default();
                 let query_seq_map: HashMap<String, Vec<u8>> = intrinsic_map
                     .iter()
                     .map(|(gid, (_im, qseq))| (gid.clone(), qseq.clone()))
                     .collect();
-                let query_seq_map = Arc::new(query_seq_map);
                 let jobs: Vec<(String, Vec<String>)> = metrics
                     .iter()
                     .filter_map(|g| {
@@ -695,59 +690,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .collect();
 
+                log::info!("mafft jobs queued: {}", jobs.len());
                 if !jobs.is_empty() {
-                    let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
-                    let results: Arc<Mutex<HashMap<String, AlignmentMetrics>>> =
-                        Arc::new(Mutex::new(HashMap::new()));
-                    let mafft_bin_arc = Arc::new(mafft_bin.clone());
-                    thread::scope(|scope| {
-                        for _ in 0..mafft_workers {
-                            let queue = Arc::clone(&queue);
-                            let seqs = Arc::clone(&seqs);
-                            let queries = Arc::clone(&query_seq_map);
-                            let results = Arc::clone(&results);
-                            let mafft_bin_path = Arc::clone(&mafft_bin_arc);
-                            scope.spawn(move || loop {
-                                let job = {
-                                    let mut guard = queue.lock().unwrap();
-                                    guard.pop_front()
-                                };
-                                let Some((gene_id, panel_ids)) = job else {
-                                    break;
-                                };
-                                let Some(qseq) = queries.get(&gene_id).cloned() else {
-                                    continue;
-                                };
-                                let mut hits: HashMap<String, Vec<u8>> = HashMap::new();
-                                for id in panel_ids.iter() {
-                                    let key = taxonomy::canonical_accession(id);
-                                    if let Some(s) = seqs.get(&key) {
-                                        hits.insert(key.clone(), s.clone());
-                                    }
-                                }
-                                if hits.is_empty() {
-                                    continue;
-                                }
-                                match run_mafft(mafft_bin_path.as_ref(), &gene_id, &qseq, &hits) {
-                                    Ok(m) => {
-                                        let mut guard = results.lock().unwrap();
-                                        guard.insert(gene_id.clone(), m);
-                                    }
-                                    Err(e) => {
-                                        log::warn!("mafft failed for {}: {}", gene_id, e);
-                                    }
-                                }
-                            });
-                        }
-                    });
-                    match Arc::try_unwrap(results) {
-                        Ok(mutex) => {
-                            alignment_map = mutex.into_inner().unwrap();
-                        }
-                        Err(arc) => {
-                            alignment_map = arc.lock().unwrap().clone();
-                        }
-                    }
+                    log::info!("mafft jobs queued: {}", jobs.len());
+                    alignment_map = run_alignment_pipeline(
+                        mafft_bin,
+                        jobs,
+                        query_seq_map,
+                        ref_seqs,
+                        mafft_workers,
+                    );
                 }
                 let _ = step_finish("mafft", t_mafft, log_json);
             }
@@ -823,15 +775,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ievalue = args
                     .hmmer_ievalue
                     .or_else(|| file_cfg.hmmer.as_ref().and_then(|h| h.ievalue));
-                if let Ok(m) = hmmer::run_hmmscan_batch_opts(
-                    hmm,
-                    pfam_db,
-                    items,
-                    hmmer_threads,
-                    top_n,
-                    ievalue,
-                ) {
-                    hmmsum_map = m;
+                if !items.is_empty() {
+                    log::info!("hmmscan jobs queued: {}", items.len());
+                    hmmsum_map =
+                        run_hmmer_pipeline(hmm, pfam_db, items, hmmer_threads, top_n, ievalue);
                 }
                 let orphan_cfg = file_cfg
                     .hmmer
@@ -856,15 +803,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let ref_ievalue = args
                             .hmmer_ref_ievalue
                             .or_else(|| file_cfg.hmmer.as_ref().and_then(|h| h.ref_ievalue));
-                        if let Ok(m) = hmmer::run_hmmscan_batch_opts(
-                            hmm,
-                            pfam_db,
-                            ref_items,
-                            hmmer_threads,
-                            top_n,
-                            ref_ievalue,
-                        ) {
-                            _ref_hmmsum_map = m;
+                        if !ref_items.is_empty() {
+                            log::info!("hmmscan reference jobs queued: {}", ref_items.len());
+                            _ref_hmmsum_map = run_hmmer_pipeline(
+                                hmm,
+                                pfam_db,
+                                ref_items,
+                                hmmer_threads,
+                                top_n,
+                                ref_ievalue,
+                            );
                         }
                     }
                 }

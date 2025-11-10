@@ -66,11 +66,13 @@ pub fn run_mafft(
         .unwrap_or(1);
     let mut child = Command::new(mafft_bin)
         .arg("--auto")
+        .arg("--quiet")
         .arg("--thread")
         .arg(threads_env.to_string())
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("failed to start mafft: {}", e))?;
     {

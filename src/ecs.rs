@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bevy_app::{App, Startup, Update};
 use bevy_ecs::prelude::*;
@@ -6,6 +7,10 @@ use bevy_tasks::{AsyncComputeTaskPool, Task, TaskPoolBuilder};
 use futures_lite::future::{block_on, poll_once};
 use needletail::parse_fastx_file;
 use std::time::{Duration, Instant};
+
+use crate::hmmer::{run_hmmscan, HmmscanSummary};
+use crate::mafft::{run_mafft, AlignmentMetrics};
+use crate::taxonomy;
 
 #[derive(Resource, Clone)]
 pub struct EcsConfig {
@@ -220,4 +225,387 @@ pub fn run_scheduler(cfg: EcsConfig) -> Vec<GeneMetrics> {
     }
     let results = app.world().get_resource::<Results>().unwrap();
     results.records.clone()
+}
+
+// --------- Alignment pipeline ---------
+
+#[derive(Component)]
+struct AlignmentJob {
+    gene_id: String,
+    panel_ids: Vec<String>,
+}
+
+#[derive(Resource)]
+struct AlignmentSeedJobs(Vec<(String, Vec<String>)>);
+
+#[derive(Component)]
+struct AlignmentHandle {
+    task: Task<Result<AlignmentMetrics, String>>,
+}
+
+#[derive(Resource)]
+struct AlignmentConfig {
+    mafft_bin: String,
+    max_jobs: usize,
+}
+
+#[derive(Resource)]
+struct AlignmentStores {
+    query_map: Arc<HashMap<String, Vec<u8>>>,
+    ref_map: Arc<HashMap<String, Vec<u8>>>,
+}
+
+#[derive(Resource, Default)]
+struct AlignmentResultsRes {
+    map: HashMap<String, AlignmentMetrics>,
+}
+
+#[derive(Resource, Default)]
+struct AlignmentInflight {
+    current: usize,
+}
+
+#[derive(Resource)]
+struct AlignmentProgress {
+    total: usize,
+    completed: usize,
+}
+
+pub fn run_alignment_pipeline(
+    mafft_bin: &str,
+    jobs: Vec<(String, Vec<String>)>,
+    query_map: HashMap<String, Vec<u8>>,
+    ref_map: HashMap<String, Vec<u8>>,
+    max_jobs: usize,
+) -> HashMap<String, AlignmentMetrics> {
+    let total_jobs = jobs.len();
+    let job_data = jobs;
+    AsyncComputeTaskPool::get_or_init(|| {
+        TaskPoolBuilder::new().num_threads(max_jobs.max(1)).build()
+    });
+    let mut app = App::new();
+    app.insert_resource(CompletionState::default())
+        .insert_resource(AlignmentConfig {
+            mafft_bin: mafft_bin.to_string(),
+            max_jobs: max_jobs.max(1),
+        })
+        .insert_resource(AlignmentStores {
+            query_map: Arc::new(query_map),
+            ref_map: Arc::new(ref_map),
+        })
+        .insert_resource(AlignmentResultsRes::default())
+        .insert_resource(AlignmentInflight::default())
+        .insert_resource(AlignmentProgress {
+            total: total_jobs,
+            completed: 0,
+        })
+        .insert_resource(AlignmentSeedJobs(job_data))
+        .add_systems(Startup, alignment_seed_system)
+        .add_systems(
+            Update,
+            (
+                alignment_schedule_system,
+                alignment_collect_system,
+                alignment_finish_system,
+            ),
+        );
+
+    loop {
+        app.update();
+        let state = app.world().get_resource::<CompletionState>().unwrap();
+        if state.finished {
+            break;
+        }
+    }
+
+    let results = app
+        .world_mut()
+        .remove_resource::<AlignmentResultsRes>()
+        .unwrap_or_default();
+    results.map
+}
+
+fn alignment_schedule_system(
+    mut commands: Commands,
+    config: Res<AlignmentConfig>,
+    stores: Res<AlignmentStores>,
+    mut inflight: ResMut<AlignmentInflight>,
+    mut progress: ResMut<AlignmentProgress>,
+    mut query: Query<(Entity, &AlignmentJob), Without<AlignmentHandle>>,
+) {
+    if inflight.current >= config.max_jobs {
+        return;
+    }
+    let pool = AsyncComputeTaskPool::get();
+    for (entity, job) in query.iter_mut() {
+        if inflight.current >= config.max_jobs {
+            break;
+        }
+        if job.panel_ids.is_empty() {
+            progress.completed += 1;
+            commands.entity(entity).insert(AlignmentDone);
+            continue;
+        }
+        let Some(qseq) = stores.query_map.get(&job.gene_id).cloned() else {
+            log::warn!("mafft skipped {}, query sequence missing", job.gene_id);
+            progress.completed += 1;
+            commands.entity(entity).insert(AlignmentDone);
+            continue;
+        };
+        let mut hits: HashMap<String, Vec<u8>> = HashMap::new();
+        for id in job.panel_ids.iter() {
+            let key = taxonomy::canonical_accession(id);
+            if let Some(seq) = stores.ref_map.get(&key) {
+                hits.insert(key.clone(), seq.clone());
+            }
+        }
+        if hits.is_empty() {
+            progress.completed += 1;
+            commands.entity(entity).insert(AlignmentDone);
+            continue;
+        }
+        let gene_id = job.gene_id.clone();
+        let bin = config.mafft_bin.clone();
+        let task = pool.spawn(async move { run_mafft(&bin, &gene_id, &qseq, &hits) });
+        commands.entity(entity).insert(AlignmentHandle { task });
+        inflight.current += 1;
+    }
+}
+
+fn alignment_collect_system(
+    mut commands: Commands,
+    mut inflight: ResMut<AlignmentInflight>,
+    mut results: ResMut<AlignmentResultsRes>,
+    mut progress: ResMut<AlignmentProgress>,
+    mut query: Query<(Entity, &AlignmentJob, &mut AlignmentHandle)>,
+) {
+    for (entity, job, mut handle) in query.iter_mut() {
+        if let Some(res) = block_on(poll_once(&mut handle.task)) {
+            inflight.current = inflight.current.saturating_sub(1);
+            match res {
+                Ok(metrics) => {
+                    results.map.insert(job.gene_id.clone(), metrics);
+                }
+                Err(err) => {
+                    log::warn!("mafft failed for {}: {}", job.gene_id, err);
+                }
+            }
+            progress.completed += 1;
+            commands.entity(entity).remove::<AlignmentHandle>();
+            commands.entity(entity).insert(AlignmentDone);
+        }
+    }
+}
+
+#[derive(Component)]
+struct AlignmentDone;
+
+fn alignment_finish_system(
+    mut commands: Commands,
+    mut state: ResMut<CompletionState>,
+    progress: Res<AlignmentProgress>,
+    done_query: Query<Entity, With<AlignmentDone>>,
+) {
+    for entity in done_query.iter() {
+        commands.entity(entity).despawn();
+    }
+    if progress.completed >= progress.total {
+        state.finished = true;
+    }
+}
+fn alignment_seed_system(mut commands: Commands, mut seeds: ResMut<AlignmentSeedJobs>) {
+    for (gene_id, panel_ids) in seeds.0.drain(..) {
+        commands.spawn(AlignmentJob { gene_id, panel_ids });
+    }
+}
+
+// --------- HMMER pipeline ---------
+
+#[derive(Component)]
+struct HmmerJob {
+    gene_id: String,
+    seq: Vec<u8>,
+}
+
+#[derive(Component)]
+struct HmmerHandle {
+    task: Task<Result<HmmscanSummary, String>>,
+}
+
+#[derive(Component)]
+struct HmmerDone;
+
+#[derive(Resource)]
+struct HmmerConfig {
+    bin: String,
+    db_path: String,
+    max_jobs: usize,
+    top_n: usize,
+    max_ievalue: Option<f64>,
+}
+
+#[derive(Resource, Default)]
+struct HmmerResultsRes {
+    map: HashMap<String, HmmscanSummary>,
+}
+
+#[derive(Resource, Default)]
+struct HmmerInflight {
+    current: usize,
+}
+
+#[derive(Resource)]
+struct HmmerProgress {
+    total: usize,
+    completed: usize,
+}
+
+#[derive(Resource)]
+struct HmmerSeedJobs(Vec<(String, Vec<u8>)>);
+
+pub fn run_hmmer_pipeline(
+    hmmscan_bin: &str,
+    db_path: &str,
+    items: Vec<(String, Vec<u8>)>,
+    max_jobs: usize,
+    top_n: usize,
+    max_ievalue: Option<f64>,
+) -> HashMap<String, HmmscanSummary> {
+    let total = items.len();
+    let seeds = items;
+    AsyncComputeTaskPool::get_or_init(|| {
+        TaskPoolBuilder::new().num_threads(max_jobs.max(1)).build()
+    });
+    let mut app = App::new();
+    app.insert_resource(CompletionState::default())
+        .insert_resource(HmmerConfig {
+            bin: hmmscan_bin.to_string(),
+            db_path: db_path.to_string(),
+            max_jobs: max_jobs.max(1),
+            top_n,
+            max_ievalue,
+        })
+        .insert_resource(HmmerResultsRes::default())
+        .insert_resource(HmmerInflight::default())
+        .insert_resource(HmmerProgress {
+            total,
+            completed: 0,
+        })
+        .insert_resource(HmmerSeedJobs(seeds))
+        .add_systems(Startup, hmmer_seed_system)
+        .add_systems(
+            Update,
+            (
+                hmmer_schedule_system,
+                hmmer_collect_system,
+                hmmer_finish_system,
+            ),
+        );
+
+    loop {
+        app.update();
+        let state = app.world().get_resource::<CompletionState>().unwrap();
+        if state.finished {
+            break;
+        }
+    }
+
+    let results = app
+        .world_mut()
+        .remove_resource::<HmmerResultsRes>()
+        .unwrap_or_default();
+    results.map
+}
+
+fn hmmer_seed_system(mut commands: Commands, mut seeds: ResMut<HmmerSeedJobs>) {
+    for (gene_id, seq) in seeds.0.drain(..) {
+        commands.spawn(HmmerJob { gene_id, seq });
+    }
+}
+
+fn hmmer_schedule_system(
+    mut commands: Commands,
+    config: Res<HmmerConfig>,
+    mut inflight: ResMut<HmmerInflight>,
+    mut progress: ResMut<HmmerProgress>,
+    mut query: Query<(Entity, &mut HmmerJob), Without<HmmerHandle>>,
+) {
+    if inflight.current >= config.max_jobs {
+        return;
+    }
+    let pool = AsyncComputeTaskPool::get();
+    for (entity, mut job) in query.iter_mut() {
+        if inflight.current >= config.max_jobs {
+            break;
+        }
+        if job.seq.is_empty() {
+            progress.completed += 1;
+            commands.entity(entity).insert(HmmerDone);
+            continue;
+        }
+        let gene_id = job.gene_id.clone();
+        let seq = std::mem::take(&mut job.seq);
+        let bin = config.bin.clone();
+        let db = config.db_path.clone();
+        let top_n = config.top_n;
+        let max_ev = config.max_ievalue;
+        let task = pool.spawn(async move {
+            match run_hmmscan(&bin, &db, &gene_id, &seq) {
+                Ok(mut summary) => {
+                    if let Some(ev) = max_ev {
+                        summary.hits.retain(|h| h.evalue <= ev);
+                    }
+                    if summary.hits.len() > top_n {
+                        summary.hits.truncate(top_n);
+                    }
+                    summary.hits_count = summary.hits.len();
+                    summary.top_accession = summary.hits.first().map(|h| h.accession.clone());
+                    summary.top_evalue = summary.hits.first().map(|h| h.evalue);
+                    Ok(summary)
+                }
+                Err(e) => Err(e),
+            }
+        });
+        commands.entity(entity).insert(HmmerHandle { task });
+        inflight.current += 1;
+    }
+}
+
+fn hmmer_collect_system(
+    mut commands: Commands,
+    mut inflight: ResMut<HmmerInflight>,
+    mut results: ResMut<HmmerResultsRes>,
+    mut progress: ResMut<HmmerProgress>,
+    mut query: Query<(Entity, &HmmerJob, &mut HmmerHandle)>,
+) {
+    for (entity, job, mut handle) in query.iter_mut() {
+        if let Some(res) = block_on(poll_once(&mut handle.task)) {
+            inflight.current = inflight.current.saturating_sub(1);
+            match res {
+                Ok(summary) => {
+                    results.map.insert(job.gene_id.clone(), summary);
+                }
+                Err(err) => {
+                    log::warn!("hmmscan failed for {}: {}", job.gene_id, err);
+                }
+            }
+            progress.completed += 1;
+            commands.entity(entity).remove::<HmmerHandle>();
+            commands.entity(entity).insert(HmmerDone);
+        }
+    }
+}
+
+fn hmmer_finish_system(
+    mut commands: Commands,
+    mut state: ResMut<CompletionState>,
+    progress: Res<HmmerProgress>,
+    done_query: Query<Entity, With<HmmerDone>>,
+) {
+    for entity in done_query.iter() {
+        commands.entity(entity).despawn();
+    }
+    if progress.completed >= progress.total {
+        state.finished = true;
+    }
 }
