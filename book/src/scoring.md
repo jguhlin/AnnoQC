@@ -4,7 +4,7 @@ AnnoQC combines pillar scores in [0,1] into a weighted average. Pillars:
 
 - Homology (h): DIAMOND-based evidence (hit count, bitscore density, coverage agreement).
 - Intrinsic (i): sequence quality (ambiguous, low-complexity, homopolymer; ORF heuristics).
-- Taxonomy (t, optional): presence-only for now (1.0 if taxid resolved).
+- Taxonomy (t, optional): consensus-based lineage congruence (LCA across top hits, penalized by contamination/outlier rate).
 - Domains Architecture (d, optional): Pfam clan-collapsed architecture agreement vs homolog panel.
 - Length Consistency (l, optional): query length vs homolog panel median using robust z-scores.
 - Orphan Domain Integrity (o, optional): detects N- or C-terminal Pfam domains that align far from the model edges, a strong hint of truncated gene models.
@@ -30,7 +30,10 @@ Formulas (implemented)
   - i = clamp(0.5·(1 − ambiguous_fraction) + 0.4·(1 − low_complexity_fraction) + 0.1·(1 − max_homopolymer/30), 0, 1).
 
 - Taxonomy t
-  - Presence-only placeholder: t = 1.0 if top hit maps to a taxid; else 0.0.
+  - Inputs: top `[taxonomy].top_hits` DIAMOND subjects (default 20) after redundancy trimming.
+  - Require at least `[taxonomy].min_consensus` resolved hits (default 5). Collect their lineage IDs and find the deepest node supported by ≥ `[taxonomy].min_support` fraction (default 0.75).
+  - Let `support_fraction = support_hits / considered_hits` and `depth_norm = depth / max_depth`. The congruence score is `t = clamp(support_fraction · depth_norm, 0, 1)`. Contamination is surfaced separately as `1 − support_fraction`.
+  - JSONL/CSV now emit `congruence_score`, `contamination_score`, support counts, and a consensus taxon label. The weighted scoring pipeline uses the congruence score whenever `[scoring.weights].taxonomy > 0`.
 
 - Domains architecture d (Pfam clan-collapsed)
   - Collapse accessions→clans; for each clan, compute frequency across homolog panel.
@@ -54,7 +57,7 @@ Start-concordance (gated)
 - Alignment-based assessment of whether the query begins at the consensus N-terminus of its homologs.
 - Requires a homolog panel of at least `min_hits` (default 5). If panel_size < `min_hits`, MAFFT is skipped and `start_concordance`/`start_class` are omitted.
 - Computation (when enabled):
-  - Align query + panel with MAFFT (threads = min(8, --threads)).
+  - Align query + panel with MAFFT, using `mafft_threads_per_job` threads per alignment (default 4 or 8 based on `--threads`) while pooling up to `mafft_max_jobs` concurrent MAFFT invocations.
   - Find first non-gap column per sequence; use the panel median as consensus start.
   - start_concordance = clamp(1 − |query_start − consensus_start|/30, 0, 1).
   - start_class: LikelyComplete (|Δ|≤3), LikelyNTruncated (Δ>3), LikelyNExtended (Δ<−3).

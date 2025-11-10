@@ -15,6 +15,12 @@ reference_fasta = "uniprot_sprot.fasta.gz"
 alignment_top_hits = 5
 alignment_strategy = "Auto"
 conserved_identity_min = 0.8
+alignment_missing_exon = 30
+alignment_retained_intron = 30
+mafft_threads_per_job = 4
+mafft_max_jobs = 2
+pfam_db = "share/pfam/Pfam-A.hmm"
+pfam_clans = "share/pfam/Pfam-A.clans.tsv"
 
 [scoring.weights]
 homology = 0.6
@@ -23,7 +29,6 @@ taxonomy = 0.0
 domains = 0.0
 length = 0.0
 orphan = 0.0
-taxonomy = 0.0
 
 [scoring.thresholds]
 high = 0.8
@@ -41,17 +46,11 @@ max_homopolymer = 10
 
 [taxonomy]
 enabled = false
-min_support = 0.7
-# profile_db = "/path/to/pfam.hmm"
-require_domain_match = false
+min_support = 0.75
+top_hits = 20
+min_consensus = 3
 # cache_path = "share/uniprot/uniprot_taxonomy.tsv"
 # taxdump_dir = "share/taxonomy/new_taxdump"
-# pfam_metadata = "share/pfam/Pfam-A.hmm.dat"
-# pfam_clans = "share/pfam/Pfam-A.clans.tsv"
-
-# Optional HMMER and DIAMOND knobs
-pfam_db = "share/pfam/Pfam-A.hmm"
-pfam_clans = "share/pfam/Pfam-A.clans.tsv"
 
 [consensus]
 # Minimum number of homologs required for consensus-based analyses (MAFFT/start, domain architecture)

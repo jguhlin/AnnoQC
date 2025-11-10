@@ -17,8 +17,18 @@ len_ratio_tolerance = 0.30
 redundancy_pident = 90.0
 max_high_identity = 3
 
+alignment_missing_exon = 30
+alignment_retained_intron = 30
+mafft_threads_per_job = 4
+mafft_max_jobs = 2
+pfam_db = "share/pfam/Pfam-A.hmm"
+pfam_clans = "share/pfam/Pfam-A.clans.tsv"
+
 [taxonomy]
 enabled = false
+min_support = 0.75
+top_hits = 20
+min_consensus = 3
 
 # Structural variation defaults tuned from head200 summary (fusion gap≈160 aa, subject coverage≈0.27)
 [structvar]
@@ -29,10 +39,6 @@ dup_max_gap = 20
 split_delta = 0.30
 min_subject_cov = 0.27
 orient_majority = 0.70
-
-# Top-level Pfam paths for HMMER (must be at root, not under [taxonomy])
-pfam_db = "share/pfam/Pfam-A.hmm"
-pfam_clans = "share/pfam/Pfam-A.clans.tsv"
 
 [hmmer]
 orphan_analysis = true
