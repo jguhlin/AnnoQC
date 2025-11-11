@@ -1,5 +1,6 @@
 use crate::diamond::DiamondHitStats;
 use crate::metrics::IntrinsicMetrics;
+use crate::taxonomy::TaxonomyEvidence;
 
 pub fn compute_homology_score(s: Option<&DiamondHitStats>) -> f64 {
     if let Some(s) = s {
@@ -26,10 +27,6 @@ pub fn compute_intrinsic_score(im: &IntrinsicMetrics) -> f64 {
     (0.5 * amb_pen + 0.4 * lc_pen + 0.1 * hp_pen).clamp(0.0, 1.0)
 }
 
-pub fn compute_taxonomy_score(resolved: bool) -> f64 {
-    if resolved {
-        1.0
-    } else {
-        0.0
-    }
+pub fn compute_taxonomy_score(evidence: Option<&TaxonomyEvidence>) -> f64 {
+    evidence.map(|e| e.congruence_score).unwrap_or(0.0)
 }

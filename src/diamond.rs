@@ -41,7 +41,7 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
     // Request explicit outfmt 6 columns by passing tokens separately.
     let outfmt_tokens = [
         "6", "qseqid", "sseqid", "bitscore", "evalue", "length", "qcovhsp", "scovhsp", "pident",
-        "qstart", "qend", "sstart", "send", "qlen", "slen",
+        "qstart", "qend", "sstart", "send", "qlen", "slen", "staxids", "slineages",
     ];
     let mut attempts = 0usize;
     loop {
@@ -58,9 +58,12 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
             .arg("--threads")
             .arg(cfg.threads.to_string())
             .arg("--max-target-seqs")
-            .arg("25")
+            .arg("50")
             .arg("--max-hsps")
             .arg(cfg.max_hsps.to_string())
+            .arg("--sensitive")
+            .arg("--motif-masking")
+            .arg("0")
             .arg("--quiet")
             .arg("--out")
             .arg(&out_path)
@@ -99,7 +102,7 @@ pub fn blastp_chunked(
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
     let outfmt_tokens = [
         "6", "qseqid", "sseqid", "bitscore", "evalue", "length", "qcovhsp", "scovhsp", "pident",
-        "qstart", "qend", "sstart", "send", "qlen", "slen",
+        "qstart", "qend", "sstart", "send", "qlen", "slen", "staxids", "slineages",
     ];
     let mut reader = parse_fastx_file(&cfg.query_fasta).map_err(|e| e.to_string())?;
     let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
@@ -190,9 +193,12 @@ fn run_chunk(
             .arg("--threads")
             .arg("1")
             .arg("--max-target-seqs")
-            .arg("25")
+            .arg("50")
             .arg("--max-hsps")
             .arg(cfg.max_hsps.to_string())
+            .arg("--sensitive")
+            .arg("--motif-masking")
+            .arg("0")
             .arg("--quiet")
             .arg("--out")
             .arg(&tmpout)
@@ -347,7 +353,7 @@ pub fn parse_tsv_stats(
         let cols: Vec<&str> = line.split('\t').collect();
         let q = cols[0];
         let sseqid = cols[1].to_string();
-        let (bitscore, evalue, alen, qcov, scov, pident) = if cols.len() >= 14 && cols.len() < 16 {
+        let (bitscore, evalue, alen, qcov, scov, pident) = if cols.len() >= 14 {
             // our requested outfmt: 6 qseqid sseqid bitscore evalue length qcovhsp scovhsp pident
             (
                 cols[2].parse::<f64>().unwrap_or(0.0),
@@ -426,7 +432,7 @@ pub fn parse_tsv_grouped(
         let q = cols[0].to_string();
         let s = cols[1].to_string();
         let (bitscore, evalue, alen, qcov, scov, pident, qstart, qend, sstart, send, qlen, slen) =
-            if cols.len() >= 14 && cols.len() < 16 {
+            if cols.len() >= 14 {
                 (
                     cols[2].parse::<f64>().unwrap_or(0.0),
                     cols[3].to_string(),

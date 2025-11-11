@@ -8,7 +8,7 @@ orphan = 0.0
 
 [consensus]
 min_hits = 5
-max_panel = 20
+max_panel = 15
 filt_qcov = 0.70
 filt_scov = 0.50
 filt_evalue = 1e-5
@@ -17,10 +17,12 @@ len_ratio_tolerance = 0.30
 redundancy_pident = 90.0
 max_high_identity = 3
 
+alignment_strategy = "Fast"
 alignment_missing_exon = 30
 alignment_retained_intron = 30
-mafft_threads_per_job = 4
-mafft_max_jobs = 2
+mafft_threads_per_job = 2
+mafft_max_jobs = 6
+render_max_jobs = 12
 pfam_db = "share/pfam/Pfam-A.hmm"
 pfam_clans = "share/pfam/Pfam-A.clans.tsv"
 

@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -13,6 +14,90 @@ pub struct TaxonomyResolver {
 }
 
 #[derive(Debug, Clone)]
+pub struct TaxonomyConsensusConfig {
+    pub min_hits: usize,
+    pub top_hits: usize,
+    pub min_support: f64,
+    pub coarse_rank_index: usize,
+    pub coarse_min_support: f64,
+}
+
+impl Default for TaxonomyConsensusConfig {
+    fn default() -> Self {
+        Self {
+            min_hits: 5,
+            top_hits: 20,
+            min_support: 0.75,
+            coarse_rank_index: 1,
+            coarse_min_support: 0.6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaxonomyDetail {
+    NoHits,
+    InsufficientHits,
+    Consensus,
+    CoarseConsensus,
+    Borrowed,
+}
+
+impl fmt::Display for TaxonomyDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            TaxonomyDetail::NoHits => "NoHits",
+            TaxonomyDetail::InsufficientHits => "InsufficientHits",
+            TaxonomyDetail::Consensus => "Consensus",
+            TaxonomyDetail::CoarseConsensus => "CoarseConsensus",
+            TaxonomyDetail::Borrowed => "Borrowed",
+        };
+        write!(f, "{}", text)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaxonomyEvidence {
+    pub top_hit: Option<TaxonSummary>,
+    pub consensus: Option<TaxonSummary>,
+    pub consensus_rank: Option<String>,
+    pub consensus_depth: usize,
+    pub support: usize,
+    pub considered: usize,
+    pub support_fraction: f64,
+    pub congruence_score: f64,
+    pub contamination_score: f64,
+    pub detail: TaxonomyDetail,
+}
+
+impl Default for TaxonomyEvidence {
+    fn default() -> Self {
+        Self {
+            top_hit: None,
+            consensus: None,
+            consensus_rank: None,
+            consensus_depth: 0,
+            support: 0,
+            considered: 0,
+            support_fraction: 0.0,
+            congruence_score: 0.0,
+            contamination_score: 0.0,
+            detail: TaxonomyDetail::NoHits,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FallbackConsensus {
+    summary: TaxonSummary,
+    support: usize,
+    support_fraction: f64,
+    depth: usize,
+    rank: Option<String>,
+    congruence: f64,
+}
+
+#[derive(Debug, Clone)]
 struct TaxonomyNode {
     parent: u32,
     #[allow(dead_code)]
@@ -24,6 +109,7 @@ pub struct TaxonSummary {
     pub taxid: u32,
     pub name: Option<String>,
     pub lineage: Vec<String>,
+    pub lineage_ids: Vec<u32>,
 }
 
 impl TaxonomyResolver {
@@ -94,27 +180,191 @@ impl TaxonomyResolver {
     pub fn lookup(&self, accession: &str) -> Option<TaxonSummary> {
         let key = canonical_accession(accession);
         let taxid = self.accession_to_taxid.get(&key).copied()?;
-        let (lineage, name) = self.reconstruct_lineage(taxid);
-        Some(TaxonSummary {
-            taxid,
-            name,
-            lineage,
+        Some(self.summary_for_taxid(taxid))
+    }
+
+    pub fn summarize_panel(
+        &self,
+        accessions: &[String],
+        cfg: &TaxonomyConsensusConfig,
+    ) -> TaxonomyEvidence {
+        let mut evidence = TaxonomyEvidence::default();
+        if accessions.is_empty() {
+            return evidence;
+        }
+        let mut resolved: Vec<TaxonSummary> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for acc in accessions.iter().take(cfg.top_hits) {
+            let canon = canonical_accession(acc);
+            if !seen.insert(canon.clone()) {
+                continue;
+            }
+            if let Some(summary) = self.lookup(acc) {
+                if evidence.top_hit.is_none() {
+                    evidence.top_hit = Some(summary.clone());
+                }
+                resolved.push(summary);
+            }
+        }
+        evidence.considered = resolved.len();
+        if resolved.is_empty() {
+            evidence.detail = TaxonomyDetail::NoHits;
+            return evidence;
+        }
+        if resolved.len() < cfg.min_hits {
+            evidence.detail = TaxonomyDetail::InsufficientHits;
+        }
+
+        let mut stats: HashMap<u32, (usize, usize)> = HashMap::new();
+        let mut max_depth = 0usize;
+        for summary in &resolved {
+            let depth = summary.lineage_ids.len();
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            for (idx, taxid) in summary.lineage_ids.iter().enumerate() {
+                stats
+                    .entry(*taxid)
+                    .and_modify(|entry| {
+                        entry.0 += 1;
+                        if idx > entry.1 {
+                            entry.1 = idx;
+                        }
+                    })
+                    .or_insert((1, idx));
+            }
+        }
+        let total = resolved.len();
+        let min_support = cfg.min_support.clamp(0.0, 1.0);
+        let quorum = ((min_support * total as f64).ceil() as usize).max(1);
+        let mut best: Option<(usize, usize, u32)> = None;
+        for (&taxid, (count, depth)) in stats.iter() {
+            if *count < quorum {
+                continue;
+            }
+            match best {
+                Some((best_depth, best_count, best_taxid)) => {
+                    if *depth > best_depth
+                        || (*depth == best_depth && *count > best_count)
+                        || (*depth == best_depth && *count == best_count && taxid < best_taxid)
+                    {
+                        best = Some((*depth, *count, taxid));
+                    }
+                }
+                None => best = Some((*depth, *count, taxid)),
+            }
+        }
+        if let Some((depth, support, taxid)) = best {
+            let support_fraction = support as f64 / total as f64;
+            let max_depth = max_depth.max(1);
+            let depth_norm = (depth as f64 / (max_depth as f64 - 1.0).max(1.0)).clamp(0.0, 1.0);
+            let congruence = (support_fraction * depth_norm).clamp(0.0, 1.0);
+            let contamination = (1.0 - support_fraction).clamp(0.0, 1.0);
+            let consensus = resolved
+                .iter()
+                .find(|ts| ts.taxid == taxid)
+                .cloned()
+                .or_else(|| Some(self.summary_for_taxid(taxid)));
+            evidence.consensus = consensus;
+            evidence.consensus_rank = self
+                .nodes
+                .get(&taxid)
+                .map(|node| node.rank.clone())
+                .filter(|s| !s.is_empty());
+            evidence.consensus_depth = depth;
+            evidence.support = support;
+            evidence.support_fraction = support_fraction;
+            evidence.congruence_score = congruence;
+            evidence.contamination_score = contamination;
+            evidence.detail = TaxonomyDetail::Consensus;
+        } else if let Some(coarse) = self.fallback_coarse_consensus(&resolved, cfg) {
+            evidence.support = coarse.support;
+            evidence.considered = total;
+            evidence.support_fraction = coarse.support_fraction;
+            evidence.congruence_score = coarse.congruence;
+            evidence.contamination_score = (1.0 - coarse.support_fraction).clamp(0.0, 1.0);
+            evidence.consensus = Some(coarse.summary);
+            evidence.consensus_rank = coarse.rank;
+            evidence.consensus_depth = coarse.depth;
+            evidence.detail = TaxonomyDetail::CoarseConsensus;
+        }
+        evidence
+    }
+
+    fn fallback_coarse_consensus(
+        &self,
+        resolved: &[TaxonSummary],
+        cfg: &TaxonomyConsensusConfig,
+    ) -> Option<FallbackConsensus> {
+        let idx = cfg.coarse_rank_index;
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        let mut label_for: HashMap<u32, String> = HashMap::new();
+        for summary in resolved {
+            if summary.lineage_ids.len() <= idx {
+                continue;
+            }
+            let taxid = summary.lineage_ids[idx];
+            *counts.entry(taxid).or_insert(0) += 1;
+            if let Some(name) = summary.lineage.get(idx) {
+                label_for.entry(taxid).or_insert_with(|| name.clone());
+            }
+        }
+        if counts.is_empty() {
+            return None;
+        }
+        let total = resolved.len();
+        let mut best_tax: Option<(usize, u32)> = None;
+        for (taxid, count) in counts {
+            if (count as f64 / total as f64) < cfg.coarse_min_support {
+                continue;
+            }
+            match best_tax {
+                Some((best_count, best_taxid)) => {
+                    if count > best_count || (count == best_count && taxid < best_taxid) {
+                        best_tax = Some((count, taxid));
+                    }
+                }
+                None => best_tax = Some((count, taxid)),
+            }
+        }
+        let (support, taxid) = best_tax?;
+        let summary = self.summary_for_taxid(taxid);
+        let support_fraction = support as f64 / total as f64;
+        Some(FallbackConsensus {
+            summary,
+            support,
+            support_fraction,
+            depth: idx,
+            rank: label_for.get(&taxid).cloned(),
+            congruence: (support_fraction * 0.5).clamp(0.0, 1.0),
         })
     }
 
-    fn reconstruct_lineage(&self, taxid: u32) -> (Vec<String>, Option<String>) {
+    fn summary_for_taxid(&self, taxid: u32) -> TaxonSummary {
+        let (lineage, lineage_ids, name) = self.reconstruct_lineage(taxid);
+        TaxonSummary {
+            taxid,
+            name,
+            lineage,
+            lineage_ids,
+        }
+    }
+
+    fn reconstruct_lineage(&self, taxid: u32) -> (Vec<String>, Vec<u32>, Option<String>) {
         if self.nodes.is_empty() {
             let name = self.scientific_names.get(&taxid).cloned();
-            return (Vec::new(), name);
+            return (Vec::new(), vec![taxid], name);
         }
         let mut lineage = Vec::new();
+        let mut lineage_ids = Vec::new();
         let mut current = taxid;
         let mut depth = 0;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         while let Some(node) = self.nodes.get(&current) {
             if let Some(name) = self.scientific_names.get(&current) {
                 lineage.push(name.clone());
             }
+            lineage_ids.push(current);
             if seen.contains(&current) {
                 break;
             }
@@ -128,6 +378,9 @@ impl TaxonomyResolver {
                 break;
             }
         }
+        if lineage_ids.last().copied() != Some(current) {
+            lineage_ids.push(current);
+        }
         if let Some(root_name) = self.scientific_names.get(&current) {
             if lineage.last().map(|s| s != root_name).unwrap_or(true) {
                 lineage.push(root_name.clone());
@@ -135,7 +388,8 @@ impl TaxonomyResolver {
         }
         let name = self.scientific_names.get(&taxid).cloned();
         lineage.reverse();
-        (lineage, name)
+        lineage_ids.reverse();
+        (lineage, lineage_ids, name)
     }
 }
 
@@ -276,6 +530,7 @@ pub fn infer_taxdump_dir(path: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::TaxonomyResolver;
+    use std::collections::HashMap;
     use std::fs;
     use tempfile::TempDir;
 
@@ -316,5 +571,95 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn consensus_scores_and_support() {
+        use super::{TaxonomyConsensusConfig, TaxonomyDetail, TaxonomyNode};
+        let mut accession_to_taxid = HashMap::new();
+        accession_to_taxid.insert("A".to_string(), 4);
+        accession_to_taxid.insert("B".to_string(), 4);
+        accession_to_taxid.insert("C".to_string(), 3);
+        accession_to_taxid.insert("D".to_string(), 5);
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            1,
+            TaxonomyNode {
+                parent: 1,
+                rank: "root".into(),
+            },
+        );
+        nodes.insert(
+            2,
+            TaxonomyNode {
+                parent: 1,
+                rank: "kingdom".into(),
+            },
+        );
+        nodes.insert(
+            3,
+            TaxonomyNode {
+                parent: 2,
+                rank: "genus".into(),
+            },
+        );
+        nodes.insert(
+            4,
+            TaxonomyNode {
+                parent: 3,
+                rank: "species".into(),
+            },
+        );
+        nodes.insert(
+            5,
+            TaxonomyNode {
+                parent: 2,
+                rank: "genus".into(),
+            },
+        );
+
+        let mut names = HashMap::new();
+        names.insert(1, "root".into());
+        names.insert(2, "Bacteria".into());
+        names.insert(3, "Escherichia".into());
+        names.insert(4, "Escherichia coli".into());
+        names.insert(5, "Outlierus".into());
+
+        let resolver = TaxonomyResolver::new(accession_to_taxid, nodes, names);
+        let cfg = TaxonomyConsensusConfig {
+            min_hits: 3,
+            top_hits: 10,
+            min_support: 0.9,
+            coarse_rank_index: 1,
+            coarse_min_support: 0.6,
+        };
+        let hits = vec![
+            "sp|A|".to_string(),
+            "sp|B|".to_string(),
+            "tr|C|".to_string(),
+            "sp|D|".to_string(),
+        ];
+        let evidence = resolver.summarize_panel(&hits, &cfg);
+        assert!(matches!(
+            evidence.detail,
+            TaxonomyDetail::Consensus | TaxonomyDetail::CoarseConsensus
+        ));
+        let consensus = evidence.consensus.expect("consensus taxon present").taxid;
+        assert!(consensus == 2 || consensus == 3);
+        assert_eq!(evidence.considered, 4);
+        assert!(evidence.support >= 2);
+        assert!(evidence.support_fraction >= 0.5);
+        assert!(evidence.congruence_score > 0.1);
+        assert!((evidence.contamination_score - 0.25).abs() < 0.26);
+
+        let scarce_hits = vec!["sp|A|".into(), "sp|B|".into()];
+        let scarce = resolver.summarize_panel(&scarce_hits, &cfg);
+        assert!(matches!(
+            scarce.detail,
+            TaxonomyDetail::InsufficientHits
+                | TaxonomyDetail::CoarseConsensus
+                | TaxonomyDetail::Consensus
+        ));
     }
 }

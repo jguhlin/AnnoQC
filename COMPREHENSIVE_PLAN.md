@@ -17,7 +17,7 @@ AnnoQC is a Rust CLI that evaluates gene/protein annotations at scale by combini
 - [x] Document metrics & scoring in mdBook (`book/`) with examples.
 - [x] Package releases (Linux/macOS/Windows) and optional Docker image.
 - [x] Build offline UniProt taxonomy cache + lineage resolver.
-- [ ] Integrate hmmscan + Pfam taxonomy heuristics into scoring model.
+- [x] Integrate hmmscan + Pfam taxonomy heuristics into scoring model.
 
 ## Goals
 
@@ -121,6 +121,7 @@ AnnoQC evaluates gene models using a multi-pillar evidence-based approach. Each 
 
 - CI: lint (`fmt`, `clippy -D warnings`), unit tests, tiny fixture integration tests.
 - Release: build artifacts for Linux/macOS (x86_64/aarch64) and Windows; optional Docker image with DIAMOND.
+- Scripted packaging: `scripts/package_release.sh` compiles a release build via Pixi and bundles configs/licensing into `dist/annoqc-<version>-<target>.tar.gz` plus a `.sha256` checksum.
 
 ## Preflight Checks
 

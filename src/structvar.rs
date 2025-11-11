@@ -1,10 +1,21 @@
 use crate::diamond::DiamondHitRow;
-use std::collections::HashMap;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 
 type HspBlock = (usize, usize, usize, usize, bool);
 type MergedSpan = (usize, usize, usize, usize);
-type SubjectHspMap<'a> = HashMap<&'a str, Vec<HspBlock>>;
-type SubjectSpanVec = Vec<(String, Vec<MergedSpan>)>;
+type SubjectHspMap = HashMap<String, Vec<HspBlock>>;
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StructVarSubjectSummary {
+    pub subject_id: String,
+    pub query_coverage: f64,
+    pub subject_coverage: f64,
+    pub span_count: usize,
+    pub orientation: String,
+    pub strand_confidence: f64,
+    pub order_conflict: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct StructVarThresholds {
@@ -44,6 +55,8 @@ pub struct StructVar {
     pub fusion_right_len: Option<usize>,
     pub fusion_subjects: Option<(String, String)>,
     pub fusion_cover_fracs: Option<(f64, f64)>,
+    pub subjects: Vec<StructVarSubjectSummary>,
+    pub warnings: Vec<String>,
 }
 
 /// Heuristic structural variation analysis using DIAMOND top hits.
@@ -69,23 +82,24 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
     let orient_maj = th.orient_majority;
 
     // Group HSPs by subject (canonical sseqid string as-is; upstream may canonicalize as needed)
-    let mut by_subject: SubjectHspMap<'_> = HashMap::new();
-    let mut by_subject_strong: SubjectHspMap<'_> = HashMap::new();
-    let mut subj_slen: HashMap<&str, usize> = HashMap::new();
-    let mut subj_orient: HashMap<&str, (usize, usize)> = HashMap::new(); // (fwd, rev)
+    let mut by_subject: SubjectHspMap = HashMap::new();
+    let mut by_subject_strong: SubjectHspMap = HashMap::new();
+    let mut subj_slen: HashMap<String, usize> = HashMap::new();
+    let mut subj_orient: HashMap<String, (usize, usize)> = HashMap::new(); // (fwd, rev)
     for h in hits {
         let a = h.qstart.min(h.qend);
         let b = h.qstart.max(h.qend);
         let is_rev = h.sstart > h.send;
-        by_subject.entry(&h.sseqid).or_default().push((
+        let key = h.sseqid.clone();
+        by_subject.entry(key.clone()).or_default().push((
             a,
             b,
             h.sstart.min(h.send),
             h.sstart.max(h.send),
             is_rev,
         ));
-        subj_slen.entry(&h.sseqid).or_insert(h.slen);
-        let e = subj_orient.entry(&h.sseqid).or_insert((0, 0));
+        subj_slen.entry(key.clone()).or_insert(h.slen);
+        let e = subj_orient.entry(key.clone()).or_insert((0, 0));
         if is_rev {
             e.1 += 1;
         } else {
@@ -99,7 +113,7 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
             0.0
         };
         if hsp_len >= min_strong_len && frac >= min_strong_frac {
-            by_subject_strong.entry(&h.sseqid).or_default().push((
+            by_subject_strong.entry(key).or_default().push((
                 a,
                 b,
                 h.sstart.min(h.send),
@@ -131,50 +145,88 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
         }
         merged
     }
-    let mut subj_spans: SubjectSpanVec = Vec::new();
-    let mut subj_spans_strong: SubjectSpanVec = Vec::new();
-    for (sid, v) in by_subject.into_iter() {
-        let mut v2 = merge(v);
-        v2.sort_by_key(|t| t.0);
-        subj_spans.push((sid.to_string(), v2));
+    #[derive(Clone)]
+    struct SubjectWorking {
+        id: String,
+        spans_all: Vec<MergedSpan>,
+        spans_strong: Vec<MergedSpan>,
+        qcov: f64,
+        scov: f64,
+        orientation: String,
+        strand_conf: f64,
+        orientation_conflict: bool,
+        order_conflict: bool,
     }
-    for (sid, v) in by_subject_strong.into_iter() {
-        subj_spans_strong.push((sid.to_string(), merge(v)));
-    }
-    let mut subj_qcov: HashMap<String, f64> = HashMap::new();
-    for (sid, spans) in &subj_spans_strong {
-        let covered: usize = spans
+
+    let mut warning_set: HashSet<String> = HashSet::new();
+    let mut subjects_working: Vec<SubjectWorking> = Vec::new();
+    for (sid, spans) in by_subject.into_iter() {
+        let mut merged_all = merge(spans);
+        merged_all.sort_by_key(|t| t.0);
+        let strong_raw = by_subject_strong.get(&sid).cloned().unwrap_or_default();
+        let mut merged_strong = merge(strong_raw);
+        merged_strong.sort_by_key(|t| t.0);
+        let spans_for_cov = if merged_strong.is_empty() {
+            &merged_all
+        } else {
+            &merged_strong
+        };
+        let qcovered: usize = spans_for_cov
             .iter()
             .map(|(qa, qb, _, _)| qb.saturating_sub(*qa) + 1)
             .sum();
-        subj_qcov.insert(sid.clone(), (covered as f64) / (qlen as f64));
+        let qcov = (qcovered as f64) / (qlen as f64);
+        let slen = *subj_slen.get(&sid).unwrap_or(&1);
+        let scov = if slen > 0 {
+            let scov_cov: usize = spans_for_cov
+                .iter()
+                .map(|(_, _, sa, sb)| sb.saturating_sub(*sa) + 1)
+                .sum();
+            (scov_cov as f64) / (slen as f64)
+        } else {
+            0.0
+        };
+        let (fwd, rev) = subj_orient.get(&sid).copied().unwrap_or((0, 0));
+        let (orientation, strand_conf, orientation_conflict) =
+            determine_orientation(fwd, rev, orient_maj);
+        let order_conflict = detect_order_conflict(&merged_all, &orientation);
+        if orientation_conflict {
+            warning_set.insert(format!("StructVarOrientationConflict:{}", sid));
+        }
+        if order_conflict {
+            warning_set.insert(format!("StructVarOrderConflict:{}", sid));
+        }
+        subjects_working.push(SubjectWorking {
+            id: sid.clone(),
+            spans_all: merged_all,
+            spans_strong: merged_strong,
+            qcov,
+            scov,
+            orientation,
+            strand_conf,
+            orientation_conflict,
+            order_conflict,
+        });
     }
-    // Flatten all spans for summary and diagnostics
-    let mut spans: Vec<(usize, usize)> = subj_spans
+    let mut spans: Vec<(usize, usize)> = subjects_working
         .iter()
-        .flat_map(|(_, v)| v.iter().map(|(a, b, _, _)| (*a, *b)))
+        .flat_map(|s| s.spans_all.iter().map(|(a, b, _, _)| (*a, *b)))
         .collect();
     spans.sort_by_key(|t| t.0);
-    sv.spans = spans.clone();
+    sv.spans = spans;
     // fusion: two different subjects whose (merged, strong) spans are disjoint, separated by large gap
-    'fusion: for i in 0..subj_spans_strong.len().saturating_sub(1) {
-        for j in i + 1..subj_spans_strong.len() {
-            let (ref ida, ref a) = subj_spans[i];
-            let (ref idb, ref b) = subj_spans[j];
-            let qcov_a = *subj_qcov.get(ida).unwrap_or(&0.0);
-            let qcov_b = *subj_qcov.get(idb).unwrap_or(&0.0);
-            if qcov_a < min_subj_cov || qcov_b < min_subj_cov {
+    'fusion: for i in 0..subjects_working.len().saturating_sub(1) {
+        for j in i + 1..subjects_working.len() {
+            let a = &subjects_working[i];
+            let b = &subjects_working[j];
+            if a.qcov < min_subj_cov || b.qcov < min_subj_cov {
                 continue;
             }
-            // use coarse first and last positions
-            let (a_min, a_max) = (
-                a.first().map(|x| x.0).unwrap_or(0),
-                a.last().map(|x| x.1).unwrap_or(0),
-            );
-            let (b_min, b_max) = (
-                b.first().map(|x| x.0).unwrap_or(0),
-                b.last().map(|x| x.1).unwrap_or(0),
-            );
+            if a.orientation_conflict || b.orientation_conflict {
+                continue;
+            }
+            let (a_min, a_max) = span_bounds(&a.spans_all);
+            let (b_min, b_max) = span_bounds(&b.spans_all);
             if a_max > 0 && b_max > 0 {
                 let (left_max, right_min) = if a_min <= b_min {
                     (a_max, b_min)
@@ -184,34 +236,7 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
                 if right_min > left_max {
                     let gap = right_min - left_max;
                     if gap >= fusion_min_gap {
-                        // per-subject coverage fractions (strong merged spans)
-                        // compute dominant orientation (>= th.orient_majority votes) for each subject
-                        let dominant = |id: &str| -> bool {
-                            let (fwd, rev) = *subj_orient.get(id).unwrap_or(&(1, 0));
-                            let tot = fwd + rev;
-                            if tot == 0 {
-                                return true;
-                            }
-                            let (maj, _min) = if fwd >= rev { (fwd, rev) } else { (rev, fwd) };
-                            (maj as f64) / (tot as f64) >= orient_maj
-                        };
-                        if !dominant(ida) || !dominant(idb) {
-                            continue;
-                        }
-                        let (cov_a, cov_b) = {
-                            let sa_cov: usize = a
-                                .iter()
-                                .map(|(_qa, _qb, sa, sb)| sb.saturating_sub(*sa) + 1)
-                                .sum();
-                            let sb_cov: usize = b
-                                .iter()
-                                .map(|(_qa, _qb, sa, sb)| sb.saturating_sub(*sa) + 1)
-                                .sum();
-                            let la = *subj_slen.get(ida.as_str()).unwrap_or(&1);
-                            let lb = *subj_slen.get(idb.as_str()).unwrap_or(&1);
-                            ((sa_cov as f64) / (la as f64), (sb_cov as f64) / (lb as f64))
-                        };
-                        if cov_a < 0.20 || cov_b < 0.20 {
+                        if a.scov < 0.20 || b.scov < 0.20 {
                             continue;
                         }
                         sv.fusion_possible = true;
@@ -221,8 +246,8 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
                         sv.fusion_gap = Some(gap);
                         sv.fusion_left_len = Some(left_len);
                         sv.fusion_right_len = Some(right_len);
-                        sv.fusion_subjects = Some((ida.clone(), idb.clone()));
-                        sv.fusion_cover_fracs = Some((cov_a.min(1.0), cov_b.min(1.0)));
+                        sv.fusion_subjects = Some((a.id.clone(), b.id.clone()));
+                        sv.fusion_cover_fracs = Some((a.scov.min(1.0), b.scov.min(1.0)));
                         break 'fusion;
                     }
                 }
@@ -230,18 +255,25 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
         }
     }
     // split: coverage delta from the best hit if available
-    if let Some(best) = hits.first() {
-        let qcov = best.qcov;
-        let scov = best.scov;
-        if (qcov - scov).abs() >= split_delta {
+    if let Some(best_subject) = subjects_working.iter().max_by(|a, b| {
+        a.qcov
+            .partial_cmp(&b.qcov)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) {
+        if (best_subject.qcov - best_subject.scov).abs() >= split_delta {
             sv.split_possible = true;
         }
     }
     // duplication: within a subject, two strong disjoint spans with small gap suggest internal duplication
-    'dup: for (sid, v) in &subj_spans_strong {
-        if *subj_qcov.get(sid).unwrap_or(&0.0) < min_subj_cov {
+    'dup: for subj in &subjects_working {
+        if subj.qcov < min_subj_cov {
             continue;
         }
+        let v = if subj.spans_strong.is_empty() {
+            &subj.spans_all
+        } else {
+            &subj.spans_strong
+        };
         for i in 0..v.len().saturating_sub(1) {
             let (a1, b1, _sa1, _sb1) = v[i];
             let (a2, b2, _sa2, _sb2) = v[i + 1];
@@ -268,7 +300,77 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
     } else {
         "None".into()
     };
+    sv.subjects = subjects_working
+        .iter()
+        .map(|s| StructVarSubjectSummary {
+            subject_id: s.id.clone(),
+            query_coverage: s.qcov,
+            subject_coverage: s.scov,
+            span_count: s.spans_all.len(),
+            orientation: s.orientation.clone(),
+            strand_confidence: s.strand_conf,
+            order_conflict: s.order_conflict,
+        })
+        .collect();
+    let mut warnings: Vec<String> = warning_set.into_iter().collect();
+    warnings.sort();
+    sv.warnings = warnings;
     sv
+}
+
+fn span_bounds(spans: &[MergedSpan]) -> (usize, usize) {
+    if spans.is_empty() {
+        return (0, 0);
+    }
+    let min = spans.first().map(|t| t.0).unwrap_or(0);
+    let max = spans.last().map(|t| t.1).unwrap_or(0);
+    (min, max)
+}
+
+fn determine_orientation(fwd: usize, rev: usize, thresh: f64) -> (String, f64, bool) {
+    let total = fwd + rev;
+    if total == 0 {
+        return ("Unknown".into(), 0.0, true);
+    }
+    if rev == 0 {
+        let conf = (fwd as f64) / (total as f64);
+        ("Forward".into(), conf, conf < thresh)
+    } else if fwd == 0 {
+        let conf = (rev as f64) / (total as f64);
+        ("Reverse".into(), conf, conf < thresh)
+    } else {
+        let conf = (fwd.max(rev) as f64) / (total as f64);
+        ("Mixed".into(), conf, true)
+    }
+}
+
+fn detect_order_conflict(spans: &[MergedSpan], orientation: &str) -> bool {
+    if spans.len() <= 1 {
+        return false;
+    }
+    match orientation {
+        "Forward" => {
+            let mut last = spans[0].2;
+            for span in spans.iter().skip(1) {
+                if span.2 < last {
+                    return true;
+                }
+                last = span.2;
+            }
+            false
+        }
+        "Reverse" => {
+            let mut last = spans[0].2;
+            for span in spans.iter().skip(1) {
+                if span.2 > last {
+                    return true;
+                }
+                last = span.2;
+            }
+            false
+        }
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -323,5 +425,19 @@ mod tests {
         ];
         let sv = analyze(&hits, &StructVarThresholds::default());
         assert!(sv.duplication_possible);
+    }
+
+    #[test]
+    fn orientation_conflict_triggers_warning() {
+        let hits = vec![
+            mk("q", "A", 50, 150, 800, 20, 120),
+            mk("q", "A", 200, 300, 800, 300, 200),
+        ];
+        let sv = analyze(&hits, &StructVarThresholds::default());
+        assert!(!sv.subjects.is_empty());
+        assert!(sv
+            .warnings
+            .iter()
+            .any(|w| w.contains("StructVarOrientationConflict")));
     }
 }

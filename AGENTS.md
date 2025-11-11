@@ -60,3 +60,10 @@
 ## Agent‑Specific Instructions
 - Scope: applies to the entire repo. Keep patches minimal and focused; don’t reformat unrelated files or add generated data.
 - Prioritize modularity and maintainability: prefer small, testable Rust modules (e.g., `src/diamond.rs`, `src/ecs.rs`, `src/taxonomy.rs`) over monolithic files. Extract sub‑libraries into modules when it improves separation of concerns, reuse, and testability. Follow best practices: clear ownership of responsibilities, narrow interfaces, and zero shared mutable state unless behind resources or channels.
+
+### ECS + Streaming Emit Notes
+- ECS is the backbone: DIAMOND intake, MAFFT, HMMER, structvar, and now JSON/CSV rendering all run through Bevy systems. Any new heavy stage should follow the same pattern (seed jobs → async handles → collect → flush).
+- Rendering is streaming: `run_render_pipeline` writes JSONL/CSV per gene as soon as its components are ready. No giant `HashMap` buffering; always prefer components/resources over ad‑hoc maps.
+- Keep systems deterministic: cap async pools with `max_jobs`, maintain ordered flush via `next_index`, and despawn entities after flushing to keep memory flat.
+- Diagnostics belong in ECS resources too (e.g., domains_arch_debug, structvar summaries). When adding new per-gene diagnostics, aggregate via systems instead of post-processing the whole dataset.
+- When touching Bevy APIs, consult upstream docs for 0.17 patterns—avoid direct entity handles after despawn; use resources/queues instead.

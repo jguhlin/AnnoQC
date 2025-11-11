@@ -1,6 +1,7 @@
 use crate::diamond::DiamondHitRow;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct ConsensusConfig {
@@ -13,13 +14,16 @@ pub struct ConsensusConfig {
     pub redundancy_pident: f64,
     pub max_high_identity: usize,
     pub len_ratio_tolerance: f64,
+    pub redundancy_trigger: usize,
+    pub diversity_backfill: bool,
+    pub clusters: Option<Arc<HashMap<String, Vec<String>>>>,
 }
 
 impl Default for ConsensusConfig {
     fn default() -> Self {
         Self {
             min_hits: 5,
-            max_panel: 20,
+            max_panel: 40,
             filt_qcov: 0.70,
             filt_scov: 0.50,
             filt_evalue: 1e-5,
@@ -27,6 +31,9 @@ impl Default for ConsensusConfig {
             redundancy_pident: 90.0,
             max_high_identity: 3,
             len_ratio_tolerance: 0.30,
+            redundancy_trigger: 20,
+            diversity_backfill: true,
+            clusters: None,
         }
     }
 }
@@ -44,6 +51,7 @@ pub struct PanelStats {
     pub len_ratio_max: f64,
     pub median_pident: f64,
     pub high_identity_dropped: usize,
+    pub backfill_from_clusters: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,6 +173,7 @@ fn run_phase(hits: &[DiamondHitRow], cfg: &ConsensusConfig, phase: &PhaseFilter)
     let mut seen_roots: HashSet<String> = HashSet::new();
     let mut high_identity_selected = 0usize;
     let max_high_identity = cfg.max_high_identity.max(1);
+    let enforce_redundancy = stats.filtered_hits >= cfg.redundancy_trigger;
 
     for h in hits.iter() {
         if h.qcov < phase.qcov || h.scov < phase.scov {
@@ -190,7 +199,7 @@ fn run_phase(hits: &[DiamondHitRow], cfg: &ConsensusConfig, phase: &PhaseFilter)
         if !seen_roots.insert(root) {
             continue;
         }
-        if h.pident >= cfg.redundancy_pident {
+        if enforce_redundancy && h.pident >= cfg.redundancy_pident {
             if high_identity_selected >= max_high_identity {
                 stats.high_identity_dropped += 1;
                 continue;
@@ -223,9 +232,84 @@ fn run_phase(hits: &[DiamondHitRow], cfg: &ConsensusConfig, phase: &PhaseFilter)
     }
 
     PanelSelection {
-        ids: selected,
+        ids: finalize_with_backfill(hits, cfg, selected, &mut stats),
         stats,
     }
+}
+
+fn finalize_with_backfill(
+    hits: &[DiamondHitRow],
+    cfg: &ConsensusConfig,
+    mut selected: Vec<String>,
+    stats: &mut PanelStats,
+) -> Vec<String> {
+    // Backfill from clusters if scarce
+    if selected.len() < cfg.min_hits {
+        if let Some(clmap) = &cfg.clusters {
+            let mut added = 0usize;
+            let mut seen: HashSet<String> = selected.iter().cloned().collect();
+            for h in hits.iter().take(2) {
+                let root = subject_root(&h.sseqid);
+                if let Some(members) = clmap.get(&root).or_else(|| clmap.get(&h.sseqid)) {
+                    for m in members {
+                        if seen.insert(m.clone()) {
+                            selected.push(m.clone());
+                            added += 1;
+                            if selected.len() >= cfg.min_hits || selected.len() >= cfg.max_panel {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if selected.len() >= cfg.min_hits || selected.len() >= cfg.max_panel {
+                    break;
+                }
+            }
+            stats.backfill_from_clusters = added;
+        }
+    }
+
+    // Diversity backfill by length ratio bins
+    if cfg.diversity_backfill && selected.len() < cfg.max_panel {
+        let mut bins_seen: HashSet<i32> = HashSet::new();
+        let mut seen_ids: HashSet<String> = selected.iter().cloned().collect();
+        // mark bins of already selected
+        for h in hits {
+            if seen_ids.contains(&h.sseqid) {
+                let lr = if h.qlen > 0 { h.slen as f64 / h.qlen as f64 } else { 0.0 };
+                bins_seen.insert((lr * 10.0).floor() as i32);
+            }
+        }
+        // prefer hits in unseen bins
+        for h in hits {
+            if selected.len() >= cfg.max_panel {
+                break;
+            }
+            if seen_ids.contains(&h.sseqid) {
+                continue;
+            }
+            let lr = if h.qlen > 0 { h.slen as f64 / h.qlen as f64 } else { 0.0 };
+            let bin = (lr * 10.0).floor() as i32;
+            if !bins_seen.contains(&bin) {
+                selected.push(h.sseqid.clone());
+                seen_ids.insert(h.sseqid.clone());
+                bins_seen.insert(bin);
+            }
+        }
+        // fill remaining with best leftover
+        for h in hits {
+            if selected.len() >= cfg.max_panel {
+                break;
+            }
+            if !seen_ids.contains(&h.sseqid) {
+                selected.push(h.sseqid.clone());
+                seen_ids.insert(h.sseqid.clone());
+            }
+        }
+    }
+
+    selected.truncate(cfg.max_panel);
+    selected
 }
 
 fn median(values: &mut [f64]) -> f64 {

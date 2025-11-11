@@ -64,8 +64,15 @@ pub fn run_mafft(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1);
-    let mut child = Command::new(mafft_bin)
-        .arg("--auto")
+    let fast = std::env::var("MAFFT_FAST").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let mut cmd = Command::new(mafft_bin);
+    if fast {
+        // FFT-NS-1: fastest reasonable settings
+        cmd.arg("--retree").arg("1").arg("--maxiterate").arg("0");
+    } else {
+        cmd.arg("--auto");
+    }
+    let mut child = cmd
         .arg("--quiet")
         .arg("--thread")
         .arg(threads_env.to_string())
@@ -85,7 +92,9 @@ pub fn run_mafft(
     }
     let aln = String::from_utf8_lossy(&output.stdout);
     let seqs = parse_fasta_sequences(&aln);
-    Ok(compute_alignment_metrics(&seqs))
+    let mut metrics = compute_alignment_metrics(&seqs);
+    metrics.strategy_used = if fast { "fast".into() } else { "auto".into() };
+    Ok(metrics)
 }
 
 fn parse_fasta_sequences(s: &str) -> Vec<Vec<u8>> {

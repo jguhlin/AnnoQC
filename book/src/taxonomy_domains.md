@@ -8,16 +8,21 @@ This page outlines how AnnoQC enriches results with taxonomy lineage and protein
   - NCBI taxdump (`nodes.dmp`, `names.dmp`) via `--taxonomy-taxdump-dir` or `[taxonomy].taxdump_dir` to reconstruct scientific names and lineage.
 
 - Resolution
-  - For each gene, the DIAMOND top hit is canonicalized (e.g., `sp|P12345|...` → `P12345`) and looked up in the cache.
-  - If a taxid is found, lineage is reconstructed using taxdump; otherwise only the taxid is surfaced if available.
+  - For each gene we take up to `[taxonomy].top_hits` (default 20) DIAMOND subjects, canonicalize their accessions, deduplicate, and look them up via the cache.
+  - The resulting taxids feed a Lowest Common Ancestor pass that demands at least `[taxonomy].min_consensus` resolved hits (default 5) and a quorum of `[taxonomy].min_support` (default 0.75).
+  - The deepest node that satisfies the quorum becomes the consensus taxon; we record support counts, support fraction, and depth to approximate how specific the consensus is.
+  - If no node meets the strict quorum but the panel still contains hits, we fall back to a coarse consensus at `[taxonomy].coarse_rank_index` (default index 1 ⇒ superkingdom). This is useful for “bacterial vs eukaryote” checks when species-level agreement is sparse.
+  - Transcripts that share a root ID like `geneX.t1/geneX.t2` borrow consensus evidence across isoforms (`detail = Borrowed`) so alternative transcripts inherit the lineage call of their best-supported sibling.
+  - Even when the consensus cannot be established (too few hits, or no resolver) we still emit a `detail` string so downstream dashboards can distinguish "NoHits" from "NoResolver" cases.
 
 - JSONL output
-  - `taxonomy.status`: `enabled` or `disabled`.
-  - When enabled and resolved, emits `taxonomy.taxid`, `taxonomy.name`, and `taxonomy.lineage` (root → leaf).
-  - Score components include a placeholder `taxonomy` score (1.0 if resolved, 0.0 otherwise) weighted by `[scoring.weights].taxonomy`.
+  - `taxonomy.status`: `enabled` or `disabled` plus a `detail` reason (`NoHits`, `InsufficientHits`, `Consensus`, `NoResolver`).
+  - When a consensus exists the block includes `top_hit` (taxid/name/lineage), `consensus_taxid`, `consensus_name`, `consensus_lineage`, `consensus_depth`, `consensus_rank`, `support_hits`, `considered_hits`, `support_fraction`, and both `congruence_score` + `contamination_score`.
+  - The taxonomy pillar in `score_components` now mirrors the congruence score so weighting `[scoring.weights].taxonomy` actually reflects lineage agreement.
 
 - CSV output
-  - Adds `taxonomy_score` and `taxonomy_status` columns; currently presence/absence based.
+  - Compact mode now includes `taxonomy_score` (the congruence score), `taxonomy_contamination`, `taxonomy_support`, `taxonomy_considered`, `consensus_taxon`, and `taxonomy_status` (detail string).
+  - `--csv-verbose` keeps the per-pillar `taxonomy_score` column near the front and appends the same contamination/support/consensus columns near the end for filtering.
 
 - Domains (hmmscan)
   - When `--hmmscan-bin` and `pfam_db` are provided, JSONL includes a `domains` block with `hits_count`, `top_accession`, `top_evalue`, and per-hit details (`target_name`, `accession`, `evalue`, `score`, `bias`).

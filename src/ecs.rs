@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use bevy_app::{App, Startup, Update};
@@ -10,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::hmmer::{run_hmmscan, HmmscanSummary};
 use crate::mafft::{run_mafft, AlignmentMetrics};
-use crate::taxonomy;
+use crate::render_gene_record;
+use crate::{taxonomy, RenderContext, RenderedRecord};
 
 #[derive(Resource, Clone)]
 pub struct EcsConfig {
@@ -271,6 +275,18 @@ struct AlignmentProgress {
     completed: usize,
 }
 
+#[derive(Resource)]
+#[allow(dead_code)]
+struct AlignmentDiag {
+    total: usize,
+    skipped_no_panel: usize,
+    skipped_no_query: usize,
+    skipped_no_refs: usize,
+    scheduled: usize,
+    last_log: std::time::Instant,
+    next_pct: usize,
+}
+
 pub fn run_alignment_pipeline(
     mafft_bin: &str,
     jobs: Vec<(String, Vec<String>)>,
@@ -298,6 +314,15 @@ pub fn run_alignment_pipeline(
         .insert_resource(AlignmentProgress {
             total: total_jobs,
             completed: 0,
+        })
+        .insert_resource(AlignmentDiag {
+            total: total_jobs,
+            skipped_no_panel: 0,
+            skipped_no_query: 0,
+            skipped_no_refs: 0,
+            scheduled: 0,
+            last_log: std::time::Instant::now(),
+            next_pct: 5,
         })
         .insert_resource(AlignmentSeedJobs(job_data))
         .add_systems(Startup, alignment_seed_system)
@@ -331,6 +356,7 @@ fn alignment_schedule_system(
     stores: Res<AlignmentStores>,
     mut inflight: ResMut<AlignmentInflight>,
     mut progress: ResMut<AlignmentProgress>,
+    mut diag: ResMut<AlignmentDiag>,
     mut query: Query<(Entity, &AlignmentJob), Without<AlignmentHandle>>,
 ) {
     if inflight.current >= config.max_jobs {
@@ -343,13 +369,19 @@ fn alignment_schedule_system(
         }
         if job.panel_ids.is_empty() {
             progress.completed += 1;
-            commands.entity(entity).insert(AlignmentDone);
+            if let Ok(mut ecmd) = commands.get_entity(entity) {
+                ecmd.insert(AlignmentDone);
+            }
+            diag.skipped_no_panel += 1;
             continue;
         }
         let Some(qseq) = stores.query_map.get(&job.gene_id).cloned() else {
             log::warn!("mafft skipped {}, query sequence missing", job.gene_id);
             progress.completed += 1;
-            commands.entity(entity).insert(AlignmentDone);
+            if let Ok(mut ecmd) = commands.get_entity(entity) {
+                ecmd.insert(AlignmentDone);
+            }
+            diag.skipped_no_query += 1;
             continue;
         };
         let mut hits: HashMap<String, Vec<u8>> = HashMap::new();
@@ -361,14 +393,20 @@ fn alignment_schedule_system(
         }
         if hits.is_empty() {
             progress.completed += 1;
-            commands.entity(entity).insert(AlignmentDone);
+            if let Ok(mut ecmd) = commands.get_entity(entity) {
+                ecmd.insert(AlignmentDone);
+            }
+            diag.skipped_no_refs += 1;
             continue;
         }
         let gene_id = job.gene_id.clone();
         let bin = config.mafft_bin.clone();
         let task = pool.spawn(async move { run_mafft(&bin, &gene_id, &qseq, &hits) });
-        commands.entity(entity).insert(AlignmentHandle { task });
+        if let Ok(mut ecmd) = commands.get_entity(entity) {
+            ecmd.insert(AlignmentHandle { task });
+        }
         inflight.current += 1;
+        diag.scheduled += 1;
     }
 }
 
@@ -377,6 +415,7 @@ fn alignment_collect_system(
     mut inflight: ResMut<AlignmentInflight>,
     mut results: ResMut<AlignmentResultsRes>,
     mut progress: ResMut<AlignmentProgress>,
+    mut diag: ResMut<AlignmentDiag>,
     mut query: Query<(Entity, &AlignmentJob, &mut AlignmentHandle)>,
 ) {
     for (entity, job, mut handle) in query.iter_mut() {
@@ -391,8 +430,36 @@ fn alignment_collect_system(
                 }
             }
             progress.completed += 1;
-            commands.entity(entity).remove::<AlignmentHandle>();
-            commands.entity(entity).insert(AlignmentDone);
+            if let Ok(mut ecmd) = commands.get_entity(entity) {
+                ecmd.remove::<AlignmentHandle>();
+                ecmd.insert(AlignmentDone);
+            }
+        }
+    }
+    // Throttled progress logging: on each 5% completion or every 60s
+    let now = std::time::Instant::now();
+    let pct = if progress.total > 0 {
+        (progress.completed * 100) / progress.total
+    } else {
+        100
+    };
+    let should_log_pct = pct >= diag.next_pct && diag.next_pct <= 100;
+    let should_log_time = now.duration_since(diag.last_log).as_secs() >= 60;
+    if should_log_pct || should_log_time {
+        log::info!(
+            "mafft progress: completed={}/{} ({}%), inflight={}, scheduled={}, skipped_no_panel={}, skipped_no_query={}, skipped_no_refs={}",
+            progress.completed,
+            progress.total,
+            pct,
+            inflight.current,
+            diag.scheduled,
+            diag.skipped_no_panel,
+            diag.skipped_no_query,
+            diag.skipped_no_refs
+        );
+        diag.last_log = now;
+        if should_log_pct {
+            diag.next_pct = (pct / 5 + 1) * 5; // next 5% bucket
         }
     }
 }
@@ -400,15 +467,7 @@ fn alignment_collect_system(
 #[derive(Component)]
 struct AlignmentDone;
 
-fn alignment_finish_system(
-    mut commands: Commands,
-    mut state: ResMut<CompletionState>,
-    progress: Res<AlignmentProgress>,
-    done_query: Query<Entity, With<AlignmentDone>>,
-) {
-    for entity in done_query.iter() {
-        commands.entity(entity).despawn();
-    }
+fn alignment_finish_system(mut state: ResMut<CompletionState>, progress: Res<AlignmentProgress>) {
     if progress.completed >= progress.total {
         state.finished = true;
     }
@@ -540,7 +599,9 @@ fn hmmer_schedule_system(
         }
         if job.seq.is_empty() {
             progress.completed += 1;
-            commands.entity(entity).insert(HmmerDone);
+            if let Ok(mut ecmd) = commands.get_entity(entity) {
+                ecmd.insert(HmmerDone);
+            }
             continue;
         }
         let gene_id = job.gene_id.clone();
@@ -566,7 +627,9 @@ fn hmmer_schedule_system(
                 Err(e) => Err(e),
             }
         });
-        commands.entity(entity).insert(HmmerHandle { task });
+        if let Ok(mut ecmd) = commands.get_entity(entity) {
+            ecmd.insert(HmmerHandle { task });
+        }
         inflight.current += 1;
     }
 }
@@ -590,22 +653,224 @@ fn hmmer_collect_system(
                 }
             }
             progress.completed += 1;
-            commands.entity(entity).remove::<HmmerHandle>();
-            commands.entity(entity).insert(HmmerDone);
+            if let Ok(mut ecmd) = commands.get_entity(entity) {
+                ecmd.remove::<HmmerHandle>();
+                ecmd.insert(HmmerDone);
+            }
         }
     }
 }
 
-fn hmmer_finish_system(
-    mut commands: Commands,
-    mut state: ResMut<CompletionState>,
-    progress: Res<HmmerProgress>,
-    done_query: Query<Entity, With<HmmerDone>>,
-) {
-    for entity in done_query.iter() {
-        commands.entity(entity).despawn();
-    }
+fn hmmer_finish_system(mut state: ResMut<CompletionState>, progress: Res<HmmerProgress>) {
     if progress.completed >= progress.total {
+        state.finished = true;
+    }
+}
+
+// --------- Render pipeline ---------
+
+#[derive(Resource)]
+struct RenderConfig {
+    ctx: Arc<RenderContext>,
+}
+
+#[derive(Resource, Default)]
+struct RenderInflight {
+    tasks: Vec<Task<Result<RenderedRecord, String>>>,
+    max_in_flight: usize,
+}
+
+#[derive(Resource)]
+struct RenderQueue(VecDeque<(usize, GeneMetrics)>);
+
+#[derive(Resource, Default)]
+struct RenderPending {
+    map: BTreeMap<usize, RenderedRecord>,
+}
+
+#[derive(Resource)]
+struct RenderBuffers {
+    json: BufWriter<File>,
+    csv: BufWriter<File>,
+    next_index: usize,
+}
+
+#[derive(Resource)]
+struct RenderProgress {
+    total: usize,
+    flushed: usize,
+}
+
+#[derive(Resource, Default)]
+struct RenderErrors {
+    first: Option<String>,
+}
+
+const CSV_HEADER_VERBOSE: &str = "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,orphan_domain_score,length_score,length_ratio,length_class,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,missing_exon_run,retained_intron_run,start_concordance,start_class,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_contamination,taxonomy_support,taxonomy_considered,consensus_taxon,taxonomy_status,warnings";
+
+const CSV_HEADER_STANDARD: &str = "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,orphan_domain_score,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_score,taxonomy_contamination,taxonomy_support,taxonomy_considered,consensus_taxon,taxonomy_status,warnings";
+
+pub fn run_render_pipeline(
+    out_dir: &str,
+    metrics: &[GeneMetrics],
+    ctx: Arc<RenderContext>,
+    max_jobs: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let json_path = Path::new(out_dir).join("qc_report.jsonl");
+    let csv_path = Path::new(out_dir).join("qc_summary.csv");
+    let json_file = File::create(json_path)?;
+    let csv_file = File::create(csv_path)?;
+    let mut csv_writer = BufWriter::new(csv_file);
+    if ctx.csv_verbose {
+        writeln!(csv_writer, "{}", CSV_HEADER_VERBOSE)?;
+    } else {
+        writeln!(csv_writer, "{}", CSV_HEADER_STANDARD)?;
+    }
+    let json_writer = BufWriter::new(json_file);
+    let seeds: VecDeque<(usize, GeneMetrics)> = metrics.iter().cloned().enumerate().collect();
+    AsyncComputeTaskPool::get_or_init(|| {
+        TaskPoolBuilder::new().num_threads(max_jobs.max(1)).build()
+    });
+    let mut app = App::new();
+    app.insert_resource(CompletionState::default())
+        .insert_resource(RenderConfig { ctx })
+        .insert_resource(RenderQueue(seeds))
+        .insert_resource(RenderInflight {
+            tasks: Vec::new(),
+            max_in_flight: max_jobs.max(1),
+        })
+        .insert_resource(RenderPending::default())
+        .insert_resource(RenderProgress {
+            total: metrics.len(),
+            flushed: 0,
+        })
+        .insert_resource(RenderErrors::default())
+        .insert_resource(RenderBuffers {
+            json: json_writer,
+            csv: csv_writer,
+            next_index: 0,
+        })
+        .add_systems(
+            Update,
+            (
+                render_schedule_system,
+                render_collect_system,
+                render_flush_system,
+                render_finish_system,
+            ),
+        );
+
+    loop {
+        app.update();
+        let state = app.world().get_resource::<CompletionState>().unwrap();
+        if state.finished {
+            break;
+        }
+    }
+
+    {
+        let world = app.world_mut();
+        let mut buffers = world.remove_resource::<RenderBuffers>().unwrap();
+        buffers.json.flush()?;
+        buffers.csv.flush()?;
+    }
+    let world = app.world_mut();
+    if let Some(errs) = world.remove_resource::<RenderErrors>() {
+        if let Some(err) = errs.first {
+            return Err(err.into());
+        }
+    }
+    Ok(())
+}
+
+fn render_schedule_system(
+    config: Res<RenderConfig>,
+    mut queue: ResMut<RenderQueue>,
+    mut inflight: ResMut<RenderInflight>,
+    errors: Res<RenderErrors>,
+) {
+    if errors.first.is_some() {
+        return;
+    }
+    let pool = AsyncComputeTaskPool::get();
+    while inflight.tasks.len() < inflight.max_in_flight {
+        let Some((index, metrics)) = queue.0.pop_front() else {
+            break;
+        };
+        let ctx = Arc::clone(&config.ctx);
+        let task = pool.spawn(async move { render_gene_record(index, &metrics, &ctx) });
+        inflight.tasks.push(task);
+    }
+}
+
+fn render_collect_system(
+    mut inflight: ResMut<RenderInflight>,
+    mut pending: ResMut<RenderPending>,
+    mut errors: ResMut<RenderErrors>,
+) {
+    let mut i = 0;
+    while i < inflight.tasks.len() {
+        if let Some(res) = block_on(poll_once(&mut inflight.tasks[i])) {
+            match res {
+                Ok(record) => {
+                    pending.map.insert(record.index, record);
+                }
+                Err(err) => {
+                    if errors.first.is_none() {
+                        errors.first = Some(err);
+                    }
+                }
+            }
+            drop(inflight.tasks.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn render_flush_system(
+    mut pending: ResMut<RenderPending>,
+    mut buffers: ResMut<RenderBuffers>,
+    mut progress: ResMut<RenderProgress>,
+    mut errors: ResMut<RenderErrors>,
+) {
+    if errors.first.is_some() {
+        return;
+    }
+    while let Some(record) = pending.map.remove(&buffers.next_index) {
+        if let Err(e) = writeln!(buffers.json, "{}", record.json_line) {
+            if errors.first.is_none() {
+                errors.first = Some(format!("write json: {}", e));
+            }
+            break;
+        }
+        if let Err(e) = writeln!(buffers.csv, "{}", record.csv_line) {
+            if errors.first.is_none() {
+                errors.first = Some(format!("write csv: {}", e));
+            }
+            break;
+        }
+        buffers.next_index += 1;
+        progress.flushed += 1;
+    }
+}
+
+fn render_finish_system(
+    queue: Res<RenderQueue>,
+    pending: Res<RenderPending>,
+    inflight: Res<RenderInflight>,
+    progress: Res<RenderProgress>,
+    errors: Res<RenderErrors>,
+    mut state: ResMut<CompletionState>,
+) {
+    let queue_empty = queue.0.is_empty();
+    let inflight_empty = inflight.tasks.is_empty();
+    let pending_empty = pending.map.is_empty();
+    if progress.flushed >= progress.total && queue_empty && inflight_empty && pending_empty {
+        state.finished = true;
+        return;
+    }
+    if errors.first.is_some() && inflight_empty {
         state.finished = true;
     }
 }

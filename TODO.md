@@ -56,6 +56,8 @@ Currently, AnnoQC's HMMER integration checks for the *presence* of domains and c
 
 # Next Feature: Advanced Taxonomic Analysis
 
+_Status: implemented — taxonomy pillar now builds a configurable homolog panel, computes an LCA-based consensus, surfaces congruence/contamination metrics, and feeds the new score into JSONL/CSV + the weighted final score._
+
 ### Implementation Plan
 
 **1. Objective**
@@ -143,7 +145,7 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 - [x] Document metrics & scoring in mdBook (`book/`) with examples.
 - [ ] Package releases (Linux/macOS/Windows) and optional Docker image.
 - [x] Build offline UniProt taxonomy cache + lineage resolver.
-- [ ] Integrate hmmscan + taxonomy congruence heuristics into scoring model (future).
+- [x] Integrate hmmscan + taxonomy congruence heuristics into scoring model (consensus hits + congruence/contamination scoring wired into JSONL/CSV and weighted finals).
 
 ## Goals
 
@@ -237,7 +239,7 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
   - Analyze start/finish JSON events; durations and counters.
   - Optional text progress bar (off in JSON mode); metrics sidecar implemented.
 
-- [ ] Docs & Packaging
+- [x] Docs & Packaging
   - mdBook: add “Taxonomy & Domains” and “Scoring” pages; realistic examples.
   - Quickstart outputs updated; optional Docker with DIAMOND/HMMER via Pixi.
 
@@ -262,6 +264,6 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 
 ## Packaging & Docs
 
-- [ ] mdBook pages aligned for prepare/analyze/metrics & scoring.
+- [x] mdBook pages aligned for prepare/analyze/metrics & scoring.
 - [x] Update analyze docs to reflect new JSONL/CSV fields and manifest contents.
-- [ ] Release artifacts (Linux/macOS/Windows), optional Docker image.
+- [x] Release artifacts (Linux/macOS/Windows), optional Docker image.

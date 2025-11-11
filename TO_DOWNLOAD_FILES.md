@@ -32,8 +32,9 @@ Use this list to provision all third-party datasets required for offline taxonom
 2. Record SHA256 checksums in `share/CHECKSUMS.txt` to ensure reproducibility.
 3. Update `config.example.toml` or your project config with paths:
    - `reference_fasta = "share/uniprot/uniprot_sprot.fasta.gz"`
-   - `taxonomy.profile_db = "share/pfam/Pfam-A.hmm"` (after decompression).
-   - Additional keys (planned): `taxonomy.taxdump_dir`, `taxonomy.cache_tsv`.
+   - `pfam_db = "share/pfam/Pfam-A.hmm"` (after decompression).
+   - `pfam_clans = "share/pfam/Pfam-A.clans.tsv"`
+   - Optional: `taxonomy.taxdump_dir` and `taxonomy.cache_path` for faster lineage lookups.
 4. Keep raw archives alongside processed outputs so regeneration is repeatable.
 
 All downloads should be performed manually or via `scripts/fetch_reference_data.sh` (see below); avoid hammering remote servers by caching artifacts in artifact storage or shared buckets.

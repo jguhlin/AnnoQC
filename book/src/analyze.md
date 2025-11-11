@@ -130,6 +130,7 @@ The CSV is suitable for spreadsheets or dashboards, while the JSONL is richer fo
 - MAFFT pooling
   - `--mafft-threads-per-job N` or `mafft_threads_per_job = N` chooses how many MAFFT worker threads each alignment receives (default heuristic: 4 or 8 depending on `--threads`).
   - `--mafft-max-jobs M` or `mafft_max_jobs = M` caps concurrent MAFFT alignments; the default is `floor((threads−1)/mafft_threads_per_job)` so the scheduler always leaves at least one CPU for coordination.
+  - `--render-max-jobs M` (or `render_max_jobs = M`) controls how many streaming render tasks write JSONL/CSV concurrently; the default matches `--threads`, but you can lower it if disk bandwidth is saturated or raise it when emit becomes the bottleneck.
 
 - StructVar diagnostics
   - The JSON `structvar` block includes a `subjects[]` array with per-subject coverage, dominant strand, and ordering information; CSV warnings echo the major structvar states (`FusionPossible`, `SplitPossible`).
@@ -138,6 +139,9 @@ The CSV is suitable for spreadsheets or dashboards, while the JSONL is richer fo
   - `--diamond-mode auto|single|batch` (default `auto`).
   - Auto uses Single up to `--diamond-auto-threshold` or `[diamond].auto_threshold` (default 200,000 queries), otherwise Batch.
   - In Batch and `--log-format json`, per-chunk progress events are logged.
+
+- High-score exports
+  - Use `--export-high` (or `export_high = true`) to dump every gene classified as `High` into `<out>/high_scoring.faa`. Override the destination with `--export-high-path path` or `export_high_path = "..."` in your config.
 
 ## Consensus Panels & Diagnostics
 

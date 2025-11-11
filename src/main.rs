@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Write;
-use std::path::Path;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mimalloc::MiMalloc;
@@ -10,6 +11,7 @@ use std::time::Instant;
 
 mod checkpoint;
 mod consensus;
+mod clusters;
 mod diamond;
 mod ecs;
 mod hmmer;
@@ -26,7 +28,10 @@ use diamond::{
     blastp_once, cluster as diamond_cluster, linclust as diamond_linclust, parse_tsv_stats,
     DiamondConfig,
 };
-use ecs::{run_alignment_pipeline, run_hmmer_pipeline, run_scheduler, EcsConfig, GeneMetrics};
+use ecs::{
+    run_alignment_pipeline, run_hmmer_pipeline, run_render_pipeline, run_scheduler, EcsConfig,
+    GeneMetrics,
+};
 use hmmer::HmmscanSummary;
 use mafft::{load_sequences_by_ids, AlignmentMetrics};
 use metrics::compute_intrinsic;
@@ -50,6 +55,34 @@ type DomainsArchDebugRow = (
     f64,
 );
 type LengthSummary = (f64, f64, f64, String);
+
+#[derive(Clone)]
+pub(crate) struct RenderContext {
+    stats: Arc<HashMap<String, diamond::DiamondHitStats>>,
+    intrinsic_map: Arc<HashMap<String, (metrics::IntrinsicMetrics, Vec<u8>)>>,
+    alignment_map: Arc<HashMap<String, mafft::AlignmentMetrics>>,
+    hmmsum_map: Arc<HashMap<String, hmmer::HmmscanSummary>>,
+    taxsum_map: Arc<HashMap<String, Option<TaxonomyEvidence>>>,
+    scores_map: Arc<HashMap<String, (f64, String)>>,
+    comp_map: Arc<HashMap<String, ComponentScores>>,
+    arch_map: Arc<HashMap<String, f64>>,
+    len_map: Arc<HashMap<String, LengthSummary>>,
+    orphan_map: Arc<HashMap<String, hmmer::OrphanAnalysis>>,
+    structvar_map: Arc<HashMap<String, structvar::StructVar>>,
+    cov_delta_thresh: f64,
+    taxonomy_enabled: bool,
+    orphan_analysis_enabled: bool,
+    csv_verbose: bool,
+    classify_no_data: bool,
+    mafft_missing_exon_thresh: usize,
+    mafft_retained_intron_thresh: usize,
+}
+
+pub(crate) struct RenderedRecord {
+    pub(crate) index: usize,
+    pub(crate) json_line: String,
+    pub(crate) csv_line: String,
+}
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -126,6 +159,10 @@ struct AnalyzeArgs {
     mafft_threads_per_job: Option<usize>,
     #[arg(long)]
     mafft_max_jobs: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    mafft_fast: bool,
+    #[arg(long)]
+    render_max_jobs: Option<usize>,
     #[arg(long)]
     reference_fasta: Option<String>,
     #[arg(long, default_value_t = 5)]
@@ -166,6 +203,10 @@ struct AnalyzeArgs {
     pfam_db: Option<String>,
     #[arg(long, default_value_t = true)]
     classify_no_data: bool,
+    #[arg(long, default_value_t = false)]
+    export_high: bool,
+    #[arg(long)]
+    export_high_path: Option<String>,
     #[arg(long, default_value_t = false)]
     csv_verbose: bool,
     #[arg(long)]
@@ -262,6 +303,8 @@ struct FileConfig {
     alignment_retained_intron: Option<usize>,
     mafft_threads_per_job: Option<usize>,
     mafft_max_jobs: Option<usize>,
+    mafft_fast: Option<bool>,
+    render_max_jobs: Option<usize>,
     batch_size: Option<usize>,
     taxonomy: Option<TaxonomyConfigOverride>,
     taxonomy_cache: Option<String>,
@@ -274,6 +317,8 @@ struct FileConfig {
     diamond: Option<DiamondConfigOverride>,
     consensus: Option<ConsensusConfigOverride>,
     structvar: Option<StructVarConfigOverride>,
+    export_high: Option<bool>,
+    export_high_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -481,7 +526,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Intrinsic metrics per gene
             let t_intrinsic = step_start("intrinsic", log_json);
-            let intrinsic_map = compute_intrinsic_for_ids(&cfg.fasta, &metrics)?;
+            let intrinsic_map = Arc::new(compute_intrinsic_for_ids(&cfg.fasta, &metrics)?);
             let intrinsic_secs = step_finish("intrinsic", t_intrinsic, log_json);
 
             // Build consensus panels per gene from DIAMOND hits
@@ -520,6 +565,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if let Some(v) = cfg_override.len_ratio_tolerance {
                     cons_cfg.len_ratio_tolerance = v;
+                }
+            }
+            // Optional cluster backfill: try default clusters file
+            let cl_path = Path::new("clusters.recluster");
+            if cl_path.exists() {
+                match clusters::load_cluster_map(cl_path.to_str().unwrap()) {
+                    Ok(map) => {
+                        cons_cfg.clusters = Some(std::sync::Arc::new(map));
+                        log::info!(
+                            "consensus: loaded cluster map from {}",
+                            cl_path.display()
+                        );
+                    }
+                    Err(e) => log::warn!("consensus: failed to load cluster map: {}", e),
                 }
             }
             let mut panel_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -563,11 +622,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !panel_stats_rows.is_empty() {
                 let panel_dbg = Path::new(&cfg.out).join("panel_debug.csv");
                 let mut f = File::create(panel_dbg)?;
-                writeln!(f, "gene_id,total_hits,phase,selected,filtered_hits,len_ratio_window_min,len_ratio_window_max,median_len_ratio,len_ratio_min,len_ratio_max,median_pident,high_identity_dropped")?;
+                writeln!(f, "gene_id,total_hits,phase,selected,filtered_hits,len_ratio_window_min,len_ratio_window_max,median_len_ratio,len_ratio_min,len_ratio_max,median_pident,high_identity_dropped,backfill_from_clusters")?;
                 for (gid, st) in panel_stats_rows {
                     writeln!(
                         f,
-                        "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
+                        "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}",
                         gid,
                         st.total_hits,
                         st.phase,
@@ -580,6 +639,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         st.len_ratio_max,
                         st.median_pident,
                         st.high_identity_dropped,
+                        st.backfill_from_clusters,
                     )?;
                 }
             }
@@ -658,17 +718,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let mafft_threads_per_job = args
                     .mafft_threads_per_job
-                    .or_else(|| file_cfg.mafft_threads_per_job)
+                    .or(file_cfg.mafft_threads_per_job)
                     .unwrap_or(default_per_job)
                     .clamp(1, total_threads);
                 let default_workers = (total_threads / mafft_threads_per_job).max(1);
                 let requested_workers = args
                     .mafft_max_jobs
-                    .or_else(|| file_cfg.mafft_max_jobs)
+                    .or(file_cfg.mafft_max_jobs)
                     .unwrap_or(default_workers)
                     .max(1);
                 let mafft_workers = requested_workers.min(default_workers).max(1);
                 std::env::set_var("MAFFT_THREADS", mafft_threads_per_job.to_string());
+                let mafft_fast = if args.mafft_fast {
+                    true
+                } else {
+                    file_cfg.mafft_fast.unwrap_or(false)
+                };
+                if mafft_fast {
+                    std::env::set_var("MAFFT_FAST", "1");
+                } else {
+                    std::env::remove_var("MAFFT_FAST");
+                }
 
                 let all_ids: Vec<String> = panel_map.values().flat_map(|v| v.clone()).collect();
                 let ref_seqs = load_sequences_by_ids(ref_fasta, &all_ids).unwrap_or_default();
@@ -703,6 +773,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let _ = step_finish("mafft", t_mafft, log_json);
             }
+
+            let alignment_map = Arc::new(alignment_map);
 
             // Optional: dump matches for inspection
             if let Some(ref_fasta) = cfg.reference_fasta.as_ref() {
@@ -882,13 +954,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = step_finish("hmmer", t_hmmer, log_json);
             }
 
+            let hmmsum_map = Arc::new(hmmsum_map);
+            let domains_arch_map = Arc::new(domains_arch_map);
+            let len_map = Arc::new(len_map);
+            let orphan_map = Arc::new(orphan_map);
+            let structvar_map = Arc::new(structvar_map);
+
             // Emit outputs
             let t_emit = step_start("emit_outputs", log_json);
             let qlen_map: HashMap<String, usize> = metrics
                 .iter()
                 .map(|m| (m.gene_id.clone(), m.length))
                 .collect();
-            let stats = parse_tsv_stats(&diamond_tsv, Some(&qlen_map)).unwrap_or_default();
+            let stats =
+                Arc::new(parse_tsv_stats(&diamond_tsv, Some(&qlen_map)).unwrap_or_default());
             let checksums = collect_checksums(&cfg)?;
             let snapshot = build_config_snapshot(&cfg, &args, &file_cfg);
             write_run_manifest(&cfg, &tools, &checksums, &snapshot)?;
@@ -984,43 +1063,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            let taxsum_map = Arc::new(taxsum_map);
+
             let t_scoring = step_start("scoring", log_json);
             let scores_map = build_scores_map(
                 &metrics,
-                &stats,
-                &intrinsic_map,
+                stats.as_ref(),
+                intrinsic_map.as_ref(),
                 &file_cfg.scoring,
                 args.enable_taxonomy,
-                Some(&domains_arch_map),
-                Some(&len_map),
+                Some(domains_arch_map.as_ref()),
+                Some(len_map.as_ref()),
                 if orphan_analysis_enabled {
-                    Some(&orphan_map)
+                    Some(orphan_map.as_ref())
                 } else {
                     None
                 },
                 if args.enable_taxonomy {
-                    Some(&taxsum_map)
+                    Some(taxsum_map.as_ref())
                 } else {
                     None
                 },
             );
+            let export_high_enabled = if args.export_high {
+                true
+            } else {
+                file_cfg.export_high.unwrap_or(false)
+            };
+            let export_high_path = args
+                .export_high_path
+                .clone()
+                .or_else(|| file_cfg.export_high_path.clone());
             let comp_map = build_component_scores(
                 &metrics,
-                &stats,
-                &intrinsic_map,
+                stats.as_ref(),
+                intrinsic_map.as_ref(),
                 args.enable_taxonomy,
                 if orphan_analysis_enabled {
-                    Some(&orphan_map)
+                    Some(orphan_map.as_ref())
                 } else {
                     None
                 },
                 if args.enable_taxonomy {
-                    Some(&taxsum_map)
+                    Some(taxsum_map.as_ref())
                 } else {
                     None
                 },
             );
             let _ = step_finish("scoring", t_scoring, log_json);
+            if export_high_enabled {
+                if let Some((path, count)) = export_high_sequences(
+                    &cfg.out,
+                    export_high_path.as_deref(),
+                    &metrics,
+                    intrinsic_map.as_ref(),
+                    &scores_map,
+                )? {
+                    log::info!(
+                        "exported {} high-scoring genes to {}",
+                        count,
+                        path.display()
+                    );
+                } else {
+                    log::info!("no high-scoring genes to export");
+                }
+            }
+            let scores_map = Arc::new(scores_map);
+            let comp_map = Arc::new(comp_map);
             let mafft_missing_exon_threshold = args
                 .alignment_missing_exon
                 .or(file_cfg.alignment_missing_exon)
@@ -1029,52 +1138,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .alignment_retained_intron
                 .or(file_cfg.alignment_retained_intron)
                 .unwrap_or(30);
-            write_jsonl_metrics(
-                &cfg.out,
-                &metrics,
-                &stats,
-                &intrinsic_map,
-                &alignment_map,
-                &hmmsum_map,
-                args.coverage_delta_threshold,
-                &file_cfg.scoring,
-                args.enable_taxonomy,
-                &taxsum_map,
-                Some(&domains_arch_map),
-                Some(&len_map),
-                if orphan_analysis_enabled {
-                    Some(&orphan_map)
-                } else {
-                    None
-                },
-                Some(&structvar_map),
-                mafft_missing_exon_threshold,
-                mafft_retained_intron_threshold,
-            )?;
-            write_csv_metrics(
-                &cfg.out,
-                &metrics,
-                &stats,
-                args.coverage_delta_threshold,
-                &scores_map,
-                &alignment_map,
-                args.enable_taxonomy,
-                &taxsum_map,
-                &hmmsum_map,
-                args.csv_verbose,
-                Some(&comp_map),
-                args.classify_no_data,
-                Some(&domains_arch_map),
-                Some(&len_map),
-                if orphan_analysis_enabled {
-                    Some(&orphan_map)
-                } else {
-                    None
-                },
-                Some(&structvar_map),
-                mafft_missing_exon_threshold,
-                mafft_retained_intron_threshold,
-            )?;
+            let render_ctx = Arc::new(RenderContext {
+                stats: Arc::clone(&stats),
+                intrinsic_map: Arc::clone(&intrinsic_map),
+                alignment_map: Arc::clone(&alignment_map),
+                hmmsum_map: Arc::clone(&hmmsum_map),
+                taxsum_map: Arc::clone(&taxsum_map),
+                scores_map: Arc::clone(&scores_map),
+                comp_map: Arc::clone(&comp_map),
+                arch_map: Arc::clone(&domains_arch_map),
+                len_map: Arc::clone(&len_map),
+                orphan_map: Arc::clone(&orphan_map),
+                structvar_map: Arc::clone(&structvar_map),
+                cov_delta_thresh: args.coverage_delta_threshold,
+                taxonomy_enabled: args.enable_taxonomy,
+                orphan_analysis_enabled,
+                csv_verbose: args.csv_verbose,
+                classify_no_data: args.classify_no_data,
+                mafft_missing_exon_thresh: mafft_missing_exon_threshold,
+                mafft_retained_intron_thresh: mafft_retained_intron_threshold,
+            });
+            let render_max_jobs = args
+                .render_max_jobs
+                .or(file_cfg.render_max_jobs)
+                .unwrap_or(cfg.threads.max(1))
+                .max(1);
+            run_render_pipeline(&cfg.out, &metrics, render_ctx, render_max_jobs)?;
             // Emit domains architecture diagnostics CSV
             if !domains_arch_dbg.is_empty() {
                 let dbg_path = std::path::Path::new(&cfg.out).join("domains_arch_debug.csv");
@@ -1299,639 +1388,6 @@ fn write_run_manifest(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_jsonl_metrics(
-    out_dir: &str,
-    metrics: &[ecs::GeneMetrics],
-    stats: &std::collections::HashMap<String, diamond::DiamondHitStats>,
-    intrinsic_map: &std::collections::HashMap<String, (metrics::IntrinsicMetrics, Vec<u8>)>,
-    alignment_map: &std::collections::HashMap<String, mafft::AlignmentMetrics>,
-    hmmsum_map: &std::collections::HashMap<String, hmmer::HmmscanSummary>,
-    cov_delta_thresh: f64,
-    scoring: &Option<ScoringConfigOverride>,
-    taxonomy_enabled: bool,
-    taxsum_map: &HashMap<String, Option<TaxonomyEvidence>>,
-    arch_map: Option<&HashMap<String, f64>>,
-    len_map: Option<&HashMap<String, LengthSummary>>,
-    orphan_map: Option<&HashMap<String, hmmer::OrphanAnalysis>>,
-    sv_map: Option<&HashMap<String, structvar::StructVar>>,
-    mafft_missing_exon_thresh: usize,
-    mafft_retained_intron_thresh: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let path = Path::new(out_dir).join("qc_report.jsonl");
-    let mut f = File::create(path)?;
-    for m in metrics {
-        let warnings: Vec<String> = if m.hits == 0 {
-            vec!["No DIAMOND hits".to_string()]
-        } else {
-            Vec::new()
-        };
-        let summary = stats.get(&m.gene_id);
-        let intrinsic = intrinsic_map
-            .get(&m.gene_id)
-            .map(|t| t.0.clone())
-            .unwrap_or_default();
-        let aln = alignment_map.get(&m.gene_id);
-        let homology_score = compute_homology_score(summary);
-        let intrinsic_score = compute_intrinsic_score(&intrinsic);
-        let taxonomy_evidence = taxsum_map.get(&m.gene_id).and_then(|x| x.as_ref());
-        let taxonomy_score = if taxonomy_enabled {
-            Some(compute_taxonomy_score(taxonomy_evidence))
-        } else {
-            None
-        };
-        let weights = scoring_weights(scoring);
-        let domains_arch_score = arch_map
-            .and_then(|am| am.get(&m.gene_id).cloned())
-            .unwrap_or(0.0);
-        let length_score = len_map
-            .and_then(|lm| lm.get(&m.gene_id).map(|t| t.0))
-            .unwrap_or(0.0);
-        let orphan_score = orphan_map
-            .and_then(|om| om.get(&m.gene_id))
-            .map(|o| o.score)
-            .unwrap_or(1.0);
-        let denom = weights.sum().max(1e-6);
-        let final_score = (weights.homology * homology_score
-            + weights.intrinsic * intrinsic_score
-            + weights.taxonomy * taxonomy_score.unwrap_or(0.0)
-            + weights.domains * domains_arch_score
-            + weights.length * length_score
-            + weights.orphan * orphan_score)
-            / denom;
-        let fusion_split_flag = summary
-            .map(|s| s.coverage_delta > cov_delta_thresh)
-            .unwrap_or(false);
-        let taxonomy = if taxonomy_enabled {
-            if let Some(Some(ev)) = taxsum_map.get(&m.gene_id) {
-                let mut obj = serde_json::Map::new();
-                obj.insert("status".into(), serde_json::Value::String("enabled".into()));
-                obj.insert(
-                    "detail".into(),
-                    serde_json::Value::String(ev.detail.to_string()),
-                );
-                obj.insert(
-                    "congruence_score".into(),
-                    serde_json::json!(ev.congruence_score),
-                );
-                obj.insert(
-                    "contamination_score".into(),
-                    serde_json::json!(ev.contamination_score),
-                );
-                obj.insert(
-                    "support_fraction".into(),
-                    serde_json::json!(ev.support_fraction),
-                );
-                obj.insert(
-                    "support_hits".into(),
-                    serde_json::Value::Number(serde_json::Number::from(ev.support as u64)),
-                );
-                obj.insert(
-                    "considered_hits".into(),
-                    serde_json::Value::Number(serde_json::Number::from(ev.considered as u64)),
-                );
-                obj.insert(
-                    "consensus_depth".into(),
-                    serde_json::Value::Number(serde_json::Number::from(ev.consensus_depth as u64)),
-                );
-                if let Some(rank) = &ev.consensus_rank {
-                    obj.insert(
-                        "consensus_rank".into(),
-                        serde_json::Value::String(rank.clone()),
-                    );
-                }
-                if let Some(top) = &ev.top_hit {
-                    obj.insert(
-                        "taxid".into(),
-                        serde_json::Value::Number(serde_json::Number::from(top.taxid)),
-                    );
-                    if let Some(name) = &top.name {
-                        obj.insert("name".into(), serde_json::Value::String(name.clone()));
-                    }
-                    obj.insert("lineage".into(), serde_json::json!(top.lineage));
-                    obj.insert(
-                        "top_hit".into(),
-                        serde_json::json!({
-                            "taxid": top.taxid,
-                            "name": top.name,
-                            "lineage": top.lineage,
-                        }),
-                    );
-                }
-                if let Some(consensus) = &ev.consensus {
-                    obj.insert(
-                        "consensus_taxid".into(),
-                        serde_json::Value::Number(serde_json::Number::from(consensus.taxid)),
-                    );
-                    if let Some(name) = &consensus.name {
-                        obj.insert(
-                            "consensus_name".into(),
-                            serde_json::Value::String(name.clone()),
-                        );
-                    }
-                    obj.insert(
-                        "consensus_lineage".into(),
-                        serde_json::json!(consensus.lineage.clone()),
-                    );
-                }
-                serde_json::Value::Object(obj)
-            } else {
-                serde_json::json!({"status":"enabled","detail":"NoResolver"})
-            }
-        } else {
-            serde_json::json!({"status":"disabled"})
-        };
-        let cur_gene = &m.gene_id;
-        // Build alignment/struct-var warnings
-        let mut warn_extra: Vec<String> = Vec::new();
-        if let Some(a) = aln {
-            if a.missing_exon_run >= mafft_missing_exon_thresh {
-                warn_extra.push("MissingExonPossible".into());
-            }
-            if a.retained_intron_run >= mafft_retained_intron_thresh {
-                warn_extra.push("RetainedIntronPossible".into());
-            }
-        }
-        let sv_obj = sv_map.and_then(|mm| mm.get(cur_gene));
-        if let Some(sv) = sv_obj {
-            match sv.classification.as_str() {
-                "FusionPossible" => warn_extra.push("FusionPossible".into()),
-                "SplitPossible" => warn_extra.push("SplitPossible".into()),
-                "InternalDuplicationPossible" => {
-                    warn_extra.push("InternalDuplicationPossible".into())
-                }
-                _ => {}
-            }
-            for w in &sv.warnings {
-                warn_extra.push(w.clone());
-            }
-        }
-        let domains = hmmsum_map.get(cur_gene).map(|d| {
-            let score = if let Some(ev) = d.top_evalue {
-                let le = if ev > 0.0 { -ev.log10() } else { 100.0 };
-                (le / 20.0).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let arch_score = arch_map
-                .and_then(|am| am.get(cur_gene))
-                .cloned()
-                .unwrap_or(0.0);
-            serde_json::json!({
-                "hits_count": d.hits_count,
-                "top_accession": d.top_accession,
-                "top_evalue": d.top_evalue,
-                "domains_score": score,
-                "domains_arch_score": arch_score,
-                "hits": d.hits.iter().map(|h| serde_json::json!({
-                    "target_name": h.target_name,
-                    "accession": h.accession,
-                    "evalue": h.evalue,
-                    "score": h.score,
-                    "bias": h.bias
-                })).collect::<Vec<_>>()
-            })
-        });
-        let length_block = len_map
-            .and_then(|lm| lm.get(&m.gene_id))
-            .map(|(s, z, r, c)| {
-                serde_json::json!({
-                    "length_score": s,
-                    "length_z": z,
-                    "length_ratio": r,
-                    "length_class": c,
-                })
-            });
-        let orphan_entry = orphan_map.and_then(|om| om.get(cur_gene));
-        let record = serde_json::json!({
-                "gene_id": m.gene_id,
-                "taxonomy": taxonomy,
-                "score_components": {"taxonomy": taxonomy_score, "homology": homology_score, "intrinsic": intrinsic_score, "domains": domains_arch_score, "length": length_score, "orphan": orphan_score},
-                "final_score": final_score,
-                "homology": {
-                "hits_count": m.hits,
-                "top_hit": summary.and_then(|s| s.top_sseqid.clone()),
-                "top_bitscore": summary.map(|s| s.top_bitscore),
-                "top_evalue": summary.as_ref().map(|s| s.top_evalue.clone()),
-                "top_qcov": summary.map(|s| s.top_qcov),
-                "top_scov": summary.map(|s| s.top_scov),
-                "bitscore_density": summary.map(|s| if s.top_len>0 { s.top_bitscore / s.top_len as f64 } else { 0.0 }),
-                "coverage_delta": summary.map(|s| s.coverage_delta),
-                "coverage_ratio": summary.map(|s| s.coverage_ratio),
-                "fusion_split_flag": fusion_split_flag,
-            },
-            "intrinsic": {
-                "ambiguous_fraction": intrinsic.ambiguous_fraction,
-                "max_homopolymer": intrinsic.max_homopolymer,
-                "low_complexity_fraction": intrinsic.low_complexity_fraction,
-                "low_complexity_windows": intrinsic.low_complexity_windows,
-                "orf_start_score": intrinsic.orf_start_score,
-            },
-            "alignment": aln.as_ref().map(|a| serde_json::json!({
-                "mafft_enabled": a.mafft_enabled,
-                "strategy_used": a.strategy_used,
-                "conserved_fraction": a.conserved_fraction,
-                "pairwise_identity": a.pairwise_identity,
-                "sequences_aligned": a.sequences_aligned,
-                "query_gap_fraction": a.query_gap_fraction,
-                "gap_run_count": a.gap_run_count,
-                "max_gap_run": a.max_gap_run,
-                "motif_mismatch_fraction": a.motif_mismatch_fraction,
-                "start_concordance": a.start_concordance,
-                "start_class": a.start_class,
-                "missing_exon_run": a.missing_exon_run,
-                "retained_intron_run": a.retained_intron_run,
-            })),
-            "domains": domains,
-            "length": length_block,
-            "orphan_analysis": orphan_entry.map(|oa| serde_json::json!({
-                "status": oa.status.as_str(),
-                "score": oa.score,
-                "details": oa.details.iter().map(|d| serde_json::json!({
-                    "accession": d.accession,
-                    "domain_index": d.domain_index,
-                    "total_domains": d.total_domains,
-                    "completeness": d.completeness,
-                    "hmm_from": d.hmm_from,
-                    "hmm_to": d.hmm_to,
-                    "hmm_len": d.hmm_len,
-                })).collect::<Vec<_>>()
-            })),
-            "structvar": sv_obj.map(|sv| serde_json::json!({
-                "classification": sv.classification,
-                "fusion_possible": sv.fusion_possible,
-                "split_possible": sv.split_possible,
-                "duplication_possible": sv.duplication_possible,
-                "spans": sv.spans,
-                "fusion_subjects": sv.fusion_subjects,
-                "fusion_gap": sv.fusion_gap,
-                "fusion_left_len": sv.fusion_left_len,
-                "fusion_right_len": sv.fusion_right_len,
-                "fusion_cover_fracs": sv.fusion_cover_fracs,
-                "subjects": sv.subjects,
-                "subject_warnings": sv.warnings,
-            })),
-            "warnings": if warn_extra.is_empty() { warnings } else { warn_extra },
-        });
-        writeln!(f, "{}", serde_json::to_string(&record)?)?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
-fn write_csv_metrics(
-    out_dir: &str,
-    metrics: &[ecs::GeneMetrics],
-    stats: &std::collections::HashMap<String, diamond::DiamondHitStats>,
-    cov_delta_thresh: f64,
-    scores: &HashMap<String, (f64, String)>,
-    alignment_map: &std::collections::HashMap<String, mafft::AlignmentMetrics>,
-    taxonomy_enabled: bool,
-    taxsum_map: &HashMap<String, Option<TaxonomyEvidence>>,
-    hmmsum_map: &std::collections::HashMap<String, hmmer::HmmscanSummary>,
-    csv_verbose: bool,
-    comp_map: Option<&HashMap<String, ComponentScores>>,
-    classify_no_data: bool,
-    arch_map: Option<&HashMap<String, f64>>,
-    len_map: Option<&HashMap<String, LengthSummary>>,
-    orphan_map: Option<&HashMap<String, hmmer::OrphanAnalysis>>,
-    sv_map: Option<&HashMap<String, structvar::StructVar>>,
-    mafft_missing_exon_thresh: usize,
-    mafft_retained_intron_thresh: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let path = Path::new(out_dir).join("qc_summary.csv");
-    let mut f = File::create(path)?;
-    if csv_verbose {
-        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,homology_score,intrinsic_score,taxonomy_score,domains_score,domains_arch_score,orphan_domain_score,length_score,length_ratio,length_class,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,missing_exon_run,retained_intron_run,start_concordance,start_class,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_contamination,taxonomy_support,taxonomy_considered,consensus_taxon,taxonomy_status,warnings")?;
-    } else {
-        writeln!(f, "gene_id,hits_count,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,orphan_domain_score,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_score,taxonomy_contamination,taxonomy_support,taxonomy_considered,consensus_taxon,taxonomy_status,warnings")?;
-    }
-    for m in metrics {
-        let mut warning_msgs: Vec<String> = Vec::new();
-        if m.hits == 0 {
-            warning_msgs.push("No DIAMOND hits".into());
-        }
-        let s = stats.get(&m.gene_id);
-        let (top_hit, top_bitscore, top_evalue, top_qcov, top_scov, bsd) = if let Some(s) = s {
-            let bsd = if s.top_len > 0 {
-                s.top_bitscore / s.top_len as f64
-            } else {
-                0.0
-            };
-            (
-                s.top_sseqid.clone().unwrap_or_default(),
-                s.top_bitscore,
-                s.top_evalue.clone(),
-                s.top_qcov,
-                s.top_scov,
-                bsd,
-            )
-        } else {
-            (String::new(), 0.0, String::new(), 0.0, 0.0, 0.0)
-        };
-        let cov_delta = s.map(|x| x.coverage_delta).unwrap_or(0.0);
-        let cov_ratio = s.map(|x| x.coverage_ratio).unwrap_or(0.0);
-        let fusion = if cov_delta > cov_delta_thresh { 1 } else { 0 };
-        let (final_score, mut classif) = scores
-            .get(&m.gene_id)
-            .cloned()
-            .unwrap_or((0.0, String::new()));
-        let aln = alignment_map.get(&m.gene_id);
-        let (
-            mafft_enabled,
-            conserved,
-            pid,
-            seqs_aln,
-            qgap,
-            gap_runs,
-            max_gap,
-            start_conc,
-            start_class,
-            missing_run,
-            intron_run,
-        ) = if let Some(a) = aln {
-            (
-                a.mafft_enabled as i32,
-                a.conserved_fraction,
-                a.pairwise_identity,
-                a.sequences_aligned,
-                a.query_gap_fraction,
-                a.gap_run_count,
-                a.max_gap_run,
-                a.start_concordance,
-                a.start_class.clone(),
-                a.missing_exon_run,
-                a.retained_intron_run,
-            )
-        } else {
-            (0, 0.0, 0.0, 0, 0.0, 0, 0, 0.0, String::new(), 0, 0)
-        };
-        if mafft_enabled == 1 {
-            if missing_run >= mafft_missing_exon_thresh {
-                warning_msgs.push("MissingExonPossible".into());
-            }
-            if intron_run >= mafft_retained_intron_thresh {
-                warning_msgs.push("RetainedIntronPossible".into());
-            }
-        }
-        let (
-            structvar_class,
-            structvar_gap,
-            structvar_left_len,
-            structvar_right_len,
-            structvar_cov_left,
-            structvar_cov_right,
-        ) = if let Some(sv) = sv_map.and_then(|sm| sm.get(&m.gene_id)) {
-            match sv.classification.as_str() {
-                "FusionPossible" => warning_msgs.push("FusionPossible".into()),
-                "SplitPossible" => warning_msgs.push("SplitPossible".into()),
-                "InternalDuplicationPossible" => {
-                    warning_msgs.push("InternalDuplicationPossible".into())
-                }
-                _ => {}
-            }
-            for w in &sv.warnings {
-                warning_msgs.push(w.clone());
-            }
-            (
-                sv.classification.clone(),
-                sv.fusion_gap.map(|v| v.to_string()).unwrap_or_default(),
-                sv.fusion_left_len
-                    .map(|v| v.to_string())
-                    .unwrap_or_default(),
-                sv.fusion_right_len
-                    .map(|v| v.to_string())
-                    .unwrap_or_default(),
-                sv.fusion_cover_fracs
-                    .map(|t| format!("{:.3}", t.0))
-                    .unwrap_or_default(),
-                sv.fusion_cover_fracs
-                    .map(|t| format!("{:.3}", t.1))
-                    .unwrap_or_default(),
-            )
-        } else {
-            (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            )
-        };
-        let (
-            taxonomy_score_value,
-            taxonomy_contamination_field,
-            taxonomy_support_field,
-            taxonomy_considered_field,
-            taxonomy_status_str,
-            consensus_label,
-        ) = if taxonomy_enabled {
-            if let Some(Some(ev)) = taxsum_map.get(&m.gene_id) {
-                let consensus_label = ev
-                    .consensus
-                    .as_ref()
-                    .map(|c| {
-                        if let Some(name) = &c.name {
-                            format!("{} ({})", name, c.taxid)
-                        } else {
-                            c.taxid.to_string()
-                        }
-                    })
-                    .unwrap_or_default();
-                (
-                    compute_taxonomy_score(Some(ev)),
-                    format!("{:.4}", ev.contamination_score),
-                    ev.support.to_string(),
-                    ev.considered.to_string(),
-                    ev.detail.to_string(),
-                    consensus_label,
-                )
-            } else {
-                (
-                    0.0,
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    "NoResolver".to_string(),
-                    String::new(),
-                )
-            }
-        } else {
-            (
-                0.0,
-                String::new(),
-                String::new(),
-                String::new(),
-                "disabled".to_string(),
-                String::new(),
-            )
-        };
-        let domains_score_field = if let Some(d) = hmmsum_map.get(&m.gene_id) {
-            let s = if let Some(ev) = d.top_evalue {
-                let le = if ev > 0.0 { -ev.log10() } else { 100.0 };
-                (le / 20.0).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            format!("{:.4}", s)
-        } else {
-            String::new()
-        };
-        let domains_arch_field = arch_map
-            .and_then(|am| am.get(&m.gene_id))
-            .map(|v| format!("{:.4}", v))
-            .unwrap_or_default();
-        let (orphan_status_str, orphan_score_field) = if let Some(map) = orphan_map {
-            if let Some(oa) = map.get(&m.gene_id) {
-                (oa.status.as_str().to_string(), format!("{:.4}", oa.score))
-            } else {
-                (String::new(), String::new())
-            }
-        } else {
-            (String::new(), String::new())
-        };
-        // Optional NoData classification override
-        if classify_no_data && m.hits == 0 {
-            let nonzero_domains = hmmsum_map
-                .get(&m.gene_id)
-                .map(|d| d.hits_count > 0)
-                .unwrap_or(false);
-            if !nonzero_domains {
-                classif = "NoData".to_string();
-            }
-        }
-        let warnings_field = if warning_msgs.is_empty() {
-            String::new()
-        } else {
-            warning_msgs.join(";")
-        };
-        if csv_verbose {
-            let (hs, is, ts_opt, orphan_component) = comp_map
-                .and_then(|cm| cm.get(&m.gene_id))
-                .map(|c| (c.homology, c.intrinsic, c.taxonomy, c.orphan))
-                .unwrap_or((0.0, 0.0, None, 1.0));
-            let ts_str = if taxonomy_enabled {
-                format!("{:.4}", ts_opt.unwrap_or(0.0))
-            } else {
-                String::new()
-            };
-            let (len_s, _len_z, len_r, len_c) = len_map
-                .and_then(|lm| lm.get(&m.gene_id))
-                .cloned()
-                .unwrap_or((0.0, 0.0, 0.0, String::new()));
-            let len_ratio_str = if len_r > 0.0 {
-                format!("{:.3}", len_r)
-            } else {
-                String::new()
-            };
-            let orphan_component_str = if orphan_map.is_some() {
-                if orphan_score_field.is_empty() {
-                    format!("{:.4}", orphan_component)
-                } else {
-                    orphan_score_field.clone()
-                }
-            } else {
-                String::new()
-            };
-            let row = vec![
-                m.gene_id.clone(),
-                m.hits.to_string(),
-                top_hit.clone(),
-                format!("{:.3}", top_bitscore),
-                top_evalue.clone(),
-                format!("{:.3}", top_qcov),
-                format!("{:.3}", top_scov),
-                format!("{:.3}", bsd),
-                format!("{:.3}", cov_delta),
-                format!("{:.3}", cov_ratio),
-                fusion.to_string(),
-                format!("{:.3}", final_score),
-                classif.clone(),
-                format!("{:.4}", hs),
-                format!("{:.4}", is),
-                ts_str,
-                domains_score_field.clone(),
-                domains_arch_field.clone(),
-                orphan_component_str,
-                format!("{:.4}", len_s),
-                len_ratio_str,
-                len_c,
-                mafft_enabled.to_string(),
-                format!("{:.3}", conserved),
-                format!("{:.3}", pid),
-                seqs_aln.to_string(),
-                format!("{:.3}", qgap),
-                gap_runs.to_string(),
-                max_gap.to_string(),
-                missing_run.to_string(),
-                intron_run.to_string(),
-                format!("{:.3}", start_conc),
-                start_class,
-                structvar_class.clone(),
-                structvar_gap.clone(),
-                structvar_left_len.clone(),
-                structvar_right_len.clone(),
-                structvar_cov_left.clone(),
-                structvar_cov_right.clone(),
-                orphan_status_str.clone(),
-                taxonomy_contamination_field.clone(),
-                taxonomy_support_field.clone(),
-                taxonomy_considered_field.clone(),
-                consensus_label.clone(),
-                taxonomy_status_str.clone(),
-                warnings_field.clone(),
-            ]
-            .join(",");
-            writeln!(f, "{}", row)?;
-            continue;
-        }
-        let row = vec![
-            m.gene_id.clone(),
-            m.hits.to_string(),
-            top_hit,
-            format!("{:.3}", top_bitscore),
-            top_evalue,
-            format!("{:.3}", top_qcov),
-            format!("{:.3}", top_scov),
-            format!("{:.3}", bsd),
-            format!("{:.3}", cov_delta),
-            format!("{:.3}", cov_ratio),
-            fusion.to_string(),
-            format!("{:.3}", final_score),
-            classif,
-            mafft_enabled.to_string(),
-            format!("{:.3}", conserved),
-            format!("{:.3}", pid),
-            seqs_aln.to_string(),
-            format!("{:.3}", qgap),
-            gap_runs.to_string(),
-            max_gap.to_string(),
-            domains_score_field,
-            domains_arch_field,
-            orphan_score_field,
-            structvar_class,
-            structvar_gap,
-            structvar_left_len,
-            structvar_right_len,
-            structvar_cov_left,
-            structvar_cov_right,
-            orphan_status_str,
-            format!("{:.4}", taxonomy_score_value),
-            taxonomy_contamination_field,
-            taxonomy_support_field,
-            taxonomy_considered_field,
-            consensus_label,
-            taxonomy_status_str,
-            warnings_field,
-        ]
-        .join(",");
-        writeln!(f, "{}", row)?;
-    }
-    Ok(())
-}
-
 fn prepare_cmd(p: PrepareArgs) -> Result<(), Box<dyn std::error::Error>> {
     let diamond_bin = p.diamond_bin.unwrap_or_else(|| "diamond".to_string());
     // Step 1: ensure FASTA exists
@@ -1952,14 +1408,50 @@ fn prepare_cmd(p: PrepareArgs) -> Result<(), Box<dyn std::error::Error>> {
                 db_out.display()
             );
         }
-        let status = std::process::Command::new(&diamond_bin)
-            .arg("makedb")
+        // Attempt to build an accession->taxid map from UniProt FASTA (uses OX= in headers)
+        let map_path = format!("{}.acc_taxid.tsv", &p.db_out);
+        match taxonomy::write_cache_from_fasta(&p.fasta, &map_path) {
+            Ok(n) => {
+                log::info!("makedb: wrote {} accessions to {}", n, map_path);
+                // Convert to DIAMOND's accepted header/format: "accession.version\ttaxid"
+                let ncbi_map = format!("{}.ncbi.tsv", &p.db_out);
+                if let Ok(text) = std::fs::read_to_string(&map_path) {
+                    use std::io::Write as _;
+                    if let Ok(mut out) = std::fs::File::create(&ncbi_map) {
+                        let _ = writeln!(out, "accession.version\ttaxid");
+                        for line in text.lines() {
+                            let mut it = line.split('\t');
+                            if let (Some(acc), Some(tax)) = (it.next(), it.next()) {
+                                let _ = writeln!(out, "{}\t{}", acc, tax);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => log::warn!("makedb: unable to build taxon map from FASTA: {}", e),
+        }
+        // Try to supply NCBI taxdump if available (downloaded by scripts/fetch_reference_data.sh)
+        let taxdump_dir = std::path::Path::new("share/taxonomy/new_taxdump");
+        let has_taxdump = taxdump_dir.join("nodes.dmp").exists()
+            && taxdump_dir.join("names.dmp").exists();
+
+        let mut cmd = std::process::Command::new(&diamond_bin);
+        cmd.arg("makedb")
             .arg("--in")
             .arg(&p.fasta)
             .arg("--db")
-            .arg(&p.db_out)
-            .status()
-            .map_err(|e| e.to_string())?;
+            .arg(&p.db_out);
+        let ncbi_map = format!("{}.ncbi.tsv", &p.db_out);
+        if std::path::Path::new(&ncbi_map).exists() {
+            cmd.arg("--taxonmap").arg(&ncbi_map);
+        }
+        if has_taxdump {
+            cmd.arg("--taxonnodes")
+                .arg(taxdump_dir.join("nodes.dmp"))
+                .arg("--taxonnames")
+                .arg(taxdump_dir.join("names.dmp"));
+        }
+        let status = cmd.status().map_err(|e| e.to_string())?;
         if !status.success() {
             return Err(format!("diamond makedb failed with status {}", status));
         }
@@ -2071,7 +1563,7 @@ fn scoring_weights(scoring: &Option<ScoringConfigOverride>) -> WeightSet {
 }
 
 #[derive(Clone, Debug, Default)]
-struct ComponentScores {
+pub(crate) struct ComponentScores {
     homology: f64,
     intrinsic: f64,
     taxonomy: Option<f64>,
@@ -2232,6 +1724,650 @@ fn build_component_scores(
         );
     }
     out
+}
+
+fn export_high_sequences(
+    out_dir: &str,
+    override_path: Option<&str>,
+    metrics: &[GeneMetrics],
+    intrinsic: &HashMap<String, (metrics::IntrinsicMetrics, Vec<u8>)>,
+    scores_map: &HashMap<String, (f64, String)>,
+) -> Result<Option<(PathBuf, usize)>, Box<dyn std::error::Error>> {
+    let target_path = override_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(out_dir).join("high_scoring.faa"));
+    let mut writer: Option<BufWriter<File>> = None;
+    let mut count = 0usize;
+    for m in metrics {
+        let Some((_, classif)) = scores_map.get(&m.gene_id) else {
+            continue;
+        };
+        if classif != "High" {
+            continue;
+        }
+        let Some((_im, seq)) = intrinsic.get(&m.gene_id) else {
+            continue;
+        };
+        if writer.is_none() {
+            if let Some(parent) = target_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            writer = Some(BufWriter::new(File::create(&target_path)?));
+        }
+        if let Some(buf) = writer.as_mut() {
+            write_fasta_record(buf, &m.gene_id, seq)?;
+            count += 1;
+        }
+    }
+    if let Some(mut buf) = writer {
+        buf.flush()?;
+        if count == 0 {
+            drop(buf);
+            fs::remove_file(&target_path).ok();
+            Ok(None)
+        } else {
+            Ok(Some((target_path, count)))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+fn write_fasta_record<W: Write>(writer: &mut W, gene_id: &str, seq: &[u8]) -> std::io::Result<()> {
+    writer.write_all(b">")?;
+    writer.write_all(gene_id.as_bytes())?;
+    writer.write_all(b"\n")?;
+    for chunk in seq.chunks(60) {
+        writer.write_all(chunk)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn render_gene_record(
+    index: usize,
+    m: &ecs::GeneMetrics,
+    ctx: &RenderContext,
+) -> Result<RenderedRecord, String> {
+    let summary = ctx.stats.get(&m.gene_id);
+    let intrinsic = ctx
+        .intrinsic_map
+        .get(&m.gene_id)
+        .map(|t| t.0.clone())
+        .unwrap_or_default();
+    let aln = ctx.alignment_map.get(&m.gene_id);
+    let hmmsum = ctx.hmmsum_map.get(&m.gene_id);
+    let taxonomy_entry = ctx.taxsum_map.get(&m.gene_id).and_then(|x| x.as_ref());
+    let comp_entry = ctx.comp_map.get(&m.gene_id);
+    let homology_score = comp_entry
+        .map(|c| c.homology)
+        .unwrap_or_else(|| compute_homology_score(summary));
+    let intrinsic_score = comp_entry
+        .map(|c| c.intrinsic)
+        .unwrap_or_else(|| compute_intrinsic_score(&intrinsic));
+    let taxonomy_score = if ctx.taxonomy_enabled {
+        if let Some(val) = comp_entry.and_then(|c| c.taxonomy) {
+            Some(val)
+        } else {
+            taxonomy_entry.map(|ev| compute_taxonomy_score(Some(ev)))
+        }
+    } else {
+        None
+    };
+    let domains_arch_value = ctx.arch_map.get(&m.gene_id).copied();
+    let domains_arch_score = domains_arch_value.unwrap_or(0.0);
+    let (length_score, _len_z, len_ratio, len_class) = ctx
+        .len_map
+        .get(&m.gene_id)
+        .cloned()
+        .unwrap_or((0.0, 0.0, 0.0, String::new()));
+    let orphan_score = if ctx.orphan_analysis_enabled {
+        comp_entry.map(|c| c.orphan).unwrap_or_else(|| {
+            ctx.orphan_map
+                .get(&m.gene_id)
+                .map(|oa| oa.score)
+                .unwrap_or(1.0)
+        })
+    } else {
+        1.0
+    };
+    let (final_score, mut classif) = ctx
+        .scores_map
+        .get(&m.gene_id)
+        .cloned()
+        .unwrap_or((0.0, "Low".to_string()));
+    let fusion_split_flag = summary
+        .map(|s| s.coverage_delta > ctx.cov_delta_thresh)
+        .unwrap_or(false);
+    let mut base_warnings: Vec<String> = Vec::new();
+    if m.hits == 0 {
+        base_warnings.push("No DIAMOND hits".to_string());
+    }
+    let mut warn_extra: Vec<String> = Vec::new();
+    let mut warning_msgs = base_warnings.clone();
+    if let Some(a) = aln {
+        if a.missing_exon_run >= ctx.mafft_missing_exon_thresh {
+            warn_extra.push("MissingExonPossible".into());
+            warning_msgs.push("MissingExonPossible".into());
+        }
+        if a.retained_intron_run >= ctx.mafft_retained_intron_thresh {
+            warn_extra.push("RetainedIntronPossible".into());
+            warning_msgs.push("RetainedIntronPossible".into());
+        }
+    }
+    let sv_obj = ctx.structvar_map.get(&m.gene_id);
+    if let Some(sv) = sv_obj {
+        match sv.classification.as_str() {
+            "FusionPossible" => {
+                warn_extra.push("FusionPossible".into());
+                warning_msgs.push("FusionPossible".into());
+            }
+            "SplitPossible" => {
+                warn_extra.push("SplitPossible".into());
+                warning_msgs.push("SplitPossible".into());
+            }
+            "InternalDuplicationPossible" => {
+                warn_extra.push("InternalDuplicationPossible".into());
+                warning_msgs.push("InternalDuplicationPossible".into());
+            }
+            _ => {}
+        }
+        for w in &sv.warnings {
+            warn_extra.push(w.clone());
+            warning_msgs.push(w.clone());
+        }
+    }
+    let taxonomy_json = if ctx.taxonomy_enabled {
+        if let Some(Some(ev)) = ctx.taxsum_map.get(&m.gene_id) {
+            let mut obj = serde_json::Map::new();
+            obj.insert("status".into(), serde_json::Value::String("enabled".into()));
+            obj.insert(
+                "detail".into(),
+                serde_json::Value::String(ev.detail.to_string()),
+            );
+            obj.insert(
+                "congruence_score".into(),
+                serde_json::json!(ev.congruence_score),
+            );
+            obj.insert(
+                "contamination_score".into(),
+                serde_json::json!(ev.contamination_score),
+            );
+            obj.insert(
+                "support_fraction".into(),
+                serde_json::json!(ev.support_fraction),
+            );
+            obj.insert(
+                "support_hits".into(),
+                serde_json::Value::Number(serde_json::Number::from(ev.support as u64)),
+            );
+            obj.insert(
+                "considered_hits".into(),
+                serde_json::Value::Number(serde_json::Number::from(ev.considered as u64)),
+            );
+            obj.insert(
+                "consensus_depth".into(),
+                serde_json::Value::Number(serde_json::Number::from(ev.consensus_depth as u64)),
+            );
+            if let Some(rank) = &ev.consensus_rank {
+                obj.insert(
+                    "consensus_rank".into(),
+                    serde_json::Value::String(rank.clone()),
+                );
+            }
+            if let Some(top) = &ev.top_hit {
+                obj.insert(
+                    "taxid".into(),
+                    serde_json::Value::Number(serde_json::Number::from(top.taxid)),
+                );
+                if let Some(name) = &top.name {
+                    obj.insert("name".into(), serde_json::Value::String(name.clone()));
+                }
+                obj.insert("lineage".into(), serde_json::json!(top.lineage));
+                obj.insert(
+                    "top_hit".into(),
+                    serde_json::json!({
+                        "taxid": top.taxid,
+                        "name": top.name,
+                        "lineage": top.lineage,
+                    }),
+                );
+            }
+            if let Some(consensus) = &ev.consensus {
+                obj.insert(
+                    "consensus_taxid".into(),
+                    serde_json::Value::Number(serde_json::Number::from(consensus.taxid)),
+                );
+                if let Some(name) = &consensus.name {
+                    obj.insert(
+                        "consensus_name".into(),
+                        serde_json::Value::String(name.clone()),
+                    );
+                }
+                obj.insert(
+                    "consensus_lineage".into(),
+                    serde_json::json!(consensus.lineage.clone()),
+                );
+            }
+            serde_json::Value::Object(obj)
+        } else {
+            serde_json::json!({"status":"enabled","detail":"NoResolver"})
+        }
+    } else {
+        serde_json::json!({"status":"disabled"})
+    };
+    let domains = hmmsum.map(|d| {
+        let score = if let Some(ev) = d.top_evalue {
+            let le = if ev > 0.0 { -ev.log10() } else { 100.0 };
+            (le / 20.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let arch_score = ctx.arch_map.get(&m.gene_id).copied().unwrap_or(0.0);
+        serde_json::json!({
+            "hits_count": d.hits_count,
+            "top_accession": d.top_accession,
+            "top_evalue": d.top_evalue,
+            "domains_score": score,
+            "domains_arch_score": arch_score,
+            "hits": d.hits.iter().map(|h| serde_json::json!({
+                "target_name": h.target_name,
+                "accession": h.accession,
+                "evalue": h.evalue,
+                "score": h.score,
+                "bias": h.bias
+            })).collect::<Vec<_>>()
+        })
+    });
+    let length_block = ctx.len_map.get(&m.gene_id).map(|(s, z, r, c)| {
+        serde_json::json!({
+            "length_score": s,
+            "length_z": z,
+            "length_ratio": r,
+            "length_class": c,
+        })
+    });
+    let orphan_entry = if ctx.orphan_analysis_enabled {
+        ctx.orphan_map.get(&m.gene_id)
+    } else {
+        None
+    };
+    let record = serde_json::json!({
+        "gene_id": m.gene_id,
+        "taxonomy": taxonomy_json,
+        "score_components": {
+            "taxonomy": taxonomy_score,
+            "homology": homology_score,
+            "intrinsic": intrinsic_score,
+            "domains": domains_arch_score,
+            "length": length_score,
+            "orphan": orphan_score
+        },
+        "final_score": final_score,
+        "homology": {
+            "hits_count": m.hits,
+            "top_hit": summary.and_then(|s| s.top_sseqid.clone()),
+            "top_bitscore": summary.map(|s| s.top_bitscore),
+            "top_evalue": summary.as_ref().map(|s| s.top_evalue.clone()),
+            "top_qcov": summary.map(|s| s.top_qcov),
+            "top_scov": summary.map(|s| s.top_scov),
+            "bitscore_density": summary.map(|s| if s.top_len > 0 {
+                s.top_bitscore / s.top_len as f64
+            } else { 0.0 }),
+            "coverage_delta": summary.map(|s| s.coverage_delta),
+            "coverage_ratio": summary.map(|s| s.coverage_ratio),
+            "fusion_split_flag": fusion_split_flag,
+        },
+        "intrinsic": {
+            "ambiguous_fraction": intrinsic.ambiguous_fraction,
+            "max_homopolymer": intrinsic.max_homopolymer,
+            "low_complexity_fraction": intrinsic.low_complexity_fraction,
+            "low_complexity_windows": intrinsic.low_complexity_windows,
+            "orf_start_score": intrinsic.orf_start_score,
+        },
+        "alignment": aln.as_ref().map(|a| serde_json::json!({
+            "mafft_enabled": a.mafft_enabled,
+            "strategy_used": a.strategy_used,
+            "conserved_fraction": a.conserved_fraction,
+            "pairwise_identity": a.pairwise_identity,
+            "sequences_aligned": a.sequences_aligned,
+            "query_gap_fraction": a.query_gap_fraction,
+            "gap_run_count": a.gap_run_count,
+            "max_gap_run": a.max_gap_run,
+            "motif_mismatch_fraction": a.motif_mismatch_fraction,
+            "start_concordance": a.start_concordance,
+            "start_class": a.start_class,
+            "missing_exon_run": a.missing_exon_run,
+            "retained_intron_run": a.retained_intron_run,
+        })),
+        "domains": domains,
+        "length": length_block,
+        "orphan_analysis": orphan_entry.map(|oa| serde_json::json!({
+            "status": oa.status.as_str(),
+            "score": oa.score,
+            "details": oa.details.iter().map(|d| serde_json::json!({
+                "accession": d.accession,
+                "domain_index": d.domain_index,
+                "total_domains": d.total_domains,
+                "completeness": d.completeness,
+                "hmm_from": d.hmm_from,
+                "hmm_to": d.hmm_to,
+                "hmm_len": d.hmm_len,
+            })).collect::<Vec<_>>()
+        })),
+        "structvar": sv_obj.map(|sv| serde_json::json!({
+            "classification": sv.classification,
+            "fusion_possible": sv.fusion_possible,
+            "split_possible": sv.split_possible,
+            "duplication_possible": sv.duplication_possible,
+            "spans": sv.spans,
+            "fusion_subjects": sv.fusion_subjects,
+            "fusion_gap": sv.fusion_gap,
+            "fusion_left_len": sv.fusion_left_len,
+            "fusion_right_len": sv.fusion_right_len,
+            "fusion_cover_fracs": sv.fusion_cover_fracs,
+            "subjects": sv.subjects,
+            "subject_warnings": sv.warnings,
+        })),
+        "warnings": if warn_extra.is_empty() { base_warnings.clone() } else { warn_extra.clone() },
+    });
+
+    let json_line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+
+    let (top_hit, top_bitscore, top_evalue, top_qcov, top_scov, bsd, cov_delta, cov_ratio) =
+        if let Some(s) = summary {
+            (
+                s.top_sseqid.clone().unwrap_or_default(),
+                s.top_bitscore,
+                s.top_evalue.clone(),
+                s.top_qcov,
+                s.top_scov,
+                if s.top_len > 0 {
+                    s.top_bitscore / s.top_len as f64
+                } else {
+                    0.0
+                },
+                s.coverage_delta,
+                s.coverage_ratio,
+            )
+        } else {
+            (String::new(), 0.0, String::new(), 0.0, 0.0, 0.0, 0.0, 0.0)
+        };
+
+    let domains_score_field = if let Some(d) = hmmsum {
+        let score = if let Some(ev) = d.top_evalue {
+            let le = if ev > 0.0 { -ev.log10() } else { 100.0 };
+            (le / 20.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        format!("{:.4}", score)
+    } else {
+        String::new()
+    };
+    let domains_arch_field = domains_arch_value
+        .map(|v| format!("{:.4}", v))
+        .unwrap_or_default();
+    let orphan_status_str = orphan_entry
+        .map(|oa| oa.status.as_str().to_string())
+        .unwrap_or_default();
+    let orphan_score_field = if ctx.orphan_analysis_enabled {
+        orphan_entry
+            .map(|oa| format!("{:.4}", oa.score))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if ctx.classify_no_data && m.hits == 0 {
+        let nonzero_domains = hmmsum.map(|d| d.hits_count > 0).unwrap_or(false);
+        if !nonzero_domains {
+            classif = "NoData".to_string();
+        }
+    }
+    let warnings_field = if warning_msgs.is_empty() {
+        String::new()
+    } else {
+        warning_msgs.join(";")
+    };
+    let (
+        mafft_enabled,
+        conserved,
+        pid,
+        seqs_aln,
+        qgap,
+        gap_runs,
+        max_gap,
+        missing_run,
+        intron_run,
+        start_conc,
+        start_class,
+    ) = if let Some(a) = aln {
+        (
+            a.mafft_enabled,
+            a.conserved_fraction,
+            a.pairwise_identity,
+            a.sequences_aligned,
+            a.query_gap_fraction,
+            a.gap_run_count,
+            a.max_gap_run,
+            a.missing_exon_run,
+            a.retained_intron_run,
+            a.start_concordance,
+            a.start_class.clone(),
+        )
+    } else {
+        (false, 0.0, 0.0, 0, 0.0, 0, 0, 0, 0, 0.0, String::new())
+    };
+    let (
+        structvar_class,
+        structvar_gap,
+        structvar_left_len,
+        structvar_right_len,
+        structvar_cov_left,
+        structvar_cov_right,
+    ) = if let Some(sv) = sv_obj {
+        (
+            sv.classification.clone(),
+            sv.fusion_gap.map(|g| g.to_string()).unwrap_or_default(),
+            sv.fusion_left_len
+                .map(|g| g.to_string())
+                .unwrap_or_default(),
+            sv.fusion_right_len
+                .map(|g| g.to_string())
+                .unwrap_or_default(),
+            sv.fusion_cover_fracs
+                .map(|(a, _)| format!("{:.3}", a))
+                .unwrap_or_default(),
+            sv.fusion_cover_fracs
+                .map(|(_, b)| format!("{:.3}", b))
+                .unwrap_or_default(),
+        )
+    } else {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    };
+    let taxonomy_score_value = if ctx.taxonomy_enabled {
+        taxonomy_entry
+            .map(|ev| compute_taxonomy_score(Some(ev)))
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let (
+        taxonomy_contamination_field,
+        taxonomy_support_field,
+        taxonomy_considered_field,
+        taxonomy_status_str,
+        consensus_label,
+    ) = if ctx.taxonomy_enabled {
+        if let Some(Some(ev)) = ctx.taxsum_map.get(&m.gene_id) {
+            let label = ev
+                .consensus
+                .as_ref()
+                .map(|c| {
+                    if let Some(name) = &c.name {
+                        format!("{} ({})", name, c.taxid)
+                    } else {
+                        c.taxid.to_string()
+                    }
+                })
+                .unwrap_or_default();
+            (
+                format!("{:.4}", ev.contamination_score),
+                ev.support.to_string(),
+                ev.considered.to_string(),
+                ev.detail.to_string(),
+                label,
+            )
+        } else {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                "NoResolver".to_string(),
+                String::new(),
+            )
+        }
+    } else {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            "disabled".to_string(),
+            String::new(),
+        )
+    };
+
+    let len_ratio_str = if len_ratio > 0.0 {
+        format!("{:.3}", len_ratio)
+    } else {
+        String::new()
+    };
+    let orphan_component_str = if ctx.orphan_analysis_enabled {
+        if orphan_score_field.is_empty() {
+            let orphan_component = comp_entry.map(|c| c.orphan).unwrap_or(orphan_score);
+            format!("{:.4}", orphan_component)
+        } else {
+            orphan_score_field.clone()
+        }
+    } else {
+        String::new()
+    };
+
+    let warnings_field_clone = warnings_field.clone();
+    let csv_line = if ctx.csv_verbose {
+        let taxonomy_component_str = if ctx.taxonomy_enabled {
+            format!("{:.4}", taxonomy_score.unwrap_or(0.0))
+        } else {
+            String::new()
+        };
+        let row = vec![
+            m.gene_id.clone(),
+            m.hits.to_string(),
+            top_hit.clone(),
+            format!("{:.3}", top_bitscore),
+            top_evalue.clone(),
+            format!("{:.3}", top_qcov),
+            format!("{:.3}", top_scov),
+            format!("{:.3}", bsd),
+            format!("{:.3}", cov_delta),
+            format!("{:.3}", cov_ratio),
+            fusion_split_flag.to_string(),
+            format!("{:.3}", final_score),
+            classif.clone(),
+            format!("{:.4}", homology_score),
+            format!("{:.4}", intrinsic_score),
+            taxonomy_component_str,
+            domains_score_field.clone(),
+            domains_arch_field.clone(),
+            orphan_component_str,
+            format!("{:.4}", length_score),
+            len_ratio_str,
+            len_class.clone(),
+            mafft_enabled.to_string(),
+            format!("{:.3}", conserved),
+            format!("{:.3}", pid),
+            seqs_aln.to_string(),
+            format!("{:.3}", qgap),
+            gap_runs.to_string(),
+            max_gap.to_string(),
+            missing_run.to_string(),
+            intron_run.to_string(),
+            format!("{:.3}", start_conc),
+            start_class.clone(),
+            structvar_class.clone(),
+            structvar_gap.clone(),
+            structvar_left_len.clone(),
+            structvar_right_len.clone(),
+            structvar_cov_left.clone(),
+            structvar_cov_right.clone(),
+            orphan_status_str.clone(),
+            taxonomy_contamination_field.clone(),
+            taxonomy_support_field.clone(),
+            taxonomy_considered_field.clone(),
+            consensus_label.clone(),
+            taxonomy_status_str.clone(),
+            warnings_field,
+        ]
+        .join(",");
+        row
+    } else {
+        let row = vec![
+            m.gene_id.clone(),
+            m.hits.to_string(),
+            top_hit,
+            format!("{:.3}", top_bitscore),
+            top_evalue,
+            format!("{:.3}", top_qcov),
+            format!("{:.3}", top_scov),
+            format!("{:.3}", bsd),
+            format!("{:.3}", cov_delta),
+            format!("{:.3}", cov_ratio),
+            fusion_split_flag.to_string(),
+            format!("{:.3}", final_score),
+            classif.clone(),
+            mafft_enabled.to_string(),
+            format!("{:.3}", conserved),
+            format!("{:.3}", pid),
+            seqs_aln.to_string(),
+            format!("{:.3}", qgap),
+            gap_runs.to_string(),
+            max_gap.to_string(),
+            domains_score_field,
+            domains_arch_field,
+            orphan_score_field,
+            structvar_class,
+            structvar_gap,
+            structvar_left_len,
+            structvar_right_len,
+            structvar_cov_left,
+            structvar_cov_right,
+            orphan_status_str,
+            format!("{:.4}", taxonomy_score_value),
+            taxonomy_contamination_field,
+            taxonomy_support_field,
+            taxonomy_considered_field,
+            consensus_label,
+            taxonomy_status_str,
+            warnings_field_clone,
+        ]
+        .join(",");
+        row
+    };
+
+    Ok(RenderedRecord {
+        index,
+        json_line,
+        csv_line,
+    })
 }
 
 fn transcript_root(id: &str) -> Option<String> {
