@@ -4,6 +4,9 @@ use std::io::{Read, Result as IoResult};
 use std::path::Path;
 use twox_hash::XxHash64;
 
+/// Compute a fixed-seed xxHash64 of a file and return a 16-char lowercase hex digest.
+///
+/// Uses seed 0 for stability across runs and takes the filesystem path to hash.
 pub fn filehash_xx64(path: &Path) -> IoResult<String> {
     let mut file = File::open(path)?;
     let mut hasher = XxHash64::with_seed(0);
