@@ -1,6 +1,20 @@
 use std::path::Path;
 use std::time::Instant;
 
+use serde::ser::SerializeMap;
+
+fn log_json_event<F>(buf: &mut Vec<u8>, build: F)
+where
+    F: FnOnce(&mut Vec<u8>) -> Result<(), serde_json::Error>,
+{
+    buf.clear();
+    if let Err(e) = build(buf) {
+        log::warn!("failed to serialize log event: {}", e);
+        return;
+    }
+    log::info!("{}", String::from_utf8_lossy(buf));
+}
+
 pub fn run_step<F>(
     done_path: &Path,
     resume: bool,
@@ -11,12 +25,23 @@ pub fn run_step<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
+    let mut json_buf = if log_json {
+        Vec::with_capacity(128)
+    } else {
+        Vec::new()
+    };
+
     if resume && done_path.exists() {
         if log_json {
-            log::info!(
-                "{}",
-                serde_json::json!({"event":"resume_skip","step":name,"done":done_path.display().to_string()})
-            );
+            let done_display = done_path.display().to_string();
+            log_json_event(&mut json_buf, |buf| {
+                let mut ser = serde_json::Serializer::new(buf);
+                let mut map = ser.serialize_map(Some(3))?;
+                map.serialize_entry("event", "resume_skip")?;
+                map.serialize_entry("step", name)?;
+                map.serialize_entry("done", &done_display)?;
+                map.end()
+            });
         } else {
             log::info!(
                 "resume: skipping step '{}' ({} exists)",
@@ -27,7 +52,13 @@ where
         return Ok(());
     }
     if log_json {
-        log::info!("{}", serde_json::json!({"event":"step_start","step":name}));
+        log_json_event(&mut json_buf, |buf| {
+            let mut ser = serde_json::Serializer::new(buf);
+            let mut map = ser.serialize_map(Some(2))?;
+            map.serialize_entry("event", "step_start")?;
+            map.serialize_entry("step", name)?;
+            map.end()
+        });
     } else {
         log::info!("step '{}' started", name);
     }
@@ -47,10 +78,15 @@ where
         log::warn!("could not write done file {}: {}", done_path.display(), e);
     }
     if log_json {
-        log::info!(
-            "{}",
-            serde_json::json!({"event":"step_finish","step":name,"duration_sec":dt.as_secs_f64()})
-        );
+        let duration_sec = dt.as_secs_f64();
+        log_json_event(&mut json_buf, |buf| {
+            let mut ser = serde_json::Serializer::new(buf);
+            let mut map = ser.serialize_map(Some(3))?;
+            map.serialize_entry("event", "step_finish")?;
+            map.serialize_entry("step", name)?;
+            map.serialize_entry("duration_sec", &duration_sec)?;
+            map.end()
+        });
     } else {
         log::info!("step '{}' finished in {:.2?}", name, dt);
     }
