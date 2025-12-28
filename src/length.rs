@@ -6,6 +6,30 @@ pub struct LengthConsistency {
     pub class_: String,
 }
 
+const RATIO_TRUNCATED: f64 = 0.8;
+const RATIO_EXTENDED: f64 = 1.2;
+
+fn median_unstable(values: &mut [f64]) -> f64 {
+    let n = values.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mid = n / 2;
+    if n % 2 == 1 {
+        values.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+        values[mid]
+    } else {
+        values.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+        let upper = values[mid];
+        let lower = values[..mid]
+            .iter()
+            .copied()
+            .max_by(|a, b| a.total_cmp(b))
+            .unwrap_or(upper);
+        (lower + upper) / 2.0
+    }
+}
+
 pub fn compute_length_consistency(
     query_len: usize,
     subject_lens: &[usize],
@@ -22,31 +46,18 @@ pub fn compute_length_consistency(
     if vals.is_empty() {
         return None;
     }
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = vals.len();
-    let med = if n % 2 == 1 {
-        vals[n / 2]
-    } else {
-        (vals[n / 2 - 1] + vals[n / 2]) / 2.0
-    };
-    let mut devs: Vec<f64> = vals.iter().map(|v| (v - med).abs()).collect();
-    devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let m = devs.len();
-    let mad = if m == 0 {
-        0.0
-    } else if m % 2 == 1 {
-        devs[m / 2]
-    } else {
-        (devs[m / 2 - 1] + devs[m / 2]) / 2.0
-    };
+    let med = median_unstable(&mut vals);
+    let mut devs = Vec::with_capacity(vals.len());
+    devs.extend(vals.iter().map(|v| (v - med).abs()));
+    let mad = median_unstable(&mut devs);
     let madn = (1.4826 * mad).max(1.0);
     let lq = query_len as f64;
     let z = if med > 0.0 { (lq - med) / madn } else { 0.0 };
     let ratio = if med > 0.0 { lq / med } else { 0.0 };
     let score = (-(z.abs()) / 2.0).exp().clamp(0.0, 1.0);
-    let class_ = if ratio < 0.8 {
+    let class_ = if ratio < RATIO_TRUNCATED {
         "LikelyNTruncated"
-    } else if ratio > 1.2 {
+    } else if ratio > RATIO_EXTENDED {
         "LikelyNExtended"
     } else {
         "InRange"
