@@ -214,43 +214,62 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
         .collect();
     spans.sort_by_key(|t| t.0);
     sv.spans = spans;
-    // fusion: two different subjects whose (merged, strong) spans are disjoint, separated by large gap
-    'fusion: for i in 0..subjects_working.len().saturating_sub(1) {
-        for j in i + 1..subjects_working.len() {
-            let a = &subjects_working[i];
-            let b = &subjects_working[j];
-            if a.qcov < min_subj_cov || b.qcov < min_subj_cov {
-                continue;
+    // fusion: disjoint query spans with a large gap, using strong spans when available
+    #[derive(Clone)]
+    struct FusionCandidate {
+        idx: usize,
+        min: usize,
+        max: usize,
+    }
+    let mut fusion_candidates: Vec<FusionCandidate> = subjects_working
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, subj)| {
+            if subj.qcov < min_subj_cov || subj.orientation_conflict || subj.scov < 0.20 {
+                return None;
             }
-            if a.orientation_conflict || b.orientation_conflict {
-                continue;
+            let spans = if subj.spans_strong.is_empty() {
+                &subj.spans_all
+            } else {
+                &subj.spans_strong
+            };
+            let (min, max) = span_bounds(spans);
+            if min == 0 && max == 0 {
+                return None;
             }
-            let (a_min, a_max) = span_bounds(&a.spans_all);
-            let (b_min, b_max) = span_bounds(&b.spans_all);
-            if a_max > 0 && b_max > 0 {
-                let (left_max, right_min) = if a_min <= b_min {
-                    (a_max, b_min)
-                } else {
-                    (b_max, a_min)
-                };
-                if right_min > left_max {
-                    let gap = right_min - left_max;
-                    if gap >= fusion_min_gap {
-                        if a.scov < 0.20 || b.scov < 0.20 {
-                            continue;
-                        }
-                        sv.fusion_possible = true;
-                        let left_len = (left_max - if a_min <= b_min { a_min } else { b_min }) + 1;
-                        let right_len =
-                            (if a_min <= b_min { b_max } else { a_max }) - right_min + 1;
-                        sv.fusion_gap = Some(gap);
-                        sv.fusion_left_len = Some(left_len);
-                        sv.fusion_right_len = Some(right_len);
-                        sv.fusion_subjects = Some((a.id.clone(), b.id.clone()));
-                        sv.fusion_cover_fracs = Some((a.scov.min(1.0), b.scov.min(1.0)));
-                        break 'fusion;
-                    }
-                }
+            Some(FusionCandidate { idx, min, max })
+        })
+        .collect();
+    fusion_candidates.sort_by_key(|c| (c.min, c.max, c.idx));
+    let mut by_max = fusion_candidates.clone();
+    by_max.sort_by_key(|c| (c.max, c.min, c.idx));
+    let mut max_idx = 0usize;
+    let mut best_left: Option<FusionCandidate> = None;
+    'fusion: for right in &fusion_candidates {
+        let threshold = right.min.saturating_sub(fusion_min_gap);
+        while max_idx < by_max.len() && by_max[max_idx].max <= threshold {
+            let cand = by_max[max_idx].clone();
+            if best_left
+                .as_ref()
+                .map_or(true, |best| cand.max > best.max)
+            {
+                best_left = Some(cand);
+            }
+            max_idx += 1;
+        }
+        if let Some(left) = best_left.as_ref() {
+            let gap = right.min - left.max;
+            if gap >= fusion_min_gap {
+                let left_subj = &subjects_working[left.idx];
+                let right_subj = &subjects_working[right.idx];
+                sv.fusion_possible = true;
+                sv.fusion_gap = Some(gap);
+                sv.fusion_left_len = Some(left.max - left.min + 1);
+                sv.fusion_right_len = Some(right.max - right.min + 1);
+                sv.fusion_subjects = Some((left_subj.id.clone(), right_subj.id.clone()));
+                sv.fusion_cover_fracs =
+                    Some((left_subj.scov.min(1.0), right_subj.scov.min(1.0)));
+                break 'fusion;
             }
         }
     }
@@ -376,6 +395,7 @@ fn detect_order_conflict(spans: &[MergedSpan], orientation: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diamond::HitSource;
     fn mk(
         q: &str,
         s: &str,
@@ -400,6 +420,9 @@ mod tests {
             send,
             qlen,
             slen: 200,
+            source: HitSource::SwissProt,
+            staxid: Some(1),
+            lineage: vec!["root".into(), "TestClass".into()],
         }
     }
     #[test]
@@ -425,6 +448,16 @@ mod tests {
         ];
         let sv = analyze(&hits, &StructVarThresholds::default());
         assert!(sv.duplication_possible);
+    }
+
+    #[test]
+    fn split_possible_when_subject_is_partial() {
+        let mut hit = mk("q", "A", 5, 600, 1000, 10, 700);
+        hit.scov = 0.3;
+        hit.qcov = 0.9;
+        let sv = analyze(&[hit], &StructVarThresholds::default());
+        assert!(sv.split_possible);
+        assert_eq!(sv.classification, "SplitPossible");
     }
 
     #[test]
