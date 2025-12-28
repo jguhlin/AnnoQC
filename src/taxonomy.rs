@@ -15,10 +15,15 @@ pub struct TaxonomyResolver {
 
 #[derive(Debug, Clone)]
 pub struct TaxonomyConsensusConfig {
+    /// Minimum resolved hits required before consensus is considered reliable.
     pub min_hits: usize,
+    /// Maximum number of accessions to consider from the hit list.
     pub top_hits: usize,
+    /// Fraction of supporting hits required for consensus (0.0-1.0).
     pub min_support: f64,
+    /// Lineage index used for coarse consensus when fine consensus fails.
     pub coarse_rank_index: usize,
+    /// Minimum support fraction for coarse consensus (0.0-1.0).
     pub coarse_min_support: f64,
 }
 
@@ -154,7 +159,7 @@ impl TaxonomyResolver {
             }
         }
 
-        if accession_to_taxid.is_empty() {
+        if accession_to_taxid.is_empty() && nodes.is_empty() {
             return Ok(None);
         }
 
@@ -238,20 +243,25 @@ impl TaxonomyResolver {
         let min_support = cfg.min_support.clamp(0.0, 1.0);
         let quorum = ((min_support * total as f64).ceil() as usize).max(1);
         let mut best: Option<(usize, usize, u32)> = None;
-        for (&taxid, (count, depth)) in stats.iter() {
-            if *count < quorum {
+        let mut stats_vec: Vec<(u32, usize, usize)> = stats
+            .into_iter()
+            .map(|(taxid, (count, depth))| (taxid, count, depth))
+            .collect();
+        stats_vec.sort_by(|a, b| a.0.cmp(&b.0));
+        for (taxid, count, depth) in stats_vec {
+            if count < quorum {
                 continue;
             }
             match best {
                 Some((best_depth, best_count, best_taxid)) => {
-                    if *depth > best_depth
-                        || (*depth == best_depth && *count > best_count)
-                        || (*depth == best_depth && *count == best_count && taxid < best_taxid)
+                    if depth > best_depth
+                        || (depth == best_depth && count > best_count)
+                        || (depth == best_depth && count == best_count && taxid < best_taxid)
                     {
-                        best = Some((*depth, *count, taxid));
+                        best = Some((depth, count, taxid));
                     }
                 }
-                None => best = Some((*depth, *count, taxid)),
+                None => best = Some((depth, count, taxid)),
             }
         }
         if let Some((depth, support, taxid)) = best {
@@ -391,6 +401,31 @@ impl TaxonomyResolver {
         lineage_ids.reverse();
         (lineage, lineage_ids, name)
     }
+
+    pub fn rank_of(&self, taxid: u32) -> Option<&str> {
+        self.nodes.get(&taxid).map(|n| n.rank.as_str())
+    }
+
+    pub fn parent_of(&self, taxid: u32) -> Option<u32> {
+        self.nodes.get(&taxid).map(|n| n.parent)
+    }
+
+    // Public helper to expose lineage for external selection code (name/ids).
+    pub fn reconstruct_lineage_public(
+        &self,
+        taxid: u32,
+    ) -> (Vec<String>, Vec<u32>, Option<String>) {
+        self.reconstruct_lineage(taxid)
+    }
+
+    pub fn find_taxid_by_name_exact(&self, name: &str) -> Option<u32> {
+        for (tid, n) in &self.scientific_names {
+            if n == name {
+                return Some(*tid);
+            }
+        }
+        None
+    }
 }
 
 pub fn canonical_accession(raw: &str) -> String {
@@ -499,7 +534,16 @@ fn build_cache_from_fasta(fasta_path: &str) -> Result<HashMap<String, u32>, Stri
 fn parse_taxid(description: &str) -> Option<u32> {
     for token in description.split_whitespace() {
         if let Some(rest) = token.strip_prefix("OX=") {
-            if let Ok(val) = rest.trim_end_matches(';').parse::<u32>() {
+            let candidate = rest
+                .split(';')
+                .next()
+                .unwrap_or(rest)
+                .trim()
+                .trim_end_matches(';');
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Ok(val) = candidate.parse::<u32>() {
                 return Some(val);
             }
         }
@@ -581,6 +625,7 @@ mod tests {
         accession_to_taxid.insert("B".to_string(), 4);
         accession_to_taxid.insert("C".to_string(), 3);
         accession_to_taxid.insert("D".to_string(), 5);
+        accession_to_taxid.insert("E".to_string(), 6);
 
         let mut nodes = HashMap::new();
         nodes.insert(
@@ -618,6 +663,13 @@ mod tests {
                 rank: "genus".into(),
             },
         );
+        nodes.insert(
+            6,
+            TaxonomyNode {
+                parent: 2,
+                rank: "genus".into(),
+            },
+        );
 
         let mut names = HashMap::new();
         names.insert(1, "root".into());
@@ -625,6 +677,7 @@ mod tests {
         names.insert(3, "Escherichia".into());
         names.insert(4, "Escherichia coli".into());
         names.insert(5, "Outlierus".into());
+        names.insert(6, "Driftus".into());
 
         let resolver = TaxonomyResolver::new(accession_to_taxid, nodes, names);
         let cfg = TaxonomyConsensusConfig {
@@ -660,6 +713,21 @@ mod tests {
             TaxonomyDetail::InsufficientHits
                 | TaxonomyDetail::CoarseConsensus
                 | TaxonomyDetail::Consensus
+        ));
+
+        let cfg_strict = TaxonomyConsensusConfig {
+            min_hits: 3,
+            top_hits: 10,
+            min_support: 0.8,
+            coarse_rank_index: 1,
+            coarse_min_support: 0.5,
+        };
+        let mixed_hits = vec!["sp|A|".into(), "sp|D|".into(), "sp|E|".into()];
+        let mixed = resolver.summarize_panel(&mixed_hits, &cfg_strict);
+        assert_eq!(mixed.considered, 3);
+        assert!(matches!(
+            mixed.detail,
+            TaxonomyDetail::Consensus | TaxonomyDetail::CoarseConsensus
         ));
     }
 }
