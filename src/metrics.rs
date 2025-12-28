@@ -15,6 +15,9 @@ pub struct IntrinsicMetrics {
     pub orf_start_score: f64,
 }
 
+/// Compute intrinsic protein metrics based on simple sequence heuristics.
+/// Assumes amino-acid input; low-complexity is the fraction of 25-aa windows
+/// with <=6 unique alphabetic residues (case-insensitive, A-Z only).
 #[allow(clippy::needless_range_loop)]
 pub fn compute_intrinsic(seq: &[u8]) -> IntrinsicMetrics {
     let len = seq.len().max(1);
@@ -41,26 +44,55 @@ pub fn compute_intrinsic(seq: &[u8]) -> IntrinsicMetrics {
         }
     }
 
-    // naive low-complexity: sliding window uniqueness threshold
+    // Low-complexity: sliding window uniqueness threshold (A-Z only).
     let w = 25usize;
     let mut low_windows = 0usize;
     let mut total_windows = 0usize;
     if seq.len() >= w {
-        for i in 0..=seq.len() - w {
-            total_windows += 1;
-            let window = &seq[i..i + w];
-            let mut mask = [false; 26];
-            let mut uniq = 0usize;
-            for &b in window {
-                let u = (b.to_ascii_uppercase() as i32) - ('A' as i32);
-                if (0..26).contains(&u) {
-                    let ui = u as usize;
-                    if !mask[ui] {
-                        mask[ui] = true;
-                        uniq += 1;
-                    }
+        let mut indices = Vec::with_capacity(seq.len());
+        for &b in seq {
+            let idx = match b {
+                b'A'..=b'Z' => (b - b'A') as i8,
+                b'a'..=b'z' => (b - b'a') as i8,
+                _ => -1,
+            };
+            indices.push(idx);
+        }
+
+        let mut counts = [0u8; 26];
+        let mut uniq = 0usize;
+        for &idx in &indices[..w] {
+            if idx >= 0 {
+                let ui = idx as usize;
+                if counts[ui] == 0 {
+                    uniq += 1;
+                }
+                counts[ui] = counts[ui].saturating_add(1);
+            }
+        }
+        total_windows = 1;
+        if uniq <= 6 {
+            low_windows += 1;
+        }
+
+        for i in w..indices.len() {
+            let out_idx = indices[i - w];
+            if out_idx >= 0 {
+                let ui = out_idx as usize;
+                counts[ui] = counts[ui].saturating_sub(1);
+                if counts[ui] == 0 {
+                    uniq = uniq.saturating_sub(1);
                 }
             }
+            let in_idx = indices[i];
+            if in_idx >= 0 {
+                let ui = in_idx as usize;
+                if counts[ui] == 0 {
+                    uniq += 1;
+                }
+                counts[ui] = counts[ui].saturating_add(1);
+            }
+            total_windows += 1;
             if uniq <= 6 {
                 low_windows += 1;
             }
