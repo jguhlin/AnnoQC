@@ -1,6 +1,5 @@
 use std::io::BufRead;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Debug, Clone, Default)]
@@ -80,6 +79,13 @@ impl Default for OrphanAnalysis {
 const ORPHAN_MARGIN: usize = 20;
 const ORPHAN_MIN_MODEL: usize = 60;
 
+/// Analyze terminal orphan domains for a summary.
+///
+/// # Parameters
+/// - `summary`: Parsed hmmscan summary for a single query.
+///
+/// # Returns
+/// Orphan analysis with a score where 1.0 indicates no orphan penalty.
 pub fn analyze_orphan_domains(summary: &HmmscanSummary) -> OrphanAnalysis {
     if summary.hits.is_empty() {
         return OrphanAnalysis::default();
@@ -176,6 +182,7 @@ pub fn run_hmmscan(
         writeln!(stdin, ">{}", id).map_err(|e| e.to_string())?;
         stdin.write_all(seq).map_err(|e| e.to_string())?;
         writeln!(stdin).map_err(|e| e.to_string())?;
+        stdin.flush().map_err(|e| e.to_string())?;
     }
     let status = child.wait().map_err(|e| e.to_string())?;
     if !status.success() {
@@ -189,53 +196,68 @@ pub fn run_hmmscan(
 
 pub fn parse_domtblout(bytes: &[u8]) -> Result<HmmscanSummary, String> {
     let mut hits: Vec<HmmscanHit> = Vec::new();
-    for line in std::io::BufReader::new(bytes).lines() {
+    for (line_idx, line) in std::io::BufReader::new(bytes).lines().enumerate() {
         let line = line.map_err(|e| e.to_string())?;
         if line.trim_start().starts_with('#') || line.trim().is_empty() {
             continue;
         }
         // domtblout columns: target name, accession, tlen, query name, accession, qlen, ... , i-Evalue, score, bias, ...
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 22 {
+        let mut target_name = None;
+        let mut accession = None;
+        let mut hmm_len = None;
+        let mut query_len = None;
+        let mut i_eval = None;
+        let mut score = None;
+        let mut bias = None;
+        let mut hmm_from = None;
+        let mut hmm_to = None;
+        let mut ali_from = None;
+        let mut ali_to = None;
+        let mut env_from = None;
+        let mut env_to = None;
+        let mut col_count = 0usize;
+        for (idx, col) in line.split_whitespace().enumerate() {
+            col_count = idx + 1;
+            match idx {
+                0 => target_name = Some(col),
+                1 => accession = Some(col),
+                2 => hmm_len = Some(col),
+                5 => query_len = Some(col),
+                12 => i_eval = Some(col),
+                13 => score = Some(col),
+                14 => bias = Some(col),
+                15 => hmm_from = Some(col),
+                16 => hmm_to = Some(col),
+                17 => ali_from = Some(col),
+                18 => ali_to = Some(col),
+                19 => env_from = Some(col),
+                20 => env_to = Some(col),
+                _ => {}
+            }
+        }
+        if col_count < 22 {
             continue;
         }
-        let target_name = cols[0].to_string();
-        let accession = cols[1].to_string();
-        let hmm_len = cols[2].parse::<usize>().unwrap_or(0);
-        let query_len = cols[5].parse::<usize>().unwrap_or(0);
-        let i_eval = cols[12].parse::<f64>().unwrap_or(1.0);
-        let score = cols
-            .get(13)
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let bias = cols
-            .get(14)
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let hmm_from = cols
-            .get(15)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let hmm_to = cols
-            .get(16)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let ali_from = cols
-            .get(17)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let ali_to = cols
-            .get(18)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let env_from = cols
-            .get(19)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let env_to = cols
-            .get(20)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
+        let line_no = line_idx + 1;
+        let target_name = target_name
+            .ok_or_else(|| format!("domtblout line {} missing target name", line_no))?
+            .to_string();
+        let accession = accession
+            .ok_or_else(|| format!("domtblout line {} missing accession", line_no))?
+            .to_string();
+        let hmm_len =
+            parse_domtblout_usize(hmm_len, "hmm_len", line_no)?;
+        let query_len =
+            parse_domtblout_usize(query_len, "query_len", line_no)?;
+        let i_eval = parse_domtblout_f64(i_eval, "i_eval", line_no)?;
+        let score = parse_domtblout_f64(score, "score", line_no)?;
+        let bias = parse_domtblout_f64(bias, "bias", line_no)?;
+        let hmm_from = parse_domtblout_usize(hmm_from, "hmm_from", line_no)?;
+        let hmm_to = parse_domtblout_usize(hmm_to, "hmm_to", line_no)?;
+        let ali_from = parse_domtblout_usize(ali_from, "ali_from", line_no)?;
+        let ali_to = parse_domtblout_usize(ali_to, "ali_to", line_no)?;
+        let env_from = parse_domtblout_usize(env_from, "env_from", line_no)?;
+        let env_to = parse_domtblout_usize(env_to, "env_to", line_no)?;
         hits.push(HmmscanHit {
             target_name,
             accession,
@@ -266,10 +288,29 @@ pub fn parse_domtblout(bytes: &[u8]) -> Result<HmmscanSummary, String> {
     })
 }
 
+fn parse_domtblout_usize(
+    field: Option<&str>,
+    name: &str,
+    line_no: usize,
+) -> Result<usize, String> {
+    let value = field.ok_or_else(|| format!("domtblout line {} missing {}", line_no, name))?;
+    value
+        .parse::<usize>()
+        .map_err(|e| format!("domtblout line {} invalid {}: {}", line_no, name, e))
+}
+
+fn parse_domtblout_f64(field: Option<&str>, name: &str, line_no: usize) -> Result<f64, String> {
+    let value = field.ok_or_else(|| format!("domtblout line {} missing {}", line_no, name))?;
+    value
+        .parse::<f64>()
+        .map_err(|e| format!("domtblout line {} invalid {}: {}", line_no, name, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        analyze_orphan_domains, parse_domtblout, HmmscanHit, HmmscanSummary, OrphanStatus,
+        analyze_orphan_domains, collapse_by_clan, domains_architecture_diagnostics,
+        domains_architecture_score, parse_domtblout, HmmscanHit, HmmscanSummary, OrphanStatus,
     };
 
     #[test]
@@ -339,6 +380,115 @@ PF00001.1  PF00001.1  250  Q12345  -  120  1e-20  100.0  0.1  1  1  2e-20  1e-20
         assert_eq!(analysis.details.len(), 1);
         assert!(analysis.score <= 0.0 + f64::EPSILON);
     }
+
+    #[test]
+    fn orphan_detection_flags_c_only() {
+        let mut summary = HmmscanSummary::default();
+        summary.hits = vec![HmmscanHit {
+            accession: "PF99999".into(),
+            hmm_from: 5,
+            hmm_to: 170,
+            hmm_len: 220,
+            ali_from: 10,
+            ali_to: 200,
+            ..Default::default()
+        }];
+        summary.hits_count = 1;
+        let analysis = analyze_orphan_domains(&summary);
+        assert_eq!(analysis.status, OrphanStatus::CTerminal);
+        assert!(analysis.score < 1.0);
+    }
+
+    #[test]
+    fn parse_domtblout_handles_multiple_hits() {
+        let data = b"# comment\nPF00001.1 PF00001.1 120 Q1 - 90 1e-10 80 0.0 1 1 1e-10 1e-10 80 0.0 1 80 5 85 3 82 0.95 desc\nPF00002.2 PF00002.2 200 Q1 - 90 5e-5 50 0.0 1 1 5e-5 5e-5 50 0.0 10 160 15 170 12 175 0.80 other\n";
+        let sum = parse_domtblout(data).expect("parse domtblout");
+        assert_eq!(sum.hits_count, 2);
+        assert_eq!(sum.hits.len(), 2);
+        assert_eq!(sum.top_accession.as_deref(), Some("PF00001.1"));
+        assert!(sum.top_evalue.unwrap() < 1e-9);
+    }
+
+    #[test]
+    fn parse_domtblout_skips_truncated_lines() {
+        let data = b"# comment\nPF00001.1 PF00001.1 120 Q1 - 90 1e-10 80 0.0 1 1 1e-10 1e-10 80 0.0 1 80 5 85 3 82 0.95 desc\nPF00002.2 PF00002.2 200 Q1 - 90 5e-5\n";
+        let sum = parse_domtblout(data).expect("parse domtblout");
+        assert_eq!(sum.hits_count, 1);
+        assert_eq!(sum.hits.len(), 1);
+        assert_eq!(sum.top_accession.as_deref(), Some("PF00001.1"));
+    }
+
+    #[test]
+    fn collapse_by_clan_coalesces_accessions() {
+        let mut summary = HmmscanSummary::default();
+        summary.hits = vec![
+            HmmscanHit {
+                accession: "PF00001.27".into(),
+                evalue: 1e-30,
+                ..Default::default()
+            },
+            HmmscanHit {
+                accession: "PF00002.1".into(),
+                evalue: 1e-20,
+                ..Default::default()
+            },
+            HmmscanHit {
+                accession: "PF00001.27".into(),
+                evalue: 1e-25,
+                ..Default::default()
+            },
+        ];
+        let mut clan_map = std::collections::HashMap::new();
+        clan_map.insert("PF00001".into(), "CL0001".into());
+        clan_map.insert("PF00002".into(), "CL0002".into());
+        let collapsed = collapse_by_clan(&summary, &clan_map);
+        assert_eq!(collapsed.hits_count, 2);
+        assert!(collapsed
+            .hits
+            .iter()
+            .any(|h| h.accession == "CL0001" && h.evalue == 1e-30));
+        assert!(collapsed.hits.iter().any(|h| h.accession == "CL0002"));
+    }
+
+    fn make_summary(domains: &[(&str, f64)]) -> HmmscanSummary {
+        let hits: Vec<HmmscanHit> = domains
+            .iter()
+            .map(|(acc, eval)| HmmscanHit {
+                accession: acc.to_string(),
+                evalue: *eval,
+                ..Default::default()
+            })
+            .collect();
+        HmmscanSummary {
+            hits_count: hits.len(),
+            top_accession: hits.first().map(|h| h.accession.clone()),
+            top_evalue: hits.first().map(|h| h.evalue),
+            hits,
+        }
+    }
+
+    #[test]
+    fn architecture_diagnostics_scores_overlap() {
+        let query = make_summary(&[("CL0001", 1e-30), ("CL0002", 1e-20), ("CL9999", 1e-5)]);
+        let mut refs = std::collections::HashMap::new();
+        refs.insert(
+            "ref1".into(),
+            make_summary(&[("CL0001", 1e-10), ("CL0002", 1e-9)]),
+        );
+        refs.insert("ref2".into(), make_summary(&[("CL0001", 1e-8)]));
+        let ref_ids = vec!["ref1".to_string(), "ref2".to_string()];
+        let diag = domains_architecture_diagnostics(&query, &ref_ids, &refs);
+        assert_eq!(diag.panel_size, ref_ids.len());
+        assert_eq!(diag.refs_with_domains, 2);
+        assert_eq!(diag.core_count, 1);
+        assert_eq!(diag.accessory_count, 1);
+        assert!(diag.recall_core <= 1.0);
+        assert!(diag.precision_acc <= 1.0);
+        assert!(diag.score >= 0.5);
+
+        let score = domains_architecture_score(&query, &ref_ids, &refs);
+        assert!((score - diag.score).abs() < 1e-9);
+    }
 }
 
 /// Batch hmmscan with optional i-Evalue filtering before truncation.
@@ -352,48 +502,53 @@ pub fn run_hmmscan_batch_opts(
     max_ievalue: Option<f64>,
 ) -> Result<std::collections::HashMap<String, HmmscanSummary>, String> {
     let nthreads = threads.max(1);
-    let queue = Arc::new(Mutex::new(items.into_iter()));
-    let results: Arc<Mutex<std::collections::HashMap<String, HmmscanSummary>>> =
-        Arc::new(Mutex::new(Default::default()));
-    let mut handles = Vec::new();
-    for _ in 0..nthreads {
-        let q = Arc::clone(&queue);
-        let r = Arc::clone(&results);
+    let mut buckets = vec![Vec::new(); nthreads];
+    for (idx, item) in items.into_iter().enumerate() {
+        buckets[idx % nthreads].push(item);
+    }
+    let mut handles = Vec::with_capacity(nthreads);
+    for bucket in buckets {
         let bin_s = bin.to_string();
         let db_s = db_path.to_string();
         let max_ev = max_ievalue;
-        let handle = thread::spawn(move || loop {
-            let next = {
-                let mut guard = q.lock().unwrap();
-                guard.next()
-            };
-            let Some((gid, seq)) = next else {
-                break;
-            };
-            let mut sum = run_hmmscan(&bin_s, &db_s, &gid, &seq).unwrap_or_default();
-            if let Some(th) = max_ev {
-                sum.hits.retain(|h| h.evalue <= th);
+        let handle = thread::spawn(move || -> Result<_, String> {
+            let mut local = std::collections::HashMap::new();
+            for (gid, seq) in bucket {
+                let mut sum = run_hmmscan(&bin_s, &db_s, &gid, &seq)
+                    .map_err(|e| format!("hmmscan failed for {}: {}", gid, e))?;
+                if let Some(th) = max_ev {
+                    sum.hits.retain(|h| h.evalue <= th);
+                }
+                if sum.hits.len() > top_n {
+                    sum.hits.truncate(top_n);
+                }
+                let trimmed = refresh_summary(sum);
+                local.insert(gid, trimmed);
             }
-            let mut trimmed = sum.clone();
-            if trimmed.hits.len() > top_n {
-                trimmed.hits.truncate(top_n);
-            }
-            let mut out = r.lock().unwrap();
-            out.insert(gid, trimmed);
+            Ok(local)
         });
         handles.push(handle);
     }
+    let mut results: std::collections::HashMap<String, HmmscanSummary> = Default::default();
     for h in handles {
-        h.join()
-            .map_err(|_| "hmmscan thread panicked".to_string())?;
+        let local = h
+            .join()
+            .map_err(|_| "hmmscan thread panicked".to_string())??;
+        results.extend(local);
     }
-    let map = Arc::try_unwrap(results)
-        .map_err(|_| "results arc busy".to_string())
-        .and_then(|m| m.into_inner().map_err(|_| "results poisoned".to_string()))?;
-    Ok(map)
+    Ok(results)
 }
 
 #[allow(dead_code)]
+/// Score domain architecture overlap against a reference panel.
+///
+/// # Parameters
+/// - `query`: Query hmmscan summary (clan-collapsed if desired).
+/// - `ref_ids`: Reference ids to consider.
+/// - `ref_map`: Reference summaries keyed by id (clan-collapsed if desired).
+///
+/// # Returns
+/// Score in [0.0, 1.0]; returns 0.0 when no valid references are provided.
 pub fn domains_architecture_score(
     query: &HmmscanSummary,
     ref_ids: &[String],
@@ -421,8 +576,7 @@ pub fn domains_architecture_score(
         return 0.0;
     }
     let denom_f = denom as f64;
-    let core_thresh = 0.7;
-    let acc_thresh = 0.3;
+    let (core_thresh, acc_thresh) = normalize_domain_thresholds(0.7, 0.3);
     let mut core: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut acc: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (k, v) in &freq {
@@ -526,8 +680,7 @@ pub fn domains_architecture_diagnostics(
         return diag;
     }
     let denom_f = denom as f64;
-    let core_thresh = 0.7;
-    let acc_thresh = 0.3;
+    let (core_thresh, acc_thresh) = normalize_domain_thresholds(0.7, 0.3);
     let mut core: HashSet<&str> = HashSet::new();
     let mut acc: HashSet<&str> = HashSet::new();
     for (k, v) in &freq {
@@ -576,6 +729,22 @@ pub fn domains_architecture_diagnostics(
         - w_ord * order_pen)
         .clamp(0.0, 1.0);
     diag
+}
+
+fn normalize_domain_thresholds(core: f64, accessory: f64) -> (f64, f64) {
+    let mut core = core.clamp(0.0, 1.0);
+    let mut accessory = accessory.clamp(0.0, 1.0);
+    if accessory > core {
+        std::mem::swap(&mut core, &mut accessory);
+    }
+    (core, accessory)
+}
+
+fn refresh_summary(mut sum: HmmscanSummary) -> HmmscanSummary {
+    sum.hits_count = sum.hits.len();
+    sum.top_accession = sum.hits.first().map(|h| h.accession.clone());
+    sum.top_evalue = sum.hits.first().map(|h| h.evalue);
+    sum
 }
 
 /// Load Pfam clans mapping from a TSV with columns: Pfam_Acc\tClan_Acc
