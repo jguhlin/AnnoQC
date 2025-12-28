@@ -4,6 +4,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum HitSource {
+    #[default]
+    SwissProt,
+    RefProt(String),
+    #[allow(dead_code)]
+    Cluster,
+}
+
 #[derive(Debug, Clone)]
 pub struct DiamondConfig {
     pub bin: String,
@@ -25,6 +34,7 @@ impl DiamondConfig {
 // version helper moved to preflight module
 
 /// Run DIAMOND blastp and write tabular output. Skips if output exists and is non-empty.
+/// Retries failures with a short backoff, blocking until success or retries exhausted.
 pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
     let out_path = cfg.out_path();
     if out_path.exists() {
@@ -40,33 +50,50 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
 
     // Request explicit outfmt 6 columns by passing tokens separately.
     let outfmt_tokens = [
-        "6", "qseqid", "sseqid", "bitscore", "evalue", "length", "qcovhsp", "scovhsp", "pident",
-        "qstart", "qend", "sstart", "send", "qlen", "slen", "staxids", "slineages",
+        "6",
+        "qseqid",
+        "sseqid",
+        "bitscore",
+        "evalue",
+        "length",
+        "qcovhsp",
+        "scovhsp",
+        "pident",
+        "qstart",
+        "qend",
+        "sstart",
+        "send",
+        "qlen",
+        "slen",
+        "staxids",
+        "slineages",
+    ];
+    let args: Vec<String> = vec![
+        "blastp".to_string(),
+        "--db".to_string(),
+        cfg.db.clone(),
+        "--query".to_string(),
+        cfg.query_fasta.clone(),
+        "--outfmt".to_string(),
+        outfmt_tokens.join(" "),
+        "--threads".to_string(),
+        cfg.threads.to_string(),
+        "--max-target-seqs".to_string(),
+        "50".to_string(),
+        "--max-hsps".to_string(),
+        cfg.max_hsps.to_string(),
+        "--sensitive".to_string(),
+        "--motif-masking".to_string(),
+        "0".to_string(),
+        "--quiet".to_string(),
+        "--out".to_string(),
+        out_path.to_string_lossy().to_string(),
     ];
     let mut attempts = 0usize;
     loop {
         attempts += 1;
-        let mut cmd = Command::new(&cfg.bin);
-        let output = cmd
-            .arg("blastp")
-            .arg("--db")
-            .arg(&cfg.db)
-            .arg("--query")
-            .arg(&cfg.query_fasta)
-            .arg("--outfmt")
-            .args(outfmt_tokens)
-            .arg("--threads")
-            .arg(cfg.threads.to_string())
-            .arg("--max-target-seqs")
-            .arg("50")
-            .arg("--max-hsps")
-            .arg(cfg.max_hsps.to_string())
-            .arg("--sensitive")
-            .arg("--motif-masking")
-            .arg("0")
-            .arg("--quiet")
-            .arg("--out")
-            .arg(&out_path)
+        let output = Command::new(&cfg.bin)
+            .args(&args)
             .output()
             .map_err(|e| format!("failed to run diamond blastp: {}", e))?;
         if output.status.success() {
@@ -101,8 +128,23 @@ pub fn blastp_chunked(
     }
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
     let outfmt_tokens = [
-        "6", "qseqid", "sseqid", "bitscore", "evalue", "length", "qcovhsp", "scovhsp", "pident",
-        "qstart", "qend", "sstart", "send", "qlen", "slen", "staxids", "slineages",
+        "6",
+        "qseqid",
+        "sseqid",
+        "bitscore",
+        "evalue",
+        "length",
+        "qcovhsp",
+        "scovhsp",
+        "pident",
+        "qstart",
+        "qend",
+        "sstart",
+        "send",
+        "qlen",
+        "slen",
+        "staxids",
+        "slineages",
     ];
     let mut reader = parse_fastx_file(&cfg.query_fasta).map_err(|e| e.to_string())?;
     let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
@@ -167,7 +209,7 @@ fn run_chunk(
     outfmt_tokens: &[&str],
     cfg: &DiamondConfig,
 ) -> Result<(), String> {
-    use std::io::Write;
+    use std::io::{BufReader, Write};
     let tmpfasta = out_path.with_extension(format!("chunk{}.fa", *idx));
     *idx += 1;
     {
@@ -225,8 +267,9 @@ fn run_chunk(
         .append(true)
         .open(out_path)
         .map_err(|e| e.to_string())?;
-    let chunk = std::fs::read(&tmpout).map_err(|e| e.to_string())?;
-    out.write_all(&chunk).map_err(|e| e.to_string())?;
+    let chunk = std::fs::File::open(&tmpout).map_err(|e| e.to_string())?;
+    let mut chunk_reader = BufReader::new(chunk);
+    std::io::copy(&mut chunk_reader, &mut out).map_err(|e| e.to_string())?;
     std::fs::remove_file(tmpfasta).ok();
     std::fs::remove_file(tmpout).ok();
     Ok(())
@@ -302,6 +345,41 @@ pub fn cluster(
     Ok(())
 }
 
+/// Run DIAMOND recluster to fix clustering errors using a prior clusters file as input.
+pub fn recluster(
+    bin: &str,
+    reference_fasta: &str,
+    clusters_in: &Path,
+    out_path: &Path,
+    approx_id: u32,
+    member_cover: u32,
+    threads: usize,
+) -> Result<(), String> {
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let status = Command::new(bin)
+        .arg("recluster")
+        .arg("-d")
+        .arg(reference_fasta)
+        .arg("--clusters")
+        .arg(clusters_in)
+        .arg("-o")
+        .arg(out_path)
+        .arg("--approx-id")
+        .arg(approx_id.to_string())
+        .arg("--member-cover")
+        .arg(member_cover.to_string())
+        .arg("--threads")
+        .arg(threads.to_string())
+        .status()
+        .map_err(|e| format!("failed to run diamond recluster: {}", e))?;
+    if !status.success() {
+        return Err(format!("diamond recluster exited with status {}", status));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DiamondHitStats {
     pub count: usize,
@@ -323,7 +401,9 @@ pub struct DiamondHitRow {
     pub bitscore: f64,
     pub evalue: String,
     pub length: usize,
+    #[allow(dead_code)]
     pub qcov: f64,
+    #[allow(dead_code)]
     pub scov: f64,
     pub pident: f64,
     pub qstart: usize,
@@ -332,6 +412,51 @@ pub struct DiamondHitRow {
     pub send: usize,
     pub qlen: usize,
     pub slen: usize,
+    pub source: HitSource,
+    pub staxid: Option<u32>,
+    pub lineage: Vec<String>,
+}
+
+#[derive(Default)]
+struct TsvParseDiag {
+    lines: usize,
+    skipped_empty: usize,
+    skipped_short: usize,
+    malformed: usize,
+    parse_errors: usize,
+}
+
+fn parse_f64(diag: &mut TsvParseDiag, value: &str) -> f64 {
+    match value.parse::<f64>() {
+        Ok(v) => v,
+        Err(_) => {
+            diag.parse_errors += 1;
+            0.0
+        }
+    }
+}
+
+fn parse_usize(diag: &mut TsvParseDiag, value: &str) -> usize {
+    match value.parse::<usize>() {
+        Ok(v) => v,
+        Err(_) => {
+            diag.parse_errors += 1;
+            0
+        }
+    }
+}
+
+fn log_tsv_diag(tsv: &Path, diag: &TsvParseDiag) {
+    if diag.malformed > 0 || diag.parse_errors > 0 || diag.skipped_short > 0 {
+        log::warn!(
+            "diamond tsv parse: file={} lines={} malformed={} short={} parse_errors={}",
+            tsv.display(),
+            diag.lines,
+            diag.malformed,
+            diag.skipped_short,
+            diag.parse_errors
+        );
+    }
 }
 
 /// Parse diamond tsv produced by `blastp_once` and compute per-query top-hit stats.
@@ -340,6 +465,7 @@ pub fn parse_tsv_stats(
     qlen_map: Option<&std::collections::HashMap<String, usize>>,
 ) -> Result<std::collections::HashMap<String, DiamondHitStats>, String> {
     let mut map: std::collections::HashMap<String, DiamondHitStats> = Default::default();
+    let mut diag = TsvParseDiag::default();
     if !tsv.exists() {
         return Ok(map);
     }
@@ -347,33 +473,49 @@ pub fn parse_tsv_stats(
     let reader = std::io::BufReader::new(file);
     for line in reader.lines() {
         let line = line.map_err(|e| e.to_string())?;
+        diag.lines += 1;
         if line.trim().is_empty() {
+            diag.skipped_empty += 1;
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 {
+            diag.skipped_short += 1;
+            continue;
+        }
         let q = cols[0];
         let sseqid = cols[1].to_string();
-        let (bitscore, evalue, alen, qcov, scov, pident) = if cols.len() >= 14 {
-            // our requested outfmt: 6 qseqid sseqid bitscore evalue length qcovhsp scovhsp pident
+        let (bitscore, evalue, alen, qcov, scov, pident) = if cols.len() >= 16 {
+            // requested outfmt columns include qcovhsp/scovhsp/pident and extra metadata fields
             (
-                cols[2].parse::<f64>().unwrap_or(0.0),
+                parse_f64(&mut diag, cols[2]),
                 cols[3].to_string(),
-                cols[4].parse::<usize>().unwrap_or(0),
-                cols[5].parse::<f64>().unwrap_or(0.0) / 100.0,
-                cols[6].parse::<f64>().unwrap_or(0.0) / 100.0,
-                cols[7].parse::<f64>().unwrap_or(0.0),
+                parse_usize(&mut diag, cols[4]),
+                parse_f64(&mut diag, cols[5]) / 100.0,
+                parse_f64(&mut diag, cols[6]) / 100.0,
+                parse_f64(&mut diag, cols[7]),
+            )
+        } else if cols.len() == 8 {
+            // minimal custom outfmt: qseqid sseqid bitscore evalue length qcovhsp scovhsp pident
+            (
+                parse_f64(&mut diag, cols[2]),
+                cols[3].to_string(),
+                parse_usize(&mut diag, cols[4]),
+                parse_f64(&mut diag, cols[5]) / 100.0,
+                parse_f64(&mut diag, cols[6]) / 100.0,
+                parse_f64(&mut diag, cols[7]),
             )
         } else if cols.len() >= 12 {
             // default BLAST 6 order
-            let pident = cols[2].parse::<f64>().unwrap_or(0.0);
-            let alen = cols[3].parse::<usize>().unwrap_or(0);
+            let pident = parse_f64(&mut diag, cols[2]);
+            let alen = parse_usize(&mut diag, cols[3]);
             let evalue = cols[10].to_string();
-            let bitscore = cols[11].parse::<f64>().unwrap_or(0.0);
+            let bitscore = parse_f64(&mut diag, cols[11]);
             // compute qcov from qstart/qend if we know query length
             let qcov = if let Some(map) = qlen_map {
                 if let Some(qlen) = map.get(q) {
-                    let qstart = cols[6].parse::<f64>().unwrap_or(0.0);
-                    let qend = cols[7].parse::<f64>().unwrap_or(0.0);
+                    let qstart = parse_f64(&mut diag, cols[6]);
+                    let qend = parse_f64(&mut diag, cols[7]);
                     let span = (qend - qstart).abs() + 1.0;
                     if *qlen > 0 {
                         (span / (*qlen as f64)).clamp(0.0, 1.0)
@@ -388,6 +530,7 @@ pub fn parse_tsv_stats(
             };
             (bitscore, evalue, alen, qcov, 0.0, pident)
         } else {
+            diag.malformed += 1;
             continue;
         };
         let entry = map.entry(q.to_string()).or_default();
@@ -400,10 +543,19 @@ pub fn parse_tsv_stats(
             entry.top_scov = scov;
             entry.top_len = alen;
             entry.top_pident = pident;
-            entry.coverage_delta = (qcov - scov).abs();
-            entry.coverage_ratio = if scov > 0.0 { qcov / scov } else { 0.0 };
+            entry.coverage_delta = if qcov.is_finite() && scov.is_finite() {
+                (qcov - scov).abs()
+            } else {
+                0.0
+            };
+            entry.coverage_ratio = if scov.is_finite() && scov > 0.0 && qcov.is_finite() {
+                qcov / scov
+            } else {
+                0.0
+            };
         }
     }
+    log_tsv_diag(tsv, &diag);
     Ok(map)
 }
 
@@ -415,6 +567,7 @@ pub fn parse_tsv_grouped(
     max_per_query: Option<usize>,
 ) -> Result<std::collections::HashMap<String, Vec<DiamondHitRow>>, String> {
     let mut map: std::collections::HashMap<String, Vec<DiamondHitRow>> = Default::default();
+    let mut diag = TsvParseDiag::default();
     if !tsv.exists() {
         return Ok(map);
     }
@@ -422,40 +575,62 @@ pub fn parse_tsv_grouped(
     let reader = std::io::BufReader::new(file);
     for line in reader.lines() {
         let line = line.map_err(|e| e.to_string())?;
+        diag.lines += 1;
         if line.trim().is_empty() {
+            diag.skipped_empty += 1;
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() < 2 {
+            diag.skipped_short += 1;
             continue;
         }
         let q = cols[0].to_string();
         let s = cols[1].to_string();
+        let mut staxid: Option<u32> = None;
+        let mut lineage: Vec<String> = Vec::new();
         let (bitscore, evalue, alen, qcov, scov, pident, qstart, qend, sstart, send, qlen, slen) =
-            if cols.len() >= 14 {
+            if cols.len() >= 16 {
+                staxid = parse_taxid(cols[14]);
+                lineage = parse_lineage(cols[15]);
                 (
-                    cols[2].parse::<f64>().unwrap_or(0.0),
+                    parse_f64(&mut diag, cols[2]),
                     cols[3].to_string(),
-                    cols[4].parse::<usize>().unwrap_or(0),
-                    cols[5].parse::<f64>().unwrap_or(0.0) / 100.0,
-                    cols[6].parse::<f64>().unwrap_or(0.0) / 100.0,
-                    cols[7].parse::<f64>().unwrap_or(0.0),
-                    cols[8].parse::<usize>().unwrap_or(0),
-                    cols[9].parse::<usize>().unwrap_or(0),
-                    cols[10].parse::<usize>().unwrap_or(0),
-                    cols[11].parse::<usize>().unwrap_or(0),
-                    cols[12].parse::<usize>().unwrap_or(0),
-                    cols[13].parse::<usize>().unwrap_or(0),
+                    parse_usize(&mut diag, cols[4]),
+                    parse_f64(&mut diag, cols[5]) / 100.0,
+                    parse_f64(&mut diag, cols[6]) / 100.0,
+                    parse_f64(&mut diag, cols[7]),
+                    parse_usize(&mut diag, cols[8]),
+                    parse_usize(&mut diag, cols[9]),
+                    parse_usize(&mut diag, cols[10]),
+                    parse_usize(&mut diag, cols[11]),
+                    parse_usize(&mut diag, cols[12]),
+                    parse_usize(&mut diag, cols[13]),
+                )
+            } else if cols.len() >= 14 {
+                (
+                    parse_f64(&mut diag, cols[2]),
+                    cols[3].to_string(),
+                    parse_usize(&mut diag, cols[4]),
+                    parse_f64(&mut diag, cols[5]) / 100.0,
+                    parse_f64(&mut diag, cols[6]) / 100.0,
+                    parse_f64(&mut diag, cols[7]),
+                    parse_usize(&mut diag, cols[8]),
+                    parse_usize(&mut diag, cols[9]),
+                    parse_usize(&mut diag, cols[10]),
+                    parse_usize(&mut diag, cols[11]),
+                    parse_usize(&mut diag, cols[12]),
+                    parse_usize(&mut diag, cols[13]),
                 )
             } else if cols.len() >= 12 {
-                let pident = cols[2].parse::<f64>().unwrap_or(0.0);
-                let alen = cols[3].parse::<usize>().unwrap_or(0);
+                let pident = parse_f64(&mut diag, cols[2]);
+                let alen = parse_usize(&mut diag, cols[3]);
                 let evalue = cols[10].to_string();
-                let bitscore = cols[11].parse::<f64>().unwrap_or(0.0);
+                let bitscore = parse_f64(&mut diag, cols[11]);
                 let qcov = if let Some(map) = qlen_map {
                     if let Some(qlen) = map.get(&q) {
-                        let qstart = cols[6].parse::<f64>().unwrap_or(0.0);
-                        let qend = cols[7].parse::<f64>().unwrap_or(0.0);
+                        let qstart = parse_f64(&mut diag, cols[6]);
+                        let qend = parse_f64(&mut diag, cols[7]);
                         let span = (qend - qstart).abs() + 1.0;
                         if *qlen > 0 {
                             (span / (*qlen as f64)).clamp(0.0, 1.0)
@@ -475,14 +650,15 @@ pub fn parse_tsv_grouped(
                     qcov,
                     0.0,
                     pident,
-                    cols[6].parse::<usize>().unwrap_or(0),
-                    cols[7].parse::<usize>().unwrap_or(0),
-                    cols[8].parse::<usize>().unwrap_or(0),
-                    cols[9].parse::<usize>().unwrap_or(0),
+                    parse_usize(&mut diag, cols[6]),
+                    parse_usize(&mut diag, cols[7]),
+                    parse_usize(&mut diag, cols[8]),
+                    parse_usize(&mut diag, cols[9]),
                     qlen_map.and_then(|m| m.get(&q).cloned()).unwrap_or(0),
                     0,
                 )
             } else {
+                diag.malformed += 1;
                 continue;
             };
         let row = DiamondHitRow {
@@ -500,6 +676,9 @@ pub fn parse_tsv_grouped(
             send,
             qlen,
             slen,
+            source: HitSource::SwissProt,
+            staxid,
+            lineage,
         };
         let entry = map.entry(q).or_default();
         entry.push(row);
@@ -517,5 +696,31 @@ pub fn parse_tsv_grouped(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
+    log_tsv_diag(tsv, &diag);
     Ok(map)
+}
+
+fn parse_taxid(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = trimmed
+        .split([';', ',', '|', ' '])
+        .find_map(|tok| tok.trim().parse::<u32>().ok());
+    if parsed.is_none() {
+        log::debug!("diamond parse_taxid: no valid taxid in '{}'", trimmed);
+    }
+    parsed
+}
+
+fn parse_lineage(raw: &str) -> Vec<String> {
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    raw.split([';', '|', ','])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
