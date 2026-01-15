@@ -143,15 +143,27 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 - [x] Implement taxonomy/domain evidence pillar (optional hmmscan integration).
 - [x] Build golden fixtures + CLI smoke tests in CI.
 - [x] Document metrics & scoring in mdBook (`book/`) with examples.
-- [ ] Package releases (Linux/macOS/Windows) and optional Docker image.
+- [x] Aggregate DIAMOND HSPs per subject so we filter with unioned query/subject coverage (`qcov_agg`, `scov_agg`), record keep/drop reasons in a debug CSV, and feed the aggregated spans into structvar + panel selection.
+- [x] Re-tune coverage/length criteria for panel selection: prefer high query coverage even when subject coverage is low (truncation cases), widen length-ratio windows when evidence suggests short predictions, and surface the inferred "expected length" in summaries.
+- [x] Make phase-1 panel gating query-centric: gate on `qcov_agg` (e.g., ≥0.70) and use `scov_agg` primarily for structvar/annotation (not as a hard drop). Keep `scov_agg` as a soft penalty in scoring.
+- [x] Emit `subject_cov_penalty` metadata so we can downweight/reflect low subject coverage in the scoring output without dropping the hit.
+- [x] Dynamic length window: compute robust z-scores for subject/query length ratio within the candidate set; expand window when the query is likely truncated (negative z) or extended (positive z).
+- [x] Two-pass panel builder with provenance tags: (1) SwissProt core; (2) refprot rescue only if selected < K; tag each subject with `source=swissprot|refprot|cluster` for downstream analysis.
+- [x] Subject quality score for refproteomes: rank/filer refprot subjects by Pfam coverage, start/stop completeness (when available), bitscore density, and taxonomy proximity; keep top-N even if near-duplicate to anchor alignment.
+- [x] Taxonomy-aware diversity: prefer subjects spanning distinct clades at rank (order/class) to avoid oversampling one proteome; add per-rank caps.
+- [x] CSV correctness: fix `taxonomy_status` label to reflect effective auto-enable; add `taxonomy_consensus_rank`, `support_frac` columns.
+- [x] Start/End concordance: complement `start_concordance` with `end_concordance` and `CTruncated` classification; include in scoring and CSV/JSON.
+- [x] Panel diagnostics: emit `panel_sources.csv` per run with per-gene counts from SwissProt/refprot/cluster and whether each stage rescued the panel (for tuning).
+- [x] Score calibration: add optional percentile or isotonic calibration for `final_score` so thresholds (High/Medium) map to stable quantiles across datasets.
+- [x] Package releases (Linux/macOS/Windows) and optional Docker image.
 - [x] Build offline UniProt taxonomy cache + lineage resolver.
 - [x] Integrate hmmscan + taxonomy congruence heuristics into scoring model (consensus hits + congruence/contamination scoring wired into JSONL/CSV and weighted finals).
 
 ## Goals
 
-- [ ] Fast, scalable QC for gene annotations with evidence-based scoring.
-- [ ] ECS scheduling to balance heterogeneous workloads.
-- [ ] Transparent per-gene scorecards with metrics for downstream pipelines.
+- [x] Fast, scalable QC for gene annotations with evidence-based scoring.
+- [x] ECS scheduling to balance heterogeneous workloads.
+- [x] Transparent per-gene scorecards with metrics for downstream pipelines.
 
 ## Architecture & Data Flow
 
@@ -162,8 +174,8 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 - [x] DIAMOND TSV parsed for top-hit stats (bitscore, evalue, coverage, density).
 - [x] FASTA handling via `needletail` (gz supported).
 - [x] FASTA parse for ids/lengths via needletail.
-- [ ] `prepare`: makedb → cluster → realign → recluster artifacts.
-- [x] Implement makedb + linclust + cluster with `.done` checkpoints; recluster placeholder.
+- [x] `prepare`: makedb → cluster → realign → recluster artifacts.
+- [x] Implement makedb + linclust + cluster with `.done` checkpoints; recluster complete.
 - [x] Add `--resume` support and progress logs for all prepare steps (checkpointed).
 - [x] `analyze`: read input → schedule tasks → parse DIAMOND → compute metrics → emit outputs.
 - [x] Read input + schedule tasks + emit minimal outputs.
@@ -179,22 +191,74 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 
 ## Performance & Reliability
 
-- [ ] Streaming I/O and bounded memory usage.
+- [x] Streaming I/O and bounded memory usage.
 - [x] Expose threads/approx-id/member-cover; sensible defaults.
 - [x] Retry transient DIAMOND errors; concise diagnostics.
 
 ## Reproducibility
 
 - [x] Run manifest (tool versions, config snapshot, checksums) at `results/run.json`.
+
+---
+
+# Roadmap TODO (2025-12-25)
+
+Prioritized TODO list based on current state and impact.
+
+## P0 — High Impact / Core Correctness
+
+- [x] Replace `prepare` recluster placeholder with real DIAMOND recluster step (checkpointed, logged).
+- [x] Genomic context: handle strand, reverse‑complement splice sites, and isoform→gene aggregation.
+- [x] Genomic context scoring pillar: splice correctness, intron stats, start/stop context; add weights/thresholds.
+- [x] Persist plugin results in JSONL/CSV/Parquet and include in run manifest (schema + plugin versions).
+- [x] Plugin input expansion: include homology/intrinsic/taxonomy summaries and panel context.
+
+## P1 — Performance / Reliability
+
+- [x] Stream Parquet output (avoid buffering all `ScoreCard`s in memory).
+- [x] Add FAI‑based genome indexing for large genomes to avoid full load in `genomic`.
+- [x] DIAMOND preflight: version checks, DB validation, clearer error diagnostics.
+- [x] Harden TSV parsing against truncated/mixed-format lines; explicit error categories.
+
+## P2 — Extensibility / UX
+
+- [x] Add `annoqc explain <gene_id>` to emit a per‑gene score breakdown.
+- [x] Add `--report-format jsonl|csv|parquet` to control outputs.
+- [x] Add `--resume` for `analyze` (skip already rendered genes).
+- [x] Add Rhai rule scripting as a lightweight alternative to WASM plugins.
+
+## P3 — Alignment / Consensus
+
+- [x] SPOA parity checklist + explicit fallback warnings when SPOA fails or diverges.
+- [x] Benchmarks comparing MAFFT vs SPOA on representative datasets; document results.
+
+## P4 — Observability / Reproducibility
+
+- [x] Emit structured run summary JSON (counts, errors, throughput, feature flags).
+- [x] Per‑stage timing and “slowest genes” report.
+- [x] Persist external tool versions and DB checksums in all outputs (CSV/Parquet headers).
+
+## P5 — Scoring / Calibration
+
+- [x] Explicit “no data” handling per pillar and expose in classification.
+- [x] Add `--dry-run` to print the computed scoring rubric and weight normalization.
+- [x] Expand calibration modes (percentile + isotonic) with small‑sample safeguards.
+
+## P6 — Testing & Docs
+
+- [x] Add fixture tests for plugins (mock WASM), genomic context, and hmmscan edge cases.
+- [x] Add property tests for alignment‑derived metrics (gap runs, concordance).
+- [x] Add tiny end‑to‑end tests without DIAMOND (stubs).
+- [x] Document plugin system end‑to‑end, plus GFF3/genome guide with strand/isoform caveats.
 - [x] Basic run manifest with tool versions (diamond/mafft/hmmscan) and inputs.
 - [x] Add file hashes for FASTA and DB (xx64).
 - [x] Manifest includes schema_version and a config snapshot (resolved settings & weights).
-- [ ] Schema versioning for outputs; CSV headers include tool versions.
+- [x] Schema versioning for outputs; CSV headers include tool versions.
 
 ## Caching & Resume
 
-- [ ] Cache downloads (ETag/Last-Modified) and support resume.
-- [ ] Step checkpoints (`.done` files) for idempotent prepare.
+- [x] Cache downloads (ETag/Last-Modified) and support resume.
+- [x] Step checkpoints (`.done` files) for idempotent prepare.
 
 ## Observability
 
@@ -207,11 +271,26 @@ Converted from COMPREHENSIVE_PLAN.md. All items start unchecked.
 - DIAMOND pre-run caching; retries; optional chunked mode.
 - ECS scheduler scaffold consuming FASTA + DIAMOND TSV; progress logs.
 - Enriched homology metrics; coverage delta/ratio; fusion/split flag.
-- Prepare checkpoints (`makedb`, `linclust`, `cluster`) with `--resume`.
-- Scoring weights + thresholds; CSV final_score/classification.
-- Manifest schema_version + config snapshot; file hashes.
-- MAFFT metrics (JSONL and CSV); HMMER/Pfam scaffolding and domains JSONL.
+- [x] Divergence Analysis: "Phylo-Lite" metrics (panel_pairwise_identity, divergence_ratio, divergence_score) in MAFFT/SPOA pillar.
+- [x] Optimization: Validate SPOA integration and expose new divergence metrics in CSV/JSON.
 
+## Ref Proteomes & Data Plumbing (next)
+
+- [x] Aves/refprot downloader robustness (retries/backoff, checksum/size verification, clearer per-proteome logs; configurable parallelism).
+- [x] Extend auto-repair to validate taxonomy presence in all makedb outputs; rebuild if missing.
+- [x] Configurable refprot trigger K and stricter fallback filters; per-proteome cap; provenance tags in outputs.
+
+## ECS, Streaming, and Concurrency (next)
+
+- [x] Streaming emit: deterministic gene-order flush, bounded memory, despawn completed entities.
+- [x] MAFFT/HMMER scheduling: enforce `mafft_threads_per_job * mafft_max_jobs` ceilings; logs with scheduled/inflight/completed without spam.
+- [x] High-score export: finalize export filters; embed provenance into FASTA headers.
+
+## Observability & Docs (next)
+
+- [x] scoring.md: add query-centric filtering rationale and examples (truncation rescued by HSP aggregation).
+- [x] taxonomy_domains.md: document clan-collapsed IDs in architecture; add worked examples post-fix.
+- [x] performance.md: tuning guide (DIAMOND modes, MAFFT fast, ECS knobs, refprot triggers).
 
 ## Next Up (prioritized)
 

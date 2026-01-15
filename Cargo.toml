@@ -1,6 +1,6 @@
 [package]
 name = "AnnoQC"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [profile.dev.package."*"]
@@ -28,3 +28,18 @@ chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.8"
 bevy_tasks = "0.17.2"
 futures-lite = "2.2"
+regex = "1.10"
+flate2 = "1.0"
+spoa = "0.2.1"
+polars = { version = "0.36.2", features = ["parquet", "lazy"] }
+polars-parquet = "0.36.2"
+noodles = { version = "0.77.0", features = ["gff", "fasta", "core"] }
+extism = "1.0"
+rhai = { version = "1.19", features = ["serde", "sync"] }
+
+[dev-dependencies]
+proptest = "1.4"
+wat = "1.0"
+
+[patch.crates-io]
+spoa-sys = { path = "crates/spoa-sys" }

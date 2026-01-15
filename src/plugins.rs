@@ -117,7 +117,7 @@ pub fn run_plugin(
         .into());
     }
 
-    let output: PluginOutput = serde_json::from_str(&output_bytes)
+    let output: PluginOutput = serde_json::from_str(output_bytes)
         .map_err(|err| format!("plugin {} produced invalid JSON: {}", def.name, err))?;
     Ok(output)
 }

@@ -22,3 +22,24 @@ dist/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+.cargo
+.graphrag
+
+# Logs, binaries, and build artifacts
+*.log
+*.out
+*.err
+*.pid
+log/
+logs/
+*.bin
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.obj
+*.class
+results_a9/
+share/

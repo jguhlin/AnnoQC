@@ -9,7 +9,7 @@ version = "0.1.0"
 
 [dependencies]
 hmmer = ">=3.4,<4"
-diamond = ">=2.1.15,<3"
+diamond = ">=2.1.17,<3"
 mafft = ">=7.526,<8"
 python = "3.11.*"
 uv = ">=0.9.7,<0.10"

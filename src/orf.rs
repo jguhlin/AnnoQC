@@ -32,20 +32,32 @@ fn translate_longest_orf(seq: &[u8]) -> String {
     fn translate_codon(a: u8, b: u8, c: u8) -> char {
         match [a, b, c] {
             [b'T', b'T', b'T'] | [b'T', b'T', b'C'] => 'F',
-            [b'T', b'T', b'A'] | [b'T', b'T', b'G'] | [b'C', b'T', b'T']
-            | [b'C', b'T', b'C'] | [b'C', b'T', b'A'] | [b'C', b'T', b'G'] => 'L',
+            [b'T', b'T', b'A']
+            | [b'T', b'T', b'G']
+            | [b'C', b'T', b'T']
+            | [b'C', b'T', b'C']
+            | [b'C', b'T', b'A']
+            | [b'C', b'T', b'G'] => 'L',
             [b'A', b'T', b'T'] | [b'A', b'T', b'C'] | [b'A', b'T', b'A'] => 'I',
             [b'A', b'T', b'G'] => 'M',
-            [b'G', b'T', b'T'] | [b'G', b'T', b'C'] | [b'G', b'T', b'A']
-            | [b'G', b'T', b'G'] => 'V',
-            [b'T', b'C', b'T'] | [b'T', b'C', b'C'] | [b'T', b'C', b'A']
-            | [b'T', b'C', b'G'] | [b'A', b'G', b'T'] | [b'A', b'G', b'C'] => 'S',
-            [b'C', b'C', b'T'] | [b'C', b'C', b'C'] | [b'C', b'C', b'A']
-            | [b'C', b'C', b'G'] => 'P',
-            [b'A', b'C', b'T'] | [b'A', b'C', b'C'] | [b'A', b'C', b'A']
-            | [b'A', b'C', b'G'] => 'T',
-            [b'G', b'C', b'T'] | [b'G', b'C', b'C'] | [b'G', b'C', b'A']
-            | [b'G', b'C', b'G'] => 'A',
+            [b'G', b'T', b'T'] | [b'G', b'T', b'C'] | [b'G', b'T', b'A'] | [b'G', b'T', b'G'] => {
+                'V'
+            }
+            [b'T', b'C', b'T']
+            | [b'T', b'C', b'C']
+            | [b'T', b'C', b'A']
+            | [b'T', b'C', b'G']
+            | [b'A', b'G', b'T']
+            | [b'A', b'G', b'C'] => 'S',
+            [b'C', b'C', b'T'] | [b'C', b'C', b'C'] | [b'C', b'C', b'A'] | [b'C', b'C', b'G'] => {
+                'P'
+            }
+            [b'A', b'C', b'T'] | [b'A', b'C', b'C'] | [b'A', b'C', b'A'] | [b'A', b'C', b'G'] => {
+                'T'
+            }
+            [b'G', b'C', b'T'] | [b'G', b'C', b'C'] | [b'G', b'C', b'A'] | [b'G', b'C', b'G'] => {
+                'A'
+            }
             [b'T', b'A', b'T'] | [b'T', b'A', b'C'] => 'Y',
             [b'T', b'A', b'A'] | [b'T', b'A', b'G'] | [b'T', b'G', b'A'] => '*',
             [b'C', b'A', b'T'] | [b'C', b'A', b'C'] => 'H',
@@ -56,10 +68,15 @@ fn translate_longest_orf(seq: &[u8]) -> String {
             [b'G', b'A', b'A'] | [b'G', b'A', b'G'] => 'E',
             [b'T', b'G', b'T'] | [b'T', b'G', b'C'] => 'C',
             [b'T', b'G', b'G'] => 'W',
-            [b'C', b'G', b'T'] | [b'C', b'G', b'C'] | [b'C', b'G', b'A']
-            | [b'C', b'G', b'G'] | [b'A', b'G', b'A'] | [b'A', b'G', b'G'] => 'R',
-            [b'G', b'G', b'T'] | [b'G', b'G', b'C'] | [b'G', b'G', b'A']
-            | [b'G', b'G', b'G'] => 'G',
+            [b'C', b'G', b'T']
+            | [b'C', b'G', b'C']
+            | [b'C', b'G', b'A']
+            | [b'C', b'G', b'G']
+            | [b'A', b'G', b'A']
+            | [b'A', b'G', b'G'] => 'R',
+            [b'G', b'G', b'T'] | [b'G', b'G', b'C'] | [b'G', b'G', b'A'] | [b'G', b'G', b'G'] => {
+                'G'
+            }
             _ => 'X',
         }
     }

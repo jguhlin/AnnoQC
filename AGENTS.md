@@ -60,6 +60,14 @@
 ## Agent‑Specific Instructions
 - Scope: applies to the entire repo. Keep patches minimal and focused; don’t reformat unrelated files or add generated data.
 - Prioritize modularity and maintainability: prefer small, testable Rust modules (e.g., `src/diamond.rs`, `src/ecs.rs`, `src/taxonomy.rs`) over monolithic files. Extract sub‑libraries into modules when it improves separation of concerns, reuse, and testability. Follow best practices: clear ownership of responsibilities, narrow interfaces, and zero shared mutable state unless behind resources or channels.
+- Log MCP pain points in `MCP_PAIN_POINTS.md` (tool name + error/symptom + workaround).
+- Prefer `graphrag` for file discovery, edits, and context gathering whenever possible (use it as the default editing workflow before falling back to ad hoc shell tools).
+- When reporting long-running DIAMOND status, always verify the process is active with `pgrep` or `ps` before saying it is still running. Prefer using Codex background process mode for long runs and only report "still running" after confirmation.
+
+### Graphrag Editing Template
+Use this short spiel when starting edits:
+
+"I'll use graphrag to locate and edit the relevant files for this change. If anything is unclear, I'll confirm the target before applying edits."
 
 ### ECS + Streaming Emit Notes
 - ECS is the backbone: DIAMOND intake, MAFFT, HMMER, structvar, and now JSON/CSV rendering all run through Bevy systems. Any new heavy stage should follow the same pattern (seed jobs → async handles → collect → flush).

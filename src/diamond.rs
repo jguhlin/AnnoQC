@@ -1,8 +1,151 @@
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
+
+fn format_exit_status(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit_code={}", code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("signal={}", sig);
+        }
+    }
+    "unknown_exit_status".to_string()
+}
+
+fn log_diamond_command(bin: &str, args: &[String]) {
+    log::info!("diamond cmd: {} {}", bin, args.join(" "));
+}
+
+fn read_trimmed(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn log_resource_snapshot(context: &str) {
+    let pid = std::process::id();
+    let mem_max = read_trimmed("/sys/fs/cgroup/memory.max");
+    let mem_current = read_trimmed("/sys/fs/cgroup/memory.current");
+    let mem_high = read_trimmed("/sys/fs/cgroup/memory.high");
+    let cpu_max = read_trimmed("/sys/fs/cgroup/cpu.max");
+    let oom_score = read_trimmed("/proc/self/oom_score");
+    let oom_adj = read_trimmed("/proc/self/oom_score_adj");
+    log::info!(
+        "resource snapshot {}: pid={} memory.max={:?} memory.current={:?} memory.high={:?} cpu.max={:?} oom_score={:?} oom_score_adj={:?}",
+        context,
+        pid,
+        mem_max,
+        mem_current,
+        mem_high,
+        cpu_max,
+        oom_score,
+        oom_adj
+    );
+}
+
+fn read_proc_status_kb(pid: u32, key: &str) -> Option<u64> {
+    let path = format!("/proc/{}/status", pid);
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(key) {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if let Some(val) = parts.first() {
+                if let Ok(kb) = val.parse::<u64>() {
+                    return Some(kb);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn write_running_status(
+    status_path: &Path,
+    stderr_path: &Path,
+    out_path: &Path,
+    pid: u32,
+    extra: serde_json::Value,
+) {
+    let out_bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+    let stderr_bytes = std::fs::metadata(stderr_path).map(|m| m.len()).unwrap_or(0);
+    let mem_current = read_trimmed("/sys/fs/cgroup/memory.current");
+    let vm_rss_kb = read_proc_status_kb(pid, "VmRSS:");
+    let vm_size_kb = read_proc_status_kb(pid, "VmSize:");
+    write_status(
+        status_path,
+        serde_json::json!({
+            "state": "running",
+            "heartbeat_at": now_unix_seconds(),
+            "pid": pid,
+            "out_path": out_path.to_string_lossy(),
+            "stderr_path": stderr_path.to_string_lossy(),
+            "out_bytes": out_bytes,
+            "stderr_bytes": stderr_bytes,
+            "memory_current": mem_current,
+            "vm_rss_kb": vm_rss_kb,
+            "vm_size_kb": vm_size_kb,
+            "extra": extra,
+        }),
+    );
+}
+
+fn now_unix_seconds() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn status_path_for(out_path: &Path) -> PathBuf {
+    out_path.with_extension("status.json")
+}
+
+fn stderr_path_for(out_path: &Path) -> PathBuf {
+    out_path.with_extension("stderr.log")
+}
+
+fn write_status(path: &Path, payload: serde_json::Value) {
+    if let Err(e) = std::fs::write(path, payload.to_string()) {
+        log::warn!(
+            "diamond status write failed: file={} err={}",
+            path.display(),
+            e
+        );
+    }
+}
+
+fn append_stderr(path: &Path, stderr: &[u8]) {
+    if stderr.is_empty() {
+        return;
+    }
+    let mut f = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!(
+                "diamond stderr open failed: file={} err={}",
+                path.display(),
+                e
+            );
+            return;
+        }
+    };
+    use std::io::Write;
+    let _ = writeln!(f, "---- stderr @ {:.3} ----", now_unix_seconds());
+    let _ = f.write_all(stderr);
+    let _ = writeln!(f);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum HitSource {
@@ -48,6 +191,9 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
     fs::create_dir_all(&cfg.out_dir)
         .map_err(|e| format!("create out_dir {}: {}", cfg.out_dir, e))?;
 
+    let status_path = status_path_for(&out_path);
+    let stderr_path = stderr_path_for(&out_path);
+
     // Request explicit outfmt 6 columns by passing tokens separately.
     let outfmt_tokens = [
         "6",
@@ -68,14 +214,12 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
         "staxids",
         "slineages",
     ];
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "blastp".to_string(),
         "--db".to_string(),
         cfg.db.clone(),
         "--query".to_string(),
         cfg.query_fasta.clone(),
-        "--outfmt".to_string(),
-        outfmt_tokens.join(" "),
         "--threads".to_string(),
         cfg.threads.to_string(),
         "--max-target-seqs".to_string(),
@@ -89,28 +233,122 @@ pub fn blastp_once(cfg: &DiamondConfig) -> Result<PathBuf, String> {
         "--out".to_string(),
         out_path.to_string_lossy().to_string(),
     ];
+    args.push("--outfmt".to_string());
+    args.extend(outfmt_tokens.iter().map(|s| s.to_string()));
+    log::info!("diamond stderr: {}", stderr_path.display());
+    write_status(
+        &status_path,
+        serde_json::json!({
+            "state": "start",
+            "started_at": now_unix_seconds(),
+            "out_path": out_path.to_string_lossy(),
+            "stderr_path": stderr_path.to_string_lossy(),
+            "db": cfg.db,
+            "query_fasta": cfg.query_fasta,
+            "threads": cfg.threads,
+            "args": args.clone(),
+        }),
+    );
     let mut attempts = 0usize;
     loop {
         attempts += 1;
-        let output = Command::new(&cfg.bin)
+        if attempts == 1 {
+            log_diamond_command(&cfg.bin, &args);
+            log_resource_snapshot("diamond_blastp_start");
+        }
+        let mut child = Command::new(&cfg.bin)
             .args(&args)
-            .output()
-            .map_err(|e| format!("failed to run diamond blastp: {}", e))?;
-        if output.status.success() {
+            // Avoid buffering long-running stderr into memory; let it stream to the caller.
+            .stdout(Stdio::null())
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&stderr_path)
+                    .map(Stdio::from)
+                    .map_err(|e| {
+                        format!(
+                            "failed to open diamond stderr log {}: {}",
+                            stderr_path.display(),
+                            e
+                        )
+                    })?,
+            )
+            .spawn()
+            .map_err(|e| format!("failed to spawn diamond blastp: {}", e))?;
+        let child_pid = child.id();
+        write_running_status(
+            &status_path,
+            &stderr_path,
+            &out_path,
+            child_pid,
+            serde_json::json!({ "attempt": attempts }),
+        );
+        log::info!("diamond pid: {}", child_pid);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let status_path_clone = status_path.clone();
+        let stderr_path_clone = stderr_path.clone();
+        let out_path_clone = out_path.clone();
+        let heartbeat = std::thread::spawn(move || {
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                write_running_status(
+                    &status_path_clone,
+                    &stderr_path_clone,
+                    &out_path_clone,
+                    child_pid,
+                    serde_json::json!({}),
+                );
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        });
+        let status = child
+            .wait()
+            .map_err(|e| format!("failed to wait on diamond blastp: {}", e))?;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = heartbeat.join();
+        if status.success() {
             break;
         }
         if attempts > cfg.retries.max(1) {
-            let mut ctx = String::from_utf8_lossy(&output.stderr).to_string();
-            if ctx.len() > 400 {
-                ctx.truncate(400);
-            }
+            write_status(
+                &status_path,
+                serde_json::json!({
+                    "state": "failed",
+                    "finished_at": now_unix_seconds(),
+                    "out_path": out_path.to_string_lossy(),
+                    "stderr_path": stderr_path.to_string_lossy(),
+                    "exit": format_exit_status(&status),
+                }),
+            );
             return Err(format!(
-                "diamond blastp failed (attempt {}): status={} stderr='{}'",
-                attempts, output.status, ctx
+                "diamond blastp failed (attempt {}): {} (stderr: {})",
+                attempts,
+                format_exit_status(&status),
+                stderr_path.display()
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(500 * attempts as u64));
     }
+    if let Ok(meta) = fs::metadata(&out_path) {
+        if meta.len() == 0 {
+            log::warn!(
+                "diamond blastp produced an empty output at {}",
+                out_path.display()
+            );
+        }
+    }
+    let out_bytes = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    write_status(
+        &status_path,
+        serde_json::json!({
+            "state": "done",
+            "finished_at": now_unix_seconds(),
+            "out_path": out_path.to_string_lossy(),
+            "stderr_path": stderr_path.to_string_lossy(),
+            "out_bytes": out_bytes,
+        }),
+    );
     Ok(out_path)
 }
 
@@ -123,6 +361,8 @@ pub fn blastp_chunked(
 ) -> Result<PathBuf, String> {
     use needletail::parse_fastx_file;
     let out_path = cfg.out_path();
+    let status_path = status_path_for(&out_path);
+    let stderr_path = stderr_path_for(&out_path);
     if out_path.exists() {
         std::fs::remove_file(&out_path).ok();
     }
@@ -151,13 +391,46 @@ pub fn blastp_chunked(
     let mut tmp_idx = 0usize;
     let start = Instant::now();
     let mut processed = 0usize;
+    log::info!("diamond stderr: {}", stderr_path.display());
+    write_status(
+        &status_path,
+        serde_json::json!({
+            "state": "start",
+            "started_at": now_unix_seconds(),
+            "out_path": out_path.to_string_lossy(),
+            "stderr_path": stderr_path.to_string_lossy(),
+            "db": cfg.db,
+            "query_fasta": cfg.query_fasta,
+            "threads": cfg.threads,
+            "chunk_size": chunk_size,
+        }),
+    );
     while let Some(rec) = reader.next() {
         let rec = rec.map_err(|e| e.to_string())?;
         let id = String::from_utf8_lossy(rec.id()).to_string();
         batch.push((id, rec.seq().to_vec()));
         if batch.len() >= chunk_size {
-            run_chunk(&batch, &mut tmp_idx, &out_path, &outfmt_tokens, cfg)?;
+            run_chunk(
+                &batch,
+                &mut tmp_idx,
+                &out_path,
+                &outfmt_tokens,
+                &stderr_path,
+                cfg,
+            )?;
             processed += batch.len();
+            write_status(
+                &status_path,
+                serde_json::json!({
+                    "state": "running",
+                    "heartbeat_at": now_unix_seconds(),
+                    "out_path": out_path.to_string_lossy(),
+                    "stderr_path": stderr_path.to_string_lossy(),
+                    "out_bytes": std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0),
+                    "processed": processed,
+                    "chunk_index": tmp_idx.saturating_sub(1),
+                }),
+            );
             if log_json {
                 let secs = start.elapsed().as_secs_f64();
                 let rate = if secs > 0.0 {
@@ -179,8 +452,27 @@ pub fn blastp_chunked(
         }
     }
     if !batch.is_empty() {
-        run_chunk(&batch, &mut tmp_idx, &out_path, &outfmt_tokens, cfg)?;
+        run_chunk(
+            &batch,
+            &mut tmp_idx,
+            &out_path,
+            &outfmt_tokens,
+            &stderr_path,
+            cfg,
+        )?;
         processed += batch.len();
+        write_status(
+            &status_path,
+            serde_json::json!({
+                "state": "running",
+                "heartbeat_at": now_unix_seconds(),
+                "out_path": out_path.to_string_lossy(),
+                "stderr_path": stderr_path.to_string_lossy(),
+                "out_bytes": std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0),
+                "processed": processed,
+                "chunk_index": tmp_idx.saturating_sub(1),
+            }),
+        );
         if log_json {
             let secs = start.elapsed().as_secs_f64();
             let rate = if secs > 0.0 {
@@ -199,6 +491,17 @@ pub fn blastp_chunked(
             );
         }
     }
+    let out_bytes = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    write_status(
+        &status_path,
+        serde_json::json!({
+            "state": "done",
+            "finished_at": now_unix_seconds(),
+            "out_path": out_path.to_string_lossy(),
+            "stderr_path": stderr_path.to_string_lossy(),
+            "out_bytes": out_bytes,
+        }),
+    );
     Ok(out_path)
 }
 
@@ -207,6 +510,7 @@ fn run_chunk(
     idx: &mut usize,
     out_path: &Path,
     outfmt_tokens: &[&str],
+    stderr_path: &Path,
     cfg: &DiamondConfig,
 ) -> Result<(), String> {
     use std::io::{BufReader, Write};
@@ -221,6 +525,12 @@ fn run_chunk(
     }
     let tmpout = out_path.with_extension(format!("chunk{}.tsv", *idx));
     let mut attempts = 0usize;
+    log::info!(
+        "diamond chunk: index={} fasta={} out={}",
+        idx.saturating_sub(1),
+        tmpfasta.display(),
+        tmpout.display()
+    );
     loop {
         attempts += 1;
         let mut cmd = Command::new(&cfg.bin);
@@ -246,6 +556,7 @@ fn run_chunk(
             .arg(&tmpout)
             .output()
             .map_err(|e| e.to_string())?;
+        append_stderr(stderr_path, &output.stderr);
         if output.status.success() {
             break;
         }
@@ -255,8 +566,11 @@ fn run_chunk(
                 ctx.truncate(400);
             }
             return Err(format!(
-                "diamond chunk blastp failed after {} attempts: status={} stderr='{}'",
-                attempts, output.status, ctx
+                "diamond chunk blastp failed after {} attempts: {} stderr='{}' (stderr: {})",
+                attempts,
+                format_exit_status(&output.status),
+                ctx,
+                stderr_path.display()
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(300 * attempts as u64));

@@ -51,8 +51,9 @@ use preflight::preflight;
 use profiles::Profile;
 use provenance::filehash_xx64;
 use scoring::{
-    compute_genomic_score, compute_genomic_score_with_cfg, compute_homology_score,
-    compute_intrinsic_score, compute_subject_cov_penalty, compute_subject_cov_score,
+    compute_conserved_regions_score, compute_domains_strength_score, compute_genomic_score,
+    compute_genomic_score_with_cfg, compute_homology_score, compute_intrinsic_score,
+    compute_structvar_multiplier, compute_subject_cov_penalty, compute_subject_cov_score,
     compute_taxonomy_score,
 };
 use taxonomy::{TaxonomyConsensusConfig, TaxonomyDetail, TaxonomyEvidence, TaxonomyResolver};
@@ -71,7 +72,7 @@ type DomainsArchDebugRow = (
     f64,
     f64,
 );
-type LengthSummary = (f64, f64, f64, String);
+type LengthSummary = (f64, f64, f64, String, f64, f64, bool, usize);
 
 pub(crate) const OUTPUT_SCHEMA_VERSION: &str = "1.1";
 const PLUGIN_SCHEMA_VERSION: &str = "v1";
@@ -130,6 +131,7 @@ pub(crate) struct RenderContext {
     alignment_map: Arc<HashMap<String, mafft::AlignmentMetrics>>,
     hmmsum_map: Arc<HashMap<String, hmmer::HmmscanSummary>>,
     taxsum_map: Arc<HashMap<String, Option<TaxonomyEvidence>>>,
+    taxonomy_resolver: Option<Arc<taxonomy::TaxonomyResolver>>,
     genomic_map: Option<Arc<HashMap<String, genomic::GenomicMetrics>>>,
     scores_map: Arc<HashMap<String, (f64, String)>>,
     raw_scores_map: Arc<HashMap<String, f64>>,
@@ -141,6 +143,14 @@ pub(crate) struct RenderContext {
     panel_prov_map: Arc<HashMap<String, PanelProvenanceCounts>>,
     cov_delta_thresh: f64,
     taxonomy_enabled: bool,
+    taxonomy_expected_domain: Option<String>,
+    taxonomy_warn_non_target_min_frac: f64,
+    taxonomy_warn_non_target_min_hits: usize,
+    taxonomy_warn_non_target_strong_frac: f64,
+    taxonomy_warn_non_target_strong_hits: usize,
+    taxonomy_warn_genus_min_frac: f64,
+    taxonomy_warn_genus_min_hits: usize,
+    taxonomy_low_coverage_frac: f64,
     orphan_analysis_enabled: bool,
     csv_verbose: bool,
     mafft_missing_exon_thresh: usize,
@@ -171,6 +181,7 @@ pub struct ScoreCard {
     pub subject_cov_score: f64,
     pub subject_cov_penalty: f64,
     pub fusion_split: bool,
+    pub structvar_multiplier: f64,
     pub final_score: f64,
     pub classification: String,
     pub homology_score: f64,
@@ -182,6 +193,11 @@ pub struct ScoreCard {
     pub length_score: f64,
     pub length_ratio: f64,
     pub length_class: String,
+    pub expected_len_min: Option<f64>,
+    pub expected_len_max: Option<f64>,
+    pub length_in_expected_range: Option<bool>,
+    pub length_panel_n: Option<usize>,
+    pub conserved_regions_score: f64,
     pub termini_score: f64,
     pub divergence_score: f64,
     pub mafft_enabled: bool,
@@ -209,6 +225,8 @@ pub struct ScoreCard {
     pub consensus_taxon: String,
     pub taxonomy_rank: String,
     pub taxonomy_status: String,
+    pub taxonomy_domain: String,
+    pub taxonomy_genus: String,
     pub genomic_introns: Option<usize>,
     pub genomic_splice_canonical: Option<usize>,
     pub genomic_splice_noncanonical: Option<usize>,
@@ -348,6 +366,8 @@ struct AnalyzeArgs {
     fasta: Option<String>,
     #[arg(long)]
     db: Option<String>,
+    #[arg(long)]
+    config: Option<String>,
     #[arg(long, default_value_t = 16)]
     threads: usize,
     #[arg(long, default_value_t = 50)]
@@ -621,6 +641,14 @@ struct TaxonomyConfigOverride {
     min_consensus: Option<usize>,
     coarse_rank_index: Option<usize>,
     coarse_min_support: Option<f64>,
+    expected_domain: Option<String>,
+    warn_non_target_min_frac: Option<f64>,
+    warn_non_target_min_hits: Option<usize>,
+    warn_non_target_strong_frac: Option<f64>,
+    warn_non_target_strong_hits: Option<usize>,
+    warn_genus_min_frac: Option<f64>,
+    warn_genus_min_hits: Option<usize>,
+    low_coverage_frac: Option<f64>,
     profile_db: Option<String>,
     #[serde(alias = "cache_path")]
     cache_path: Option<String>,
@@ -709,6 +737,7 @@ struct ScoringConfigOverride {
     #[serde(default)]
     weights: HashMap<String, f64>,
     thresholds: Option<ScoringThresholds>,
+    caps: Option<ScoringCapsConfigOverride>,
     genomic: Option<ScoringGenomicConfigOverride>,
 }
 
@@ -723,6 +752,16 @@ struct ScoringGenomicConfigOverride {
     min_canonical: Option<f64>,
     max_noncanonical: Option<f64>,
     max_weird: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ScoringCapsConfigOverride {
+    /// Maximum raw score allowed when `structvar.classification == FusionPossible`.
+    structvar_fusion_max: Option<f64>,
+    /// Maximum raw score allowed when `structvar.classification == SplitPossible`.
+    structvar_split_max: Option<f64>,
+    /// Maximum raw score allowed when `structvar.classification == InternalDuplicationPossible`.
+    structvar_dup_max: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -889,7 +928,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Analyze(args) => {
             let args = *args;
-            let mut file_cfg = if let Some(path) = cli.config.as_deref() {
+            let config_path = args.config.as_deref().or(cli.config.as_deref());
+            let mut file_cfg = if let Some(path) = config_path {
                 let text = fs::read_to_string(path)?;
                 toml::from_str::<FileConfig>(&text)?
             } else {
@@ -953,6 +993,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .or_else(|| file_cfg.diamond.as_ref().and_then(|d| d.max_hsps))
                     .unwrap_or(5),
             };
+            log::info!(
+                "diamond: started mode={:?} out_dir={} out_name={}",
+                args.diamond_mode,
+                cfg.out,
+                dia_cfg.out_name
+            );
             let log_json = matches!(args.log_format, LogFormat::Json);
             let t_diamond = step_start("diamond", log_json);
             let diamond_tsv = match args.diamond_mode {
@@ -975,27 +1021,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let diamond_secs = step_finish("diamond", t_diamond, log_json);
+            log::info!(
+                "diamond: finished out={} seconds={:.3}",
+                diamond_tsv.display(),
+                diamond_secs
+            );
             let refprot_map_path = Path::new("share/refprot/aves/refprot_proteome_map.tsv");
             let refprot_proteome_map = load_refprot_proteome_map(refprot_map_path);
 
-            // Optional refprot fallback DIAMOND pass (always run once, use selectively later)
+            // Optional refprot fallback DIAMOND pass (best-effort; never fatal)
             let mut refprot_grouped: HashMap<String, Vec<diamond::DiamondHitRow>> = HashMap::new();
             if let Some(ref_db) = cfg.refprot_db.as_ref() {
                 if Path::new(ref_db).exists() {
-                    let t_ref = step_start("diamond_refprot", log_json);
-                    let ref_cfg = DiamondConfig {
-                        out_name: "diamond.refprot.tsv".into(),
-                        ..dia_cfg.clone()
-                    };
-                    let ref_tsv = blastp_once(&DiamondConfig {
-                        db: ref_db.clone(),
-                        ..ref_cfg
-                    })?;
-                    // parse grouped (no qlen map needed here)
-                    refprot_grouped =
-                        diamond::parse_tsv_grouped(&ref_tsv, None, Some(100)).unwrap_or_default();
-                    annotate_refprot_hits(&mut refprot_grouped, &refprot_proteome_map);
-                    let _ = step_finish("diamond_refprot", t_ref, log_json);
+                    let refprot_ok =
+                        if let Err(e) = preflight::check_diamond_db(&cfg.diamond_bin, ref_db) {
+                            log::warn!("refprot db preflight failed; skipping refprot: {}", e);
+                            false
+                        } else {
+                            true
+                        };
+                    if refprot_ok {
+                        let ref_db_size = std::fs::metadata(ref_db).map(|m| m.len()).unwrap_or(0);
+                        log::info!(
+                            "refprot: db={} size_bytes={} fasta={} mode={:?} out_dir={}",
+                            ref_db,
+                            ref_db_size,
+                            cfg.fasta,
+                            args.diamond_mode,
+                            cfg.out
+                        );
+                        let t_ref = step_start("diamond_refprot", log_json);
+                        let mut ref_cfg = dia_cfg.clone();
+                        ref_cfg.out_name = "diamond.refprot.tsv".into();
+                        ref_cfg.db = ref_db.clone();
+                        let mut used_chunked = false;
+                        let ref_tsv_result = match args.diamond_mode {
+                            DiamondMode::Batch => {
+                                used_chunked = true;
+                                diamond::blastp_chunked(&ref_cfg, args.batch_size.max(1), log_json)
+                            }
+                            DiamondMode::Auto => {
+                                let n = diamond::estimate_query_count(&cfg.fasta).unwrap_or(0);
+                                let threshold = args
+                                    .diamond_auto_threshold
+                                    .or_else(|| {
+                                        file_cfg.diamond.as_ref().and_then(|d| d.auto_threshold)
+                                    })
+                                    .unwrap_or(200_000usize);
+                                if n > threshold {
+                                    used_chunked = true;
+                                    diamond::blastp_chunked(
+                                        &ref_cfg,
+                                        args.batch_size.max(1),
+                                        log_json,
+                                    )
+                                } else {
+                                    blastp_once(&ref_cfg)
+                                }
+                            }
+                            DiamondMode::Single => blastp_once(&ref_cfg),
+                        };
+                        if let Ok(ref_tsv) = ref_tsv_result {
+                            let mut ref_bytes =
+                                std::fs::metadata(&ref_tsv).map(|m| m.len()).unwrap_or(0);
+                            if ref_bytes == 0 && !used_chunked {
+                                log::warn!(
+                                    "refprot blastp produced empty output; retrying in chunked mode"
+                                );
+                                let _ = diamond::blastp_chunked(
+                                    &ref_cfg,
+                                    args.batch_size.max(1),
+                                    log_json,
+                                );
+                                ref_bytes =
+                                    std::fs::metadata(&ref_tsv).map(|m| m.len()).unwrap_or(0);
+                            }
+                            if ref_bytes == 0 {
+                                log::warn!(
+                                    "refprot blastp output is empty; continuing without refprot"
+                                );
+                            } else {
+                                // parse grouped (no qlen map needed here)
+                                refprot_grouped =
+                                    diamond::parse_tsv_grouped(&ref_tsv, None, Some(100))
+                                        .unwrap_or_default();
+                                annotate_refprot_hits(&mut refprot_grouped, &refprot_proteome_map);
+                            }
+                        } else if let Err(e) = ref_tsv_result {
+                            log::warn!("refprot blastp failed; continuing without refprot: {}", e);
+                        }
+                        let _ = step_finish("diamond_refprot", t_ref, log_json);
+                    }
                 } else {
                     log::warn!("refprot db '{}' not found; skipping", ref_db);
                 }
@@ -1203,8 +1319,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let selection = panel_res.selection.clone();
                     panel_len_stats.insert(m.gene_id.clone(), panel_res.len_stats.clone());
                     let selected_set: HashSet<_> = selection.ids.iter().cloned().collect();
-                    let mut prov_counts = PanelProvenanceCounts::default();
+                    let mut source_by_id: HashMap<String, HitSource> = HashMap::new();
                     for agg in &panel_res.aggregated_hits {
+                        source_by_id
+                            .entry(agg.sseqid.clone())
+                            .or_insert_with(|| agg.source.clone());
                         panel_agg_rows.push(PanelAggDebugRow {
                             gene_id: m.gene_id.clone(),
                             subject_id: agg.sseqid.clone(),
@@ -1218,12 +1337,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             quality: agg.quality,
                             diversity_key: agg.diversity_key(cons_cfg.diversity_rank_index),
                         });
-                        if selected_set.contains(&agg.sseqid) {
-                            match &agg.source {
-                                HitSource::SwissProt => prov_counts.swissprot += 1,
-                                HitSource::RefProt(_) => prov_counts.refprot += 1,
-                                HitSource::Cluster => prov_counts.cluster += 1,
-                            }
+                    }
+                    let mut prov_counts = PanelProvenanceCounts::default();
+                    for sid in &selection.ids {
+                        match source_by_id.get(sid) {
+                            Some(HitSource::SwissProt) => prov_counts.swissprot += 1,
+                            Some(HitSource::RefProt(_)) => prov_counts.refprot += 1,
+                            Some(HitSource::Cluster) => prov_counts.cluster += 1,
+                            // IDs added by cluster backfill have no DIAMOND row, so they aren't in
+                            // `aggregated_hits` and are counted as cluster provenance here.
+                            None => prov_counts.cluster += 1,
                         }
                     }
                     let panel_ids = selection.ids.clone();
@@ -1242,7 +1365,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(lc) = length::compute_length_consistency(m.length, &slens) {
                                 len_map.insert(
                                     m.gene_id.clone(),
-                                    (lc.score, lc.z, lc.ratio, lc.class_),
+                                    (
+                                        lc.score,
+                                        lc.z,
+                                        lc.ratio,
+                                        lc.class_,
+                                        lc.expected_min,
+                                        lc.expected_max,
+                                        lc.in_expected_range,
+                                        lc.panel_n,
+                                    ),
                                 );
                             }
                         }
@@ -1829,6 +1961,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 taxdump_dir,
             )
             .map_err(|e| format!("taxonomy setup failed: {}", e))?;
+            let resolver = resolver.map(Arc::new);
             if resolver.is_some() {
                 taxonomy_enabled_effective = true;
             }
@@ -1860,6 +1993,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let taxsum_map = Arc::new(taxsum_local);
+            let taxonomy_expected_domain = file_cfg
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.expected_domain.clone());
+            let taxonomy_warn_non_target_min_frac = file_cfg
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.warn_non_target_min_frac)
+                .unwrap_or(0.05);
+            let taxonomy_warn_non_target_min_hits = file_cfg
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.warn_non_target_min_hits)
+                .unwrap_or(200);
+            let taxonomy_warn_non_target_strong_frac = file_cfg
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.warn_non_target_strong_frac)
+                .unwrap_or(0.10);
+            let taxonomy_warn_non_target_strong_hits = file_cfg
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.warn_non_target_strong_hits)
+                .unwrap_or(500);
+            let taxonomy_warn_genus_min_frac = file_cfg
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.warn_genus_min_frac)
+                .unwrap_or(0.15);
+            let taxonomy_warn_genus_min_hits = file_cfg
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.warn_genus_min_hits)
+                .unwrap_or(300);
+            let taxonomy_low_coverage_frac = file_cfg
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.low_coverage_frac)
+                .unwrap_or(0.05);
 
             let mut genomic_map: Option<Arc<HashMap<String, genomic::GenomicMetrics>>> = None;
             if let (Some(gff), Some(genome)) = (&args.gff, &args.genome) {
@@ -1883,6 +2055,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 intrinsic_map.as_ref(),
                 &file_cfg.scoring,
                 taxonomy_enabled_effective,
+                hmmer_requested,
+                if hmmer_requested {
+                    Some(hmmsum_map.as_ref())
+                } else {
+                    None
+                },
                 Some(domains_arch_map.as_ref()),
                 Some(len_map.as_ref()),
                 if orphan_analysis_enabled {
@@ -1896,6 +2074,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 },
                 Some(alignment_map.as_ref()),
+                Some(structvar_map.as_ref()),
                 genomic_map.as_ref().map(|gm| gm.as_ref()),
                 calibration,
                 args.classify_no_data,
@@ -1925,6 +2104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 },
                 Some(alignment_map.as_ref()),
+                Some(len_map.as_ref()),
                 genomic_map.as_ref().map(|gm| gm.as_ref()),
                 &file_cfg.scoring,
             );
@@ -2010,8 +2190,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Add Profile info if possible, but args.profile is available
             let profile_name = format!("{:?}", args.profile);
+            let input_label = if args.gff.is_some() || args.genome.is_some() {
+                "GFF+Genome"
+            } else if args.nucleotide {
+                "Nucleotide FASTA"
+            } else {
+                "Protein FASTA"
+            };
             let features_string = format!(
-                "Profile: {}, Features: [{}]",
+                "Input: {}, Profile: {}, Features: [{}]",
+                input_label,
                 profile_name,
                 features_list.join("+")
             );
@@ -2024,6 +2212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 alignment_map: Arc::clone(&alignment_map),
                 hmmsum_map: Arc::clone(&hmmsum_map),
                 taxsum_map: Arc::clone(&taxsum_map),
+                taxonomy_resolver: resolver.clone(),
                 genomic_map: genomic_map.clone(),
                 scores_map: Arc::clone(&scores_map),
                 raw_scores_map: Arc::clone(&raw_scores_map),
@@ -2035,6 +2224,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 panel_prov_map: Arc::clone(&panel_prov_map),
                 cov_delta_thresh: args.coverage_delta_threshold,
                 taxonomy_enabled: taxonomy_enabled_effective,
+                taxonomy_expected_domain,
+                taxonomy_warn_non_target_min_frac,
+                taxonomy_warn_non_target_min_hits,
+                taxonomy_warn_non_target_strong_frac,
+                taxonomy_warn_non_target_strong_hits,
+                taxonomy_warn_genus_min_frac,
+                taxonomy_warn_genus_min_hits,
+                taxonomy_low_coverage_frac,
                 orphan_analysis_enabled,
                 csv_verbose: args.csv_verbose,
                 mafft_missing_exon_thresh: mafft_missing_exon_threshold,
@@ -3834,10 +4031,22 @@ fn diamond_db_has_taxonomy(diamond_bin: &str, db: &Path) -> bool {
         return false;
     }
     if let Ok(text) = run_diamond_dbinfo(diamond_bin, db) {
-        dbinfo_text_has_taxonomy(&text)
-    } else {
-        false
+        if dbinfo_text_has_taxonomy(&text) {
+            return true;
+        }
     }
+    let acc_taxid_candidates = [
+        std::path::PathBuf::from(format!("{}.acc_taxid.tsv", db.display())),
+        db.with_extension("acc_taxid.tsv"),
+    ];
+    for acc_taxid in acc_taxid_candidates {
+        if let Ok(meta) = fs::metadata(&acc_taxid) {
+            if meta.len() > 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn dbinfo_text_has_taxonomy(text: &str) -> bool {
@@ -3903,10 +4112,7 @@ fn format_classification(base: &str, missing: &[&'static str], classify_no_data:
 }
 
 fn classification_base(label: &str) -> &str {
-    label
-        .split(|c: char| c == ' ' || c == '(' || c == '[')
-        .next()
-        .unwrap_or(label)
+    label.split([' ', '(', '[']).next().unwrap_or(label)
 }
 
 fn print_scoring_rubric(
@@ -3920,30 +4126,34 @@ fn print_scoring_rubric(
     let norm = |v: f64| v / sum;
     println!("scoring_rubric");
     println!(
-        "weights_raw: homology={:.3} intrinsic={:.3} taxonomy={:.3} domains={:.3} length={:.3} orphan={:.3} subject_cov={:.3} termini={:.3} divergence={:.3} genomic={:.3} sum={:.3}",
+        "weights_raw: homology={:.3} intrinsic={:.3} taxonomy={:.3} domains={:.3} domains_strength={:.3} length={:.3} orphan={:.3} subject_cov={:.3} termini={:.3} divergence={:.3} conserved_regions={:.3} genomic={:.3} sum={:.3}",
         weights.homology,
         weights.intrinsic,
         weights.taxonomy,
         weights.domains,
+        weights.domains_strength,
         weights.length,
         weights.orphan,
         weights.subject_cov,
         weights.termini,
         weights.divergence,
+        weights.conserved_regions,
         weights.genomic,
         weights.sum(),
     );
     println!(
-        "weights_normalized: homology={:.3} intrinsic={:.3} taxonomy={:.3} domains={:.3} length={:.3} orphan={:.3} subject_cov={:.3} termini={:.3} divergence={:.3} genomic={:.3}",
+        "weights_normalized: homology={:.3} intrinsic={:.3} taxonomy={:.3} domains={:.3} domains_strength={:.3} length={:.3} orphan={:.3} subject_cov={:.3} termini={:.3} divergence={:.3} conserved_regions={:.3} genomic={:.3}",
         norm(weights.homology),
         norm(weights.intrinsic),
         norm(weights.taxonomy),
         norm(weights.domains),
+        norm(weights.domains_strength),
         norm(weights.length),
         norm(weights.orphan),
         norm(weights.subject_cov),
         norm(weights.termini),
         norm(weights.divergence),
+        norm(weights.conserved_regions),
         norm(weights.genomic),
     );
     println!("thresholds: high={:.3} medium={:.3}", th_high, th_med);
@@ -3963,11 +4173,13 @@ struct WeightSet {
     intrinsic: f64,
     taxonomy: f64,
     domains: f64,
+    domains_strength: f64,
     length: f64,
     orphan: f64,
     subject_cov: f64,
     termini: f64,
     divergence: f64,
+    conserved_regions: f64,
     genomic: f64,
 }
 
@@ -3977,11 +4189,13 @@ impl WeightSet {
             + self.intrinsic
             + self.taxonomy
             + self.domains
+            + self.domains_strength
             + self.length
             + self.orphan
             + self.subject_cov
             + self.termini
             + self.divergence
+            + self.conserved_regions
             + self.genomic
     }
 
@@ -3999,6 +4213,9 @@ impl WeightSet {
         if presence.domains {
             sum += self.domains;
         }
+        if presence.domains_strength {
+            sum += self.domains_strength;
+        }
         if presence.length {
             sum += self.length;
         }
@@ -4014,6 +4231,9 @@ impl WeightSet {
         if presence.divergence {
             sum += self.divergence;
         }
+        if presence.conserved_regions {
+            sum += self.conserved_regions;
+        }
         if presence.genomic {
             sum += self.genomic;
         }
@@ -4027,11 +4247,13 @@ struct PillarPresence {
     intrinsic: bool,
     taxonomy: bool,
     domains: bool,
+    domains_strength: bool,
     length: bool,
     orphan: bool,
     subject_cov: bool,
     termini: bool,
     divergence: bool,
+    conserved_regions: bool,
     genomic: bool,
 }
 
@@ -4050,6 +4272,9 @@ impl PillarPresence {
         if weights.domains > 0.0 && !self.domains {
             missing.push("domains");
         }
+        if weights.domains_strength > 0.0 && !self.domains_strength {
+            missing.push("domains_strength");
+        }
         if weights.length > 0.0 && !self.length {
             missing.push("length");
         }
@@ -4065,6 +4290,9 @@ impl PillarPresence {
         if weights.divergence > 0.0 && !self.divergence {
             missing.push("divergence");
         }
+        if weights.conserved_regions > 0.0 && !self.conserved_regions {
+            missing.push("conserved_regions");
+        }
         if weights.genomic > 0.0 && !self.genomic {
             missing.push("genomic");
         }
@@ -4074,15 +4302,17 @@ impl PillarPresence {
 
 fn scoring_weights(scoring: &Option<ScoringConfigOverride>) -> WeightSet {
     let mut ws = WeightSet {
-        homology: 0.6,
-        intrinsic: 0.4,
+        homology: 0.55,
+        intrinsic: 0.3,
         taxonomy: 0.0,
         domains: 0.0,
+        domains_strength: 0.05,
         length: 0.0,
         orphan: 0.0,
         subject_cov: 0.0,
         termini: 0.0,
         divergence: 0.0,
+        conserved_regions: 0.1,
         genomic: 0.0,
     };
     if let Some(cfg) = scoring {
@@ -4098,6 +4328,9 @@ fn scoring_weights(scoring: &Option<ScoringConfigOverride>) -> WeightSet {
         if let Some(v) = cfg.weights.get("domains") {
             ws.domains = *v;
         }
+        if let Some(v) = cfg.weights.get("domains_strength") {
+            ws.domains_strength = *v;
+        }
         if let Some(v) = cfg.weights.get("length") {
             ws.length = *v;
         }
@@ -4112,6 +4345,9 @@ fn scoring_weights(scoring: &Option<ScoringConfigOverride>) -> WeightSet {
         }
         if let Some(v) = cfg.weights.get("divergence") {
             ws.divergence = *v;
+        }
+        if let Some(v) = cfg.weights.get("conserved_regions") {
+            ws.conserved_regions = *v;
         }
         if let Some(v) = cfg.weights.get("genomic") {
             ws.genomic = *v;
@@ -4129,6 +4365,7 @@ pub(crate) struct ComponentScores {
     subject_cov: f64,
     termini: Option<f64>,
     divergence: Option<f64>,
+    conserved_regions: Option<f64>,
     genomic: f64,
 }
 
@@ -4218,8 +4455,12 @@ fn apply_isotonic_calibration(entries: &mut [ScoreTemp]) {
     let mut fitted = vec![0.0; n];
     for block in blocks {
         let avg = (block.sum / block.weight as f64).clamp(0.0, 1.0);
-        for idx in block.start..=block.end {
-            fitted[idx] = avg;
+        for value in fitted
+            .iter_mut()
+            .take(block.end.saturating_add(1))
+            .skip(block.start)
+        {
+            *value = avg;
         }
     }
     for (rank, idx) in order.into_iter().enumerate() {
@@ -4279,15 +4520,18 @@ fn build_config_snapshot<'a>(
     if let Some(sc) = &file_cfg.scoring {
         weights = sc.weights.clone();
     } else {
-        weights.insert("homology".to_string(), 0.6);
-        weights.insert("intrinsic".to_string(), 0.4);
+        // Keep in sync with `scoring_weights` defaults.
+        weights.insert("homology".to_string(), 0.55);
+        weights.insert("intrinsic".to_string(), 0.3);
         weights.insert("taxonomy".to_string(), 0.0);
         weights.insert("domains".to_string(), 0.0);
+        weights.insert("domains_strength".to_string(), 0.05);
         weights.insert("length".to_string(), 0.0);
         weights.insert("orphan".to_string(), 0.0);
         weights.insert("subject_cov".to_string(), 0.0);
         weights.insert("termini".to_string(), 0.0);
         weights.insert("divergence".to_string(), 0.0);
+        weights.insert("conserved_regions".to_string(), 0.1);
         weights.insert("genomic".to_string(), 0.0);
     }
     ConfigSnapshot {
@@ -4309,6 +4553,25 @@ fn build_config_snapshot<'a>(
     }
 }
 
+fn adjust_homology_score(
+    raw: f64,
+    divergence_score: f64,
+    divergence_present: bool,
+    length_score: f64,
+    length_present: bool,
+) -> f64 {
+    let mut score = raw;
+    if divergence_present {
+        let adj = (0.5 + 0.5 * divergence_score.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        score *= adj;
+    }
+    if length_present {
+        let adj = (0.5 + 0.5 * length_score.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        score *= adj;
+    }
+    score.clamp(0.0, 1.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_scores_map(
     metrics: &[GeneMetrics],
@@ -4316,18 +4579,30 @@ fn build_scores_map(
     intrinsic: &HashMap<String, (metrics::IntrinsicMetrics, Vec<u8>)>,
     scoring: &Option<ScoringConfigOverride>,
     taxonomy_enabled: bool,
+    hmmer_enabled: bool,
+    hmmsum_map: Option<&HashMap<String, hmmer::HmmscanSummary>>,
     arch_map: Option<&HashMap<String, f64>>,
     len_map: Option<&HashMap<String, LengthSummary>>,
     orphan_map: Option<&HashMap<String, hmmer::OrphanAnalysis>>,
     taxonomy_map: Option<&HashMap<String, Option<TaxonomyEvidence>>>,
     alignment_map: Option<&HashMap<String, mafft::AlignmentMetrics>>,
+    structvar_map: Option<&HashMap<String, structvar::StructVar>>,
     genomic_map: Option<&HashMap<String, genomic::GenomicMetrics>>,
     calibration: CalibrationSettings,
     classify_no_data: bool,
 ) -> (HashMap<String, (f64, String)>, HashMap<String, f64>) {
-    let weights = scoring_weights(scoring);
+    let mut weights = scoring_weights(scoring);
+    if !hmmer_enabled {
+        if weights.domains > 0.0 || weights.domains_strength > 0.0 || weights.orphan > 0.0 {
+            log::warn!("hmmer disabled; ignoring domains/domains_strength/orphan weights");
+        }
+        weights.domains = 0.0;
+        weights.domains_strength = 0.0;
+        weights.orphan = 0.0;
+    }
     let (th_high, th_med) = scoring_thresholds(scoring);
     let genomic_cfg = scoring.as_ref().and_then(|s| s.genomic.as_ref());
+    let caps_cfg = scoring.as_ref().and_then(|s| s.caps.as_ref());
     let mut staging: Vec<ScoreTemp> = Vec::with_capacity(metrics.len());
     for m in metrics {
         let s = stats.get(&m.gene_id);
@@ -4338,7 +4613,7 @@ fn build_scores_map(
             .get(&m.gene_id)
             .map(|t| &t.0)
             .unwrap_or(&default_im);
-        let h = compute_homology_score(s);
+        let h_raw = compute_homology_score(s);
         let i = compute_intrinsic_score(im);
         let (t, taxonomy_present) = if taxonomy_enabled {
             let evidence = taxonomy_map
@@ -4357,6 +4632,11 @@ fn build_scores_map(
             .unwrap_or(0.0);
         let domains_present = arch_map
             .map(|am| am.contains_key(&m.gene_id))
+            .unwrap_or(false);
+        let domains_strength_score =
+            compute_domains_strength_score(hmmsum_map.and_then(|hm| hm.get(&m.gene_id)));
+        let domains_strength_present = hmmsum_map
+            .map(|hm| hm.contains_key(&m.gene_id))
             .unwrap_or(false);
         let l = len_map
             .and_then(|lm| lm.get(&m.gene_id).map(|t| t.0))
@@ -4392,6 +4672,13 @@ fn build_scores_map(
             .unwrap_or(false);
         let divergence_score =
             scoring::compute_divergence_score(alignment_map.and_then(|am| am.get(&m.gene_id)));
+        let conserved_regions_present = align_entry
+            .map(|a| {
+                a.mafft_enabled && a.sequences_aligned >= mafft::MIN_PANEL_FOR_CONSERVED_REGIONS
+            })
+            .unwrap_or(false);
+        let conserved_regions_score =
+            compute_conserved_regions_score(alignment_map.and_then(|am| am.get(&m.gene_id)));
         let genomic_score = compute_genomic_score_with_cfg(
             genomic_map.and_then(|gm| gm.get(&m.gene_id)),
             genomic_cfg.and_then(|g| g.min_canonical),
@@ -4401,20 +4688,39 @@ fn build_scores_map(
         let genomic_present = genomic_map
             .map(|gm| gm.contains_key(&m.gene_id))
             .unwrap_or(false);
+        let h = adjust_homology_score(
+            h_raw,
+            divergence_score,
+            divergence_present,
+            l,
+            length_present,
+        );
         let presence = PillarPresence {
             homology: homology_present,
             intrinsic: intrinsic_present,
             taxonomy: taxonomy_present,
             domains: domains_present,
+            domains_strength: domains_strength_present,
             length: length_present,
             orphan: orphan_present,
             subject_cov: subject_cov_present,
             termini: termini_present,
             divergence: divergence_present,
+            conserved_regions: conserved_regions_present,
             genomic: genomic_present,
         };
         let missing = presence.missing_with_weights(&weights);
         let available_weight = weights.sum_available(&presence);
+        let mut total_weight = available_weight;
+        if !presence.homology {
+            total_weight += weights.homology;
+        }
+        if !presence.domains {
+            total_weight += weights.domains;
+        }
+        if hmmer_enabled && !presence.domains_strength {
+            total_weight += weights.domains_strength;
+        }
         let mut numerator = 0.0;
         if presence.homology {
             numerator += weights.homology * h;
@@ -4427,6 +4733,9 @@ fn build_scores_map(
         }
         if presence.domains {
             numerator += weights.domains * d;
+        }
+        if presence.domains_strength {
+            numerator += weights.domains_strength * domains_strength_score;
         }
         if presence.length {
             numerator += weights.length * l;
@@ -4443,14 +4752,36 @@ fn build_scores_map(
         if presence.divergence {
             numerator += weights.divergence * divergence_score;
         }
+        if presence.conserved_regions {
+            numerator += weights.conserved_regions * conserved_regions_score;
+        }
         if presence.genomic {
             numerator += weights.genomic * genomic_score;
         }
-        let score = if available_weight > 1e-6 {
-            (numerator / available_weight).clamp(0.0, 1.0)
+        let score = if total_weight > 1e-6 {
+            (numerator / total_weight).clamp(0.0, 1.0)
         } else {
             0.0
         };
+        let sv = structvar_map.and_then(|sv| sv.get(&m.gene_id));
+        let structvar_multiplier = if homology_present {
+            compute_structvar_multiplier(sv)
+        } else {
+            1.0
+        };
+        let mut score = (score * structvar_multiplier).clamp(0.0, 1.0);
+        // Hard caps for catastrophic structural-variation calls: ensure they can't be averaged away.
+        if let (Some(cfg), Some(sv)) = (caps_cfg, sv) {
+            let cap = match sv.classification.as_str() {
+                "FusionPossible" => cfg.structvar_fusion_max,
+                "SplitPossible" => cfg.structvar_split_max,
+                "InternalDuplicationPossible" => cfg.structvar_dup_max,
+                _ => None,
+            };
+            if let Some(max_score) = cap {
+                score = score.min(max_score.clamp(0.0, 1.0));
+            }
+        }
         staging.push(ScoreTemp {
             gene_id: m.gene_id.clone(),
             raw_score: score,
@@ -4499,6 +4830,7 @@ fn build_scores_map(
     (out, raw_map)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_component_scores(
     metrics: &[GeneMetrics],
     stats: &HashMap<String, diamond::DiamondHitStats>,
@@ -4507,6 +4839,7 @@ fn build_component_scores(
     orphan_map: Option<&HashMap<String, hmmer::OrphanAnalysis>>,
     taxonomy_map: Option<&HashMap<String, Option<TaxonomyEvidence>>>,
     alignment_map: Option<&HashMap<String, mafft::AlignmentMetrics>>,
+    len_map: Option<&HashMap<String, LengthSummary>>,
     genomic_map: Option<&HashMap<String, genomic::GenomicMetrics>>,
     scoring: &Option<ScoringConfigOverride>,
 ) -> HashMap<String, ComponentScores> {
@@ -4519,7 +4852,7 @@ fn build_component_scores(
             .get(&m.gene_id)
             .map(|t| &t.0)
             .unwrap_or(&default_im);
-        let h = compute_homology_score(s);
+        let h_raw = compute_homology_score(s);
         let i = compute_intrinsic_score(im);
         let taxonomy_component = if taxonomy_enabled {
             let evidence = taxonomy_map
@@ -4550,9 +4883,35 @@ fn build_component_scores(
                     None
                 }
             });
+        let conserved_regions_component =
+            alignment_map
+                .and_then(|am| am.get(&m.gene_id))
+                .and_then(|a| {
+                    if a.mafft_enabled
+                        && a.sequences_aligned >= mafft::MIN_PANEL_FOR_CONSERVED_REGIONS
+                    {
+                        Some(compute_conserved_regions_score(Some(a)))
+                    } else {
+                        None
+                    }
+                });
         let divergence_component = alignment_map
             .and_then(|am| am.get(&m.gene_id))
             .map(|a| scoring::compute_divergence_score(Some(a)));
+        let divergence_present = divergence_component.is_some();
+        let length_score = len_map
+            .and_then(|lm| lm.get(&m.gene_id).map(|t| t.0))
+            .unwrap_or(0.0);
+        let length_present = len_map
+            .map(|lm| lm.contains_key(&m.gene_id))
+            .unwrap_or(false);
+        let h = adjust_homology_score(
+            h_raw,
+            divergence_component.unwrap_or(0.0),
+            divergence_present,
+            length_score,
+            length_present,
+        );
         let genomic_component = compute_genomic_score_with_cfg(
             genomic_map.and_then(|gm| gm.get(&m.gene_id)),
             genomic_cfg.and_then(|g| g.min_canonical),
@@ -4569,6 +4928,7 @@ fn build_component_scores(
                 subject_cov: subject_cov_score,
                 termini: termini_component,
                 divergence: divergence_component,
+                conserved_regions: conserved_regions_component,
                 genomic: genomic_component,
             },
         );
@@ -4802,11 +5162,17 @@ pub(crate) fn render_gene_record(
     };
     let domains_arch_value = ctx.arch_map.get(&m.gene_id).copied();
     let domains_arch_score = domains_arch_value.unwrap_or(0.0);
-    let (length_score, _len_z, len_ratio, len_class) = ctx
-        .len_map
-        .get(&m.gene_id)
-        .cloned()
-        .unwrap_or((0.0, 0.0, 0.0, String::new()));
+    let (length_score, _len_z, len_ratio, len_class, len_min, len_max, len_in_range, len_panel_n) =
+        ctx.len_map.get(&m.gene_id).cloned().unwrap_or((
+            0.0,
+            0.0,
+            0.0,
+            String::new(),
+            0.0,
+            0.0,
+            false,
+            0,
+        ));
     let orphan_score = if ctx.orphan_analysis_enabled {
         comp_entry.map(|c| c.orphan).unwrap_or_else(|| {
             ctx.orphan_map
@@ -4827,6 +5193,19 @@ pub(crate) fn render_gene_record(
             aln.and_then(|a| {
                 if a.mafft_enabled && a.sequences_aligned >= mafft::MIN_PANEL_FOR_TERMINI {
                     Some((a.start_concordance + a.end_concordance) / 2.0)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(0.0);
+    let conserved_regions_score = comp_entry
+        .and_then(|c| c.conserved_regions)
+        .or_else(|| {
+            aln.and_then(|a| {
+                if a.mafft_enabled && a.sequences_aligned >= mafft::MIN_PANEL_FOR_CONSERVED_REGIONS
+                {
+                    Some(compute_conserved_regions_score(Some(a)))
                 } else {
                     None
                 }
@@ -4873,6 +5252,11 @@ pub(crate) fn render_gene_record(
         }
     }
     let sv_obj = ctx.structvar_map.get(&m.gene_id);
+    let structvar_multiplier = if m.hits > 0 {
+        compute_structvar_multiplier(sv_obj)
+    } else {
+        1.0
+    };
     if let Some(sv) = sv_obj {
         match sv.classification.as_str() {
             "FusionPossible" => {
@@ -4996,14 +5380,21 @@ pub(crate) fn render_gene_record(
             })).collect::<Vec<_>>()
         })
     });
-    let length_block = ctx.len_map.get(&m.gene_id).map(|(s, z, r, c)| {
-        serde_json::json!({
-            "length_score": s,
-            "length_z": z,
-            "length_ratio": r,
-            "length_class": c,
-        })
-    });
+    let length_block = ctx
+        .len_map
+        .get(&m.gene_id)
+        .map(|(s, z, r, c, mn, mx, in_rng, n)| {
+            serde_json::json!({
+                "length_score": s,
+                "length_z": z,
+                "length_ratio": r,
+                "length_class": c,
+                "expected_len_min": mn,
+                "expected_len_max": mx,
+                "in_expected_range": in_rng,
+                "panel_n": n,
+            })
+        });
     let orphan_entry = if ctx.orphan_analysis_enabled {
         ctx.orphan_map.get(&m.gene_id)
     } else {
@@ -5017,10 +5408,13 @@ pub(crate) fn render_gene_record(
             "homology": homology_score,
             "intrinsic": intrinsic_score,
             "domains": domains_arch_score,
+            "domains_strength": compute_domains_strength_score(hmmsum),
             "subject_coverage": subject_cov_score,
             "subject_cov_penalty": subject_cov_penalty,
             "length": length_score,
             "orphan": orphan_score,
+            "conserved_regions": conserved_regions_score,
+            "structvar_multiplier": structvar_multiplier,
             "termini": termini_score,
             "genomic": genomic_score
         },
@@ -5275,11 +5669,8 @@ pub(crate) fn render_gene_record(
     let top_evalue_val = summary
         .and_then(|s| s.top_evalue.parse::<f64>().ok())
         .unwrap_or(0.0);
-    let domains_score = if domains_arch_score > 0.0 {
-        Some(domains_arch_score)
-    } else {
-        None
-    };
+    let domains_strength_score = compute_domains_strength_score(hmmsum);
+    let domains_score = hmmsum.map(|_| domains_strength_score);
 
     let (
         taxonomy_contamination_field,
@@ -5333,9 +5724,50 @@ pub(crate) fn render_gene_record(
             String::new(),
         )
     };
+    let (taxonomy_domain, taxonomy_genus) = if ctx.taxonomy_enabled {
+        if let (Some(ev), Some(resolver)) = (taxonomy_entry, ctx.taxonomy_resolver.as_ref()) {
+            if let Some(consensus) = &ev.consensus {
+                let domain = resolver
+                    .ancestor_at_rank(consensus.taxid, "domain")
+                    .and_then(|tid| resolver.name_of(tid).map(|s| s.to_string()))
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let genus = resolver
+                    .ancestor_at_rank(consensus.taxid, "genus")
+                    .and_then(|tid| resolver.name_of(tid).map(|s| s.to_string()))
+                    .unwrap_or_default();
+                (domain, genus)
+            } else {
+                (String::new(), String::new())
+            }
+        } else {
+            (String::new(), String::new())
+        }
+    } else {
+        (String::new(), String::new())
+    };
 
     let len_ratio_str = if len_ratio > 0.0 {
         format!("{:.3}", len_ratio)
+    } else {
+        String::new()
+    };
+    let len_expected_min_str = if len_panel_n > 0 && len_min > 0.0 {
+        format!("{:.0}", len_min)
+    } else {
+        String::new()
+    };
+    let len_expected_max_str = if len_panel_n > 0 && len_max > 0.0 {
+        format!("{:.0}", len_max)
+    } else {
+        String::new()
+    };
+    let len_in_range_str = if len_panel_n > 0 {
+        len_in_range.to_string()
+    } else {
+        String::new()
+    };
+    let len_panel_n_str = if len_panel_n > 0 {
+        len_panel_n.to_string()
     } else {
         String::new()
     };
@@ -5382,6 +5814,7 @@ pub(crate) fn render_gene_record(
             subject_cov_score_str.clone(),
             subject_cov_penalty_str.clone(),
             fusion_split_flag.to_string(),
+            format!("{:.4}", structvar_multiplier),
             format!("{:.3}", final_score),
             classif.clone(),
             format!("{:.4}", homology_score),
@@ -5394,6 +5827,11 @@ pub(crate) fn render_gene_record(
             format!("{:.4}", length_score),
             len_ratio_str,
             len_class.clone(),
+            len_expected_min_str,
+            len_expected_max_str,
+            len_in_range_str,
+            len_panel_n_str,
+            format!("{:.4}", conserved_regions_score),
             format!("{:.4}", termini_score),
             format!("{:.4}", divergence_score),
             mafft_enabled.to_string(),
@@ -5452,6 +5890,7 @@ pub(crate) fn render_gene_record(
             subject_cov_score_str.clone(),
             subject_cov_penalty_str.clone(),
             fusion_split_flag.to_string(),
+            format!("{:.4}", structvar_multiplier),
             format!("{:.3}", final_score),
             classif.clone(),
             mafft_enabled.to_string(),
@@ -5510,6 +5949,7 @@ pub(crate) fn render_gene_record(
         subject_cov_score,
         subject_cov_penalty,
         fusion_split: fusion_split_flag,
+        structvar_multiplier,
         final_score,
         classification: classif.clone(),
         homology_score,
@@ -5521,6 +5961,19 @@ pub(crate) fn render_gene_record(
         length_score,
         length_ratio: len_ratio,
         length_class: len_class.clone(),
+        expected_len_min: if len_panel_n > 0 { Some(len_min) } else { None },
+        expected_len_max: if len_panel_n > 0 { Some(len_max) } else { None },
+        length_in_expected_range: if len_panel_n > 0 {
+            Some(len_in_range)
+        } else {
+            None
+        },
+        length_panel_n: if len_panel_n > 0 {
+            Some(len_panel_n)
+        } else {
+            None
+        },
+        conserved_regions_score,
         termini_score,
         divergence_score,
         mafft_enabled,
@@ -5564,6 +6017,8 @@ pub(crate) fn render_gene_record(
         consensus_taxon: consensus_label.clone(),
         taxonomy_rank: taxonomy_rank_field.clone(),
         taxonomy_status: taxonomy_status_str.clone(),
+        taxonomy_domain,
+        taxonomy_genus,
         genomic_introns: genomic_metrics.map(|g| g.introns_total),
         genomic_splice_canonical: genomic_metrics.map(|g| g.splice_canonical),
         genomic_splice_noncanonical: genomic_metrics

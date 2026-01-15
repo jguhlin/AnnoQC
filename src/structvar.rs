@@ -249,10 +249,7 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
         let threshold = right.min.saturating_sub(fusion_min_gap);
         while max_idx < by_max.len() && by_max[max_idx].max <= threshold {
             let cand = by_max[max_idx].clone();
-            if best_left
-                .as_ref()
-                .map_or(true, |best| cand.max > best.max)
-            {
+            if best_left.as_ref().is_none_or(|best| cand.max > best.max) {
                 best_left = Some(cand);
             }
             max_idx += 1;
@@ -267,8 +264,7 @@ pub fn analyze(hits: &[DiamondHitRow], th: &StructVarThresholds) -> StructVar {
                 sv.fusion_left_len = Some(left.max - left.min + 1);
                 sv.fusion_right_len = Some(right.max - right.min + 1);
                 sv.fusion_subjects = Some((left_subj.id.clone(), right_subj.id.clone()));
-                sv.fusion_cover_fracs =
-                    Some((left_subj.scov.min(1.0), right_subj.scov.min(1.0)));
+                sv.fusion_cover_fracs = Some((left_subj.scov.min(1.0), right_subj.scov.min(1.0)));
                 break 'fusion;
             }
         }

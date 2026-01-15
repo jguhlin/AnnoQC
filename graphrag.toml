@@ -1,0 +1,108 @@
+default_profile = "default"
+
+[profiles.default]
+split_threshold_loc = 1500
+split_threshold_units = 80
+split_exempt_paths = []
+rust_module_style = "flat"
+rust_prefer_inline_mod = false
+build_entrypoints = []
+format_command = "rustfmt {file}"
+format_scope = "file"
+cargo_features = []
+
+[profiles.default.budgets]
+max_units = 10
+max_loc = 1000
+max_call_sites = 50
+max_hops = 1
+
+[profiles.default.safety]
+allow_signature_change = false
+allow_generated_edit = true
+allow_dependency_edits = true
+require_change_reason = true
+
+[profiles.default.file_policy]
+allowed_roots = ["."]
+allowed_extensions = [
+    "rs",
+    "py",
+    "toml",
+    "md",
+    "txt",
+    "json",
+    "yaml",
+    "yml",
+    "c",
+    "h",
+    "cc",
+    "cpp",
+    "hpp",
+    "cu",
+    "cuh",
+    "sh",
+]
+max_file_size_bytes = 262144
+allow_delete = true
+allow_delete_in_sandbox = true
+allow_overwrite = false
+
+[profiles.default.scaffold]
+enabled = false
+allowed_roots = []
+layers = []
+allowed_public_exports = []
+max_new_files = 10
+
+[profiles.default.scaffold.naming]
+enforce_snake_case = false
+
+[profiles.default.codemap]
+debounce_ms = 1000
+max_top_modules = 6
+max_public_units = 8
+max_hotspot_files = 8
+max_hotspot_units = 8
+max_entrypoints = 6
+max_test_units = 6
+
+[profiles.default.sandbox]
+clone_mode = "hardlink"
+target_cache = "shared"
+cache_root = ".graphrag/cache"
+
+[profiles.default.sccache]
+enabled = true
+
+[profiles.default.cpp]
+clangd_args = []
+
+[profiles.default.rustdoc]
+enabled = true
+allowlist_crates = []
+max_items_per_window = 6
+
+[profiles.default.embeddings]
+enabled = true
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3-embedding:8b"
+external_roots = []
+external_use_lsp = true
+external_doc_symbol_timeout_secs = 5
+auto_index_on_start = false
+
+[profiles.default.rust_analyzer]
+doc_symbol_timeout_secs = 300
+
+[profiles.default.tool_timeouts]
+workspace_search_secs = 300
+unit_search_secs = 300
+unit_at_cursor_secs = 300
+workspace_open_file_secs = 300
+unit_open_file_secs = 300
+schema_describe_transforms_secs = 300
+patch_apply_secs = 300
+patch_apply_diff_secs = 300
+
+[profiles.default.split_language_rules]

@@ -55,8 +55,9 @@ fn invalid_data(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
-fn load_fasta_ids(path: &Path) -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>>
-{
+fn load_fasta_ids(
+    path: &Path,
+) -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
     let mut ids = std::collections::HashSet::new();
     let content = fs::read_to_string(path)?;
     for line in content.lines() {

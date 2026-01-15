@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use serde::ser::SerializeMap;
+use serde::ser::{SerializeMap, Serializer};
 
 fn log_json_event<F>(buf: &mut Vec<u8>, build: F)
 where

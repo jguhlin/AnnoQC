@@ -3,8 +3,36 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use needletail::parse_fastx_file;
+use spoa::{AlignmentEngine, AlignmentType, Graph};
 
 use crate::taxonomy::canonical_accession;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignerBackend {
+    Mafft,
+    Spoa,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlignerConfig {
+    pub backend: AlignerBackend,
+    /// MAFFT executable path or command name (resolved via PATH).
+    pub mafft_bin: String,
+    /// Use MAFFT fast mode (FFT-NS-1) instead of auto-tuned settings.
+    pub mafft_fast: bool,
+    /// MAFFT threads to use per alignment job (minimum 1).
+    pub mafft_threads_per_job: usize,
+    /// Maximum number of MAFFT jobs to run concurrently.
+    pub mafft_max_jobs: usize,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct AlignmentResult {
+    pub gene_id: String,
+    pub seq_ids: Vec<String>,
+    pub aligned_seqs: Vec<String>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct AlignmentMetrics {
@@ -12,6 +40,8 @@ pub struct AlignmentMetrics {
     pub strategy_used: String,
     pub conserved_fraction: f64,
     pub pairwise_identity: f64,
+    pub panel_pairwise_identity: f64,
+    pub divergence_ratio: f64,
     pub sequences_aligned: usize,
     pub query_gap_fraction: f64,
     pub gap_run_count: usize,
@@ -19,6 +49,8 @@ pub struct AlignmentMetrics {
     pub motif_mismatch_fraction: f64,
     pub start_concordance: f64,
     pub start_class: String,
+    pub end_concordance: f64,
+    pub end_class: String,
     pub missing_exon_run: usize,
     pub retained_intron_run: usize,
 }
@@ -42,31 +74,38 @@ pub fn load_sequences_by_ids(
     Ok(found)
 }
 
-pub fn run_mafft(
-    mafft_bin: &str,
-    query_id: &str,
-    query_seq: &[u8],
-    hit_seqs: &HashMap<String, Vec<u8>>,
-) -> Result<AlignmentMetrics, String> {
-    if hit_seqs.is_empty() {
-        return Ok(AlignmentMetrics::default());
-    }
-    // Write a temporary FASTA with query first and then hits
-    let mut fasta_data = Vec::new();
-    writeln!(&mut fasta_data, ">{}", query_id).unwrap();
-    writeln!(&mut fasta_data, "{}", String::from_utf8_lossy(query_seq)).unwrap();
-    for (id, seq) in hit_seqs.iter() {
-        writeln!(&mut fasta_data, ">{}", id).unwrap();
-        writeln!(&mut fasta_data, "{}", String::from_utf8_lossy(seq)).unwrap();
+/// Run MAFFT on the provided sequences (query expected first) and return the aligned rows.
+pub fn run_mafft_alignment(
+    cfg: &AlignerConfig,
+    gene_id: &str,
+    ids_and_seqs: &[(String, String)],
+) -> Result<AlignmentResult, String> {
+    if ids_and_seqs.is_empty() {
+        return Err("no sequences provided for alignment".into());
     }
 
-    let threads_env = std::env::var("MAFFT_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1);
-    let fast = std::env::var("MAFFT_FAST").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-    let mut cmd = Command::new(mafft_bin);
-    if fast {
+    #[cfg(test)]
+    if cfg.mafft_bin.is_empty() {
+        // In tests we allow bypassing the external MAFFT binary to keep
+        // alignment unit tests self-contained.
+        return Ok(AlignmentResult {
+            gene_id: gene_id.to_string(),
+            seq_ids: ids_and_seqs.iter().map(|(id, _)| id.clone()).collect(),
+            aligned_seqs: ids_and_seqs.iter().map(|(_, s)| s.clone()).collect(),
+        });
+    }
+
+    if cfg.mafft_bin.trim().is_empty() {
+        return Err("mafft_bin is empty; set a MAFFT executable path".into());
+    }
+    let bin_path = std::path::Path::new(&cfg.mafft_bin);
+    if bin_path.parent().is_some() && !bin_path.exists() {
+        return Err(format!("mafft_bin not found: {}", cfg.mafft_bin));
+    }
+
+    let threads = cfg.mafft_threads_per_job.max(1);
+    let mut cmd = Command::new(&cfg.mafft_bin);
+    if cfg.mafft_fast {
         // FFT-NS-1: fastest reasonable settings
         cmd.arg("--retree").arg("1").arg("--maxiterate").arg("0");
     } else {
@@ -75,7 +114,7 @@ pub fn run_mafft(
     let mut child = cmd
         .arg("--quiet")
         .arg("--thread")
-        .arg(threads_env.to_string())
+        .arg(threads.to_string())
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -84,36 +123,149 @@ pub fn run_mafft(
         .map_err(|e| format!("failed to start mafft: {}", e))?;
     {
         let stdin = child.stdin.as_mut().ok_or("mafft stdin unavailable")?;
-        stdin.write_all(&fasta_data).map_err(|e| e.to_string())?;
+        for (id, seq) in ids_and_seqs.iter() {
+            writeln!(stdin, ">{}", id).map_err(|e| e.to_string())?;
+            writeln!(stdin, "{}", seq).map_err(|e| e.to_string())?;
+        }
     }
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(format!("mafft exited with status {}", output.status));
     }
     let aln = String::from_utf8_lossy(&output.stdout);
-    let seqs = parse_fasta_sequences(&aln);
-    let mut metrics = compute_alignment_metrics(&seqs);
-    metrics.strategy_used = if fast { "fast".into() } else { "auto".into() };
-    Ok(metrics)
+    let seqs = parse_fasta_sequences(&aln)
+        .map_err(|e| format!("mafft output parse failed: {}", e))?
+        .into_iter()
+        .map(|s| String::from_utf8_lossy(&s).into_owned())
+        .collect::<Vec<_>>();
+
+    if seqs.len() != ids_and_seqs.len() {
+        return Err(format!(
+            "mafft MSA row count mismatch: expected {} got {}",
+            ids_and_seqs.len(),
+            seqs.len()
+        ));
+    }
+
+    Ok(AlignmentResult {
+        gene_id: gene_id.to_string(),
+        seq_ids: ids_and_seqs.iter().map(|(id, _)| id.clone()).collect(),
+        aligned_seqs: seqs,
+    })
 }
 
-fn parse_fasta_sequences(s: &str) -> Vec<Vec<u8>> {
+fn parse_fasta_sequences(s: &str) -> Result<Vec<Vec<u8>>, String> {
     let mut seqs: Vec<Vec<u8>> = Vec::new();
     let mut cur: Vec<u8> = Vec::new();
+    let mut saw_header = false;
     for line in s.lines() {
         if line.starts_with('>') {
+            saw_header = true;
             if !cur.is_empty() {
-                seqs.push(cur.clone());
-                cur.clear();
+                seqs.push(std::mem::take(&mut cur));
             }
         } else {
+            if !saw_header {
+                return Err("FASTA missing header before sequence data".into());
+            }
             cur.extend_from_slice(line.as_bytes());
         }
     }
     if !cur.is_empty() {
         seqs.push(cur);
     }
-    seqs
+    if seqs.is_empty() {
+        return Err("no sequences parsed from FASTA output".into());
+    }
+    Ok(seqs)
+}
+
+pub const MIN_PANEL_FOR_TERMINI: usize = 5;
+pub const MIN_PANEL_FOR_CONSERVED_REGIONS: usize = 10;
+
+pub fn run_spoa_alignment(
+    gene_id: &str,
+    ids_and_seqs: &[(String, String)],
+) -> Result<AlignmentResult, String> {
+    if ids_and_seqs.is_empty() {
+        return Err("no sequences provided for alignment".to_string());
+    }
+    if ids_and_seqs.len() < 2 {
+        return Ok(AlignmentResult {
+            gene_id: gene_id.to_string(),
+            seq_ids: ids_and_seqs.iter().map(|(id, _)| id.clone()).collect(),
+            aligned_seqs: ids_and_seqs.iter().map(|(_, s)| s.clone()).collect(),
+        });
+    }
+
+    // Simple protein scoring; can be tuned later.
+    let mut engine = AlignmentEngine::new(AlignmentType::kNW, 2, -1, -2, -1, -2, -1);
+    let mut graph = Graph::new();
+
+    for (_, seq) in ids_and_seqs.iter() {
+        let s = seq.as_bytes();
+        let alignment = engine.align(s, &graph);
+        graph.add_alignment(&alignment, s, 1);
+    }
+
+    let msa = graph.multiple_sequence_alignment(false);
+
+    let aligned_seqs: Vec<String> = msa
+        .iter()
+        .map(|row| String::from_utf8_lossy(row).into_owned())
+        .collect();
+
+    if aligned_seqs.len() != ids_and_seqs.len() {
+        return Err(format!(
+            "spoa MSA row count mismatch: expected {} got {}",
+            ids_and_seqs.len(),
+            aligned_seqs.len()
+        ));
+    }
+
+    validate_spoa_alignment(ids_and_seqs, &aligned_seqs)
+        .map_err(|e| format!("parity check failed: {}", e))?;
+
+    Ok(AlignmentResult {
+        gene_id: gene_id.to_string(),
+        seq_ids: ids_and_seqs.iter().map(|(id, _)| id.clone()).collect(),
+        aligned_seqs,
+    })
+}
+
+fn validate_spoa_alignment(
+    ids_and_seqs: &[(String, String)],
+    aligned_seqs: &[String],
+) -> Result<(), String> {
+    if aligned_seqs.is_empty() {
+        return Err("alignment is empty".to_string());
+    }
+    let expected_len = aligned_seqs[0].len();
+    if expected_len == 0 {
+        return Err("alignment length is zero".to_string());
+    }
+    for (idx, aln) in aligned_seqs.iter().enumerate() {
+        if aln.len() != expected_len {
+            return Err(format!(
+                "row {} length mismatch: expected {} got {}",
+                idx,
+                expected_len,
+                aln.len()
+            ));
+        }
+    }
+    for ((id, seq), aln) in ids_and_seqs.iter().zip(aligned_seqs.iter()) {
+        let non_gap = aln.as_bytes().iter().filter(|&&c| c != b'-').count();
+        if non_gap != seq.len() {
+            return Err(format!(
+                "sequence {} residue count mismatch: expected {} got {}",
+                id,
+                seq.len(),
+                non_gap
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
@@ -149,7 +301,7 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
             conserved += 1;
         }
     }
-    // pairwise identity: between first and others averaged
+    // pairwise identity: between first (query) and others averaged
     let mut matches = 0usize;
     let mut compared = 0usize;
     for seq in seqs.iter().skip(1) {
@@ -166,6 +318,47 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         matches as f64 / compared as f64
     } else {
         0.0
+    };
+
+    // panel pairwise identity: average identity among the reference sequences (1..n)
+    // To keep this fast (O(N^2 * L)), we only compute if n > 2.
+    // If n=2 (query + 1 ref), panel identity is undefined/1.0, effectively same as pairwise.
+    let mut panel_matches = 0usize;
+    let mut panel_compared = 0usize;
+    if n > 2 {
+        for i in 1..n {
+            for j in (i + 1)..n {
+                let s1 = &seqs[i];
+                let s2 = &seqs[j];
+                for (&a, &b) in s1.iter().zip(s2.iter()) {
+                    if a == b && a != b'-' {
+                        panel_matches += 1;
+                    }
+                    if a != b'-' && b != b'-' {
+                        panel_compared += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let panel_pairwise_identity = if n <= 2 {
+        pairwise_identity // Fallback for single reference
+    } else if panel_compared > 0 {
+        panel_matches as f64 / panel_compared as f64
+    } else {
+        0.0
+    };
+
+    // Divergence ratio: How similar is the query compared to how similar the panel is?
+    // 1.0 = Query is as central as any panel member.
+    // < 0.5 = Query is significantly divergent/outlier.
+    let divergence_ratio = if panel_pairwise_identity <= 1.0e-6 {
+        1.0
+    } else if panel_pairwise_identity > 0.0 {
+        pairwise_identity / panel_pairwise_identity
+    } else {
+        1.0 // If panel is garbage/diverse, we can't judge the query harshly
     };
 
     // gap metrics on query
@@ -191,35 +384,59 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
     }
 
     // Start-concordance: compute first non-gap column per sequence
-    let starts: Vec<usize> = seqs
-        .iter()
-        .map(|s| s.iter().position(|&c| c != b'-').unwrap_or(0))
-        .collect();
-    let query_start = *starts.first().unwrap_or(&0);
-    let mut others: Vec<usize> = starts.iter().cloned().skip(1).collect();
-    others.sort_unstable();
-    let modal = if others.is_empty() {
-        query_start
-    } else {
-        // median as a robust proxy for consensus start
-        let mid = others.len() / 2;
-        others[mid]
-    };
-    let diff = if query_start > modal {
-        (query_start - modal) as i64
-    } else {
-        -((modal - query_start) as i64)
-    };
-    let start_concordance = (1.0 - (diff.unsigned_abs() as f64 / 30.0)).clamp(0.0, 1.0);
-    let start_class = if diff.abs() <= 3 {
-        "LikelyComplete"
-    } else if diff > 3 {
-        // query starts later -> likely N-truncated
-        "LikelyNTruncated"
-    } else {
-        // query starts earlier -> likely N-extended
-        "LikelyNExtended"
-    };
+    let mut start_concordance = 0.0;
+    let mut start_class = "InsufficientPanel".to_string();
+    let mut end_concordance = 0.0;
+    let mut end_class = "InsufficientPanel".to_string();
+    if n >= MIN_PANEL_FOR_TERMINI {
+        let starts: Vec<usize> = seqs
+            .iter()
+            .map(|s| s.iter().position(|&c| c != b'-').unwrap_or(0))
+            .collect();
+        let query_start = *starts.first().unwrap_or(&0);
+        let mut others: Vec<usize> = starts.iter().cloned().skip(1).collect();
+        others.sort_unstable();
+        let modal = if others.is_empty() {
+            query_start
+        } else {
+            let mid = others.len() / 2;
+            others[mid]
+        };
+        let diff = query_start as i64 - modal as i64;
+        start_concordance = (1.0 - (diff.unsigned_abs() as f64 / 30.0)).clamp(0.0, 1.0);
+        start_class = if diff.abs() <= 3 {
+            "LikelyComplete"
+        } else if diff > 3 {
+            "LikelyNTruncated"
+        } else {
+            "LikelyNExtended"
+        }
+        .to_string();
+
+        let ends: Vec<usize> = seqs
+            .iter()
+            .map(|s| s.iter().rposition(|&c| c != b'-').unwrap_or(0))
+            .collect();
+        let query_end = *ends.first().unwrap_or(&0);
+        let mut others_end: Vec<usize> = ends.iter().cloned().skip(1).collect();
+        others_end.sort_unstable();
+        let modal_end = if others_end.is_empty() {
+            query_end
+        } else {
+            let mid = others_end.len() / 2;
+            others_end[mid]
+        };
+        let diff_end = query_end as i64 - modal_end as i64;
+        end_concordance = (1.0 - (diff_end.unsigned_abs() as f64 / 30.0)).clamp(0.0, 1.0);
+        end_class = if diff_end.abs() <= 3 {
+            "LikelyComplete"
+        } else if diff_end < -3 {
+            "LikelyCTruncated"
+        } else {
+            "LikelyCExtended"
+        }
+        .to_string();
+    }
 
     AlignmentMetrics {
         mafft_enabled: true,
@@ -230,6 +447,8 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
             0.0
         },
         pairwise_identity,
+        panel_pairwise_identity,
+        divergence_ratio,
         sequences_aligned: n,
         query_gap_fraction: if cols > 0 {
             gap_count as f64 / cols as f64
@@ -241,13 +460,64 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         motif_mismatch_fraction: 0.0,
         start_concordance,
         start_class: start_class.to_string(),
+        end_concordance,
+        end_class,
         missing_exon_run: compute_consensus_gap_run(seqs, true),
         retained_intron_run: compute_consensus_gap_run(seqs, false),
     }
 }
 
-// If `query_gap=true`, measure the longest run where query is gap and ≥70% of others are residues.
-// If `query_gap=false`, measure the longest run where query is residue and ≥70% of others are gaps.
+/// Compute metrics for an alignment result and tag with the strategy used.
+fn metrics_from_alignment(result: &AlignmentResult, strategy: &str) -> AlignmentMetrics {
+    let seqs: Vec<Vec<u8>> = result
+        .aligned_seqs
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    let mut metrics = compute_alignment_metrics(&seqs);
+    metrics.strategy_used = strategy.to_string();
+    metrics
+}
+
+/// Run alignment according to the configured backend, falling back to MAFFT on SPOA failure.
+pub fn run_alignment_for_panel(
+    cfg: &AlignerConfig,
+    gene_id: &str,
+    ids_and_seqs: &[(String, String)],
+) -> Result<AlignmentMetrics, String> {
+    match cfg.backend {
+        AlignerBackend::Mafft => {
+            let aln = run_mafft_alignment(cfg, gene_id, ids_and_seqs)?;
+            Ok(metrics_from_alignment(&aln, "mafft"))
+        }
+        AlignerBackend::Spoa => {
+            #[cfg(test)]
+            let force_error = std::env::var("FORCE_SPOA_ERROR")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+            #[cfg(not(test))]
+            let force_error = false;
+
+            let spoa_result = if force_error {
+                Err("forced spoa error".to_string())
+            } else {
+                run_spoa_alignment(gene_id, ids_and_seqs)
+            };
+            match spoa_result {
+                Ok(aln) => Ok(metrics_from_alignment(&aln, "spoa")),
+                Err(e) => {
+                    log::warn!("SPOA failed for {}: {}; falling back to MAFFT", gene_id, e);
+                    let aln = run_mafft_alignment(cfg, gene_id, ids_and_seqs)?;
+                    Ok(metrics_from_alignment(&aln, "mafft_fallback"))
+                }
+            }
+        }
+    }
+}
+
+/// If `query_gap=true`, measure the longest run where query is gap and >=70% of others are residues.
+/// If `query_gap=false`, measure the longest run where query is residue and >=70% of others are gaps.
 fn compute_consensus_gap_run(seqs: &[Vec<u8>], query_gap: bool) -> usize {
     if seqs.len() < 2 {
         return 0;
@@ -257,12 +527,18 @@ fn compute_consensus_gap_run(seqs: &[Vec<u8>], query_gap: bool) -> usize {
     let mut best = 0usize;
     for (c, &query_char) in seqs[0].iter().enumerate() {
         let q = query_char == b'-';
-        let others_non_gap = (1..n).filter(|&r| seqs[r][c] != b'-').count();
-        let others_gap = (1..n).filter(|&r| seqs[r][c] == b'-').count();
+        let mut others_non_gap = 0usize;
+        for other in seqs.iter().skip(1) {
+            if other[c] != b'-' {
+                others_non_gap += 1;
+            }
+        }
+        let others_gap = (n - 1).saturating_sub(others_non_gap);
+        let denom = (n - 1) as f64;
         let cond = if query_gap {
-            q && (others_non_gap as f64) / (n as f64 - 1.0) >= 0.7
+            q && (others_non_gap as f64) / denom >= 0.7
         } else {
-            !q && (others_gap as f64) / (n as f64 - 1.0) >= 0.7
+            !q && (others_gap as f64) / denom >= 0.7
         };
         if cond {
             run += 1;
@@ -272,4 +548,130 @@ fn compute_consensus_gap_run(seqs: &[Vec<u8>], query_gap: bool) -> usize {
         }
     }
     best.max(run)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compute_alignment_metrics, run_alignment_for_panel, run_spoa_alignment,
+        validate_spoa_alignment, AlignerBackend, AlignerConfig,
+    };
+    use proptest::prelude::*;
+
+    #[test]
+    fn start_concordance_flags_truncation() {
+        let query: [u8; 12] = [
+            b'-', b'-', b'-', b'-', b'M', b'K', b'T', b'A', b'A', b'-', b'-', b'-',
+        ];
+        let ref_row: [u8; 12] = [
+            b'M', b'K', b'T', b'A', b'A', b'-', b'-', b'-', b'-', b'-', b'-', b'-',
+        ];
+        let mut seqs = vec![query.to_vec()];
+        for _ in 0..4 {
+            seqs.push(ref_row.to_vec());
+        }
+        let metrics = compute_alignment_metrics(&seqs);
+        assert_eq!(metrics.start_class, "LikelyNTruncated");
+        assert!(metrics.start_concordance < 1.0);
+    }
+
+    #[test]
+    fn end_concordance_flags_extension() {
+        let query: [u8; 12] = [
+            b'M', b'K', b'T', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A',
+        ];
+        let ref_row: [u8; 12] = [
+            b'M', b'K', b'T', b'A', b'A', b'-', b'-', b'-', b'-', b'-', b'-', b'-',
+        ];
+        let mut seqs = vec![query.to_vec()];
+        for _ in 0..4 {
+            seqs.push(ref_row.to_vec());
+        }
+        let metrics = compute_alignment_metrics(&seqs);
+        assert_eq!(metrics.end_class, "LikelyCExtended");
+        assert!(metrics.end_concordance < 1.0);
+    }
+
+    #[test]
+    fn spoa_round_trip_rows_and_lengths() {
+        let ids_and_seqs = vec![
+            ("query".to_string(), "MKTAA".to_string()),
+            ("hit1".to_string(), "MKAAA".to_string()),
+            ("hit2".to_string(), "MKTAG".to_string()),
+        ];
+        let result = run_spoa_alignment("gene1", &ids_and_seqs).expect("spoa succeeds");
+        assert_eq!(result.seq_ids.len(), ids_and_seqs.len());
+        assert_eq!(result.aligned_seqs.len(), ids_and_seqs.len());
+        let lens: Vec<usize> = result.aligned_seqs.iter().map(|s| s.len()).collect();
+        assert!(lens.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    #[test]
+    fn spoa_falls_back_to_mafft_with_empty_bin_in_tests() {
+        std::env::set_var("FORCE_SPOA_ERROR", "1");
+        let cfg = AlignerConfig {
+            backend: AlignerBackend::Spoa,
+            mafft_bin: String::new(),
+            mafft_fast: false,
+            mafft_threads_per_job: 1,
+            mafft_max_jobs: 1,
+        };
+        let ids_and_seqs = vec![
+            ("query".to_string(), "ACDE".to_string()),
+            ("hit1".to_string(), "ACDE".to_string()),
+        ];
+        let metrics = run_alignment_for_panel(&cfg, "gene1", &ids_and_seqs)
+            .expect("fallback alignment succeeds");
+        assert!(metrics.mafft_enabled);
+        assert_eq!(metrics.strategy_used, "mafft_fallback");
+        std::env::remove_var("FORCE_SPOA_ERROR");
+    }
+
+    #[test]
+    fn spoa_parity_check_flags_residue_mismatch() {
+        let ids_and_seqs = vec![
+            ("query".to_string(), "ACDE".to_string()),
+            ("hit1".to_string(), "ACDE".to_string()),
+        ];
+        let aligned = vec!["ACDE".to_string(), "ACD-".to_string()];
+        let err = validate_spoa_alignment(&ids_and_seqs, &aligned)
+            .expect_err("should detect residue mismatch");
+        assert!(err.contains("residue count mismatch"));
+    }
+
+    proptest! {
+        #[test]
+        fn alignment_metrics_invariants(
+            len in 1usize..60,
+            nrefs in 1usize..4,
+            seqs in prop::collection::vec(
+                prop::collection::vec(prop::sample::select(vec![b'A', b'C', b'G', b'T', b'-']), 1..60),
+                2..6
+            ),
+        ) {
+            let total = nrefs + 1;
+            let mut aligned: Vec<Vec<u8>> = Vec::with_capacity(total);
+            for i in 0..total {
+                let mut s = seqs[i % seqs.len()].clone();
+                s.truncate(len);
+                if s.len() < len {
+                    s.resize(len, b'A');
+                }
+                aligned.push(s);
+            }
+            let metrics = compute_alignment_metrics(&aligned);
+            assert!(metrics.start_concordance >= 0.0 && metrics.start_concordance <= 1.0);
+            assert!(metrics.end_concordance >= 0.0 && metrics.end_concordance <= 1.0);
+            assert!(metrics.divergence_ratio.is_finite());
+            let query = &aligned[0];
+            let gap_count = query.iter().filter(|&&c| c == b'-').count();
+            if gap_count == 0 {
+                assert_eq!(metrics.gap_run_count, 0);
+                assert_eq!(metrics.max_gap_run, 0);
+            } else {
+                assert!(metrics.gap_run_count <= gap_count);
+                assert!(metrics.max_gap_run <= gap_count);
+            }
+        }
+    }
 }

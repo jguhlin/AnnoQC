@@ -14,7 +14,7 @@ pub fn explain_gene(out_dir: &str, gene_id: &str) -> Result<(), Box<dyn Error>> 
     let path = Path::new(out_dir).join("qc_report.jsonl");
     let file =
         File::open(&path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut line = String::new();
     loop {
         line.clear();

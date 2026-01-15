@@ -1,6 +1,9 @@
 use crate::diamond::DiamondHitStats;
 use crate::genomic::GenomicMetrics;
+use crate::hmmer::HmmscanSummary;
+use crate::mafft::AlignmentMetrics;
 use crate::metrics::IntrinsicMetrics;
+use crate::structvar::StructVar;
 use crate::taxonomy::TaxonomyEvidence;
 
 pub fn compute_homology_score(s: Option<&DiamondHitStats>) -> f64 {
@@ -48,6 +51,23 @@ pub fn compute_subject_cov_penalty(s: Option<&DiamondHitStats>) -> f64 {
     1.0 - compute_subject_cov_score(s)
 }
 
+/// Computes a domain-strength score from the best (lowest) hmmscan e-value.
+///
+/// Returns a score in [0.0, 1.0]. Missing or hitless hmmscan results yield 0.0.
+pub fn compute_domains_strength_score(summary: Option<&HmmscanSummary>) -> f64 {
+    let Some(s) = summary else {
+        return 0.0;
+    };
+    if s.hits_count == 0 {
+        return 0.0;
+    }
+    let Some(ev) = s.top_evalue else {
+        return 0.0;
+    };
+    let le = if ev > 0.0 { -ev.log10() } else { 100.0 };
+    (le / 20.0).clamp(0.0, 1.0)
+}
+
 pub fn compute_divergence_score(am: Option<&crate::mafft::AlignmentMetrics>) -> f64 {
     if let Some(am) = am {
         // divergence_ratio = query_id / panel_id.
@@ -64,6 +84,55 @@ pub fn compute_divergence_score(am: Option<&crate::mafft::AlignmentMetrics>) -> 
         }
     } else {
         0.0
+    }
+}
+
+/// Computes a conserved-regions / alignment-integrity score from alignment metrics.
+///
+/// This is intended to capture "internal" alignment quality (conserved core, gaps, large runs),
+/// distinct from endpoints (termini) and divergence.
+///
+/// Returns a score in [0.0, 1.0]. Treats missing alignment metrics as 0.0.
+pub fn compute_conserved_regions_score(am: Option<&AlignmentMetrics>) -> f64 {
+    let Some(am) = am else {
+        return 0.0;
+    };
+
+    let conserved = am.conserved_fraction.clamp(0.0, 1.0);
+
+    // Penalize heavy gappiness in the query row. This is a simple, tunable mapping.
+    // By default: gaps >= 20% => 0.0 contribution from this term.
+    let gap_pen = (1.0 - (am.query_gap_fraction / 0.20).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+
+    // Penalize long contiguous gap runs.
+    let run_pen = (-(am.max_gap_run as f64 / 25.0)).exp().clamp(0.0, 1.0);
+
+    // Mild penalties for strong "missing exon" / "retained intron" signatures.
+    let missing_pen = (-(am.missing_exon_run as f64 / 20.0)).exp().clamp(0.0, 1.0);
+    let intron_pen = (-(am.retained_intron_run as f64 / 20.0))
+        .exp()
+        .clamp(0.0, 1.0);
+
+    (0.55 * conserved + 0.20 * gap_pen + 0.15 * run_pen + 0.05 * missing_pen + 0.05 * intron_pen)
+        .clamp(0.0, 1.0)
+}
+
+/// Computes a multiplicative penalty factor for structural-variation / "different genes" signals.
+///
+/// This is derived from DIAMOND HSP layouts and is meant to be a *major detriment* when a fusion
+/// or split is suspected. The factor is applied as `score *= structvar_multiplier` before
+/// calibration.
+///
+/// Returns a value in [0.0, 1.0]. Missing structvar evidence defaults to 1.0 (no penalty).
+pub fn compute_structvar_multiplier(sv: Option<&StructVar>) -> f64 {
+    let Some(sv) = sv else {
+        return 1.0;
+    };
+    match sv.classification.as_str() {
+        "FusionPossible" => 0.05,
+        "SplitPossible" => 0.20,
+        "InternalDuplicationPossible" => 0.70,
+        _ => 1.0,
     }
 }
 
@@ -108,8 +177,14 @@ pub fn compute_genomic_score_with_cfg(
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_genomic_score_with_cfg, compute_taxonomy_score};
+    use super::{
+        compute_conserved_regions_score, compute_domains_strength_score,
+        compute_genomic_score_with_cfg, compute_structvar_multiplier, compute_taxonomy_score,
+    };
     use crate::genomic::GenomicMetrics;
+    use crate::hmmer::HmmscanSummary;
+    use crate::mafft::AlignmentMetrics;
+    use crate::structvar::StructVar;
     use crate::taxonomy::TaxonomyEvidence;
 
     #[test]
@@ -134,5 +209,61 @@ mod tests {
         assert_eq!(compute_taxonomy_score(Some(&ev)), 0.0);
         ev.congruence_score = 1.2;
         assert_eq!(compute_taxonomy_score(Some(&ev)), 1.0);
+    }
+
+    #[test]
+    fn conserved_regions_score_behaves_reasonably() {
+        let mut m = AlignmentMetrics::default();
+        m.conserved_fraction = 0.9;
+        m.query_gap_fraction = 0.01;
+        m.max_gap_run = 1;
+        m.missing_exon_run = 0;
+        m.retained_intron_run = 0;
+        let good = compute_conserved_regions_score(Some(&m));
+        assert!(good > 0.7);
+
+        m.query_gap_fraction = 0.4;
+        let gappy = compute_conserved_regions_score(Some(&m));
+        assert!(gappy < good);
+
+        m.query_gap_fraction = 0.01;
+        m.max_gap_run = 80;
+        let long_run = compute_conserved_regions_score(Some(&m));
+        assert!(long_run < good);
+
+        m.max_gap_run = 1;
+        m.missing_exon_run = 50;
+        let missing_exon = compute_conserved_regions_score(Some(&m));
+        assert!(missing_exon < good);
+    }
+
+    #[test]
+    fn structvar_multiplier_matches_classes() {
+        let mut sv = StructVar::default();
+        sv.classification = "None".into();
+        assert_eq!(compute_structvar_multiplier(Some(&sv)), 1.0);
+        sv.classification = "InternalDuplicationPossible".into();
+        assert_eq!(compute_structvar_multiplier(Some(&sv)), 0.70);
+        sv.classification = "SplitPossible".into();
+        assert_eq!(compute_structvar_multiplier(Some(&sv)), 0.20);
+        sv.classification = "FusionPossible".into();
+        assert_eq!(compute_structvar_multiplier(Some(&sv)), 0.05);
+    }
+
+    #[test]
+    fn domains_strength_score_maps_evalue() {
+        let mut s = HmmscanSummary::default();
+        s.hits_count = 0;
+        s.top_evalue = None;
+        assert_eq!(compute_domains_strength_score(Some(&s)), 0.0);
+
+        s.hits_count = 1;
+        s.top_evalue = Some(1e-40);
+        let strong = compute_domains_strength_score(Some(&s));
+        assert!(strong > 0.9);
+
+        s.top_evalue = Some(1e-2);
+        let weak = compute_domains_strength_score(Some(&s));
+        assert!(weak < strong);
     }
 }

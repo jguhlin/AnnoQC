@@ -8,8 +8,9 @@ OUT_DIR=${1:-"${ROOT_DIR}/share"}
 UNIPROT_DIR="${OUT_DIR}/uniprot"
 TAXONOMY_DIR="${OUT_DIR}/taxonomy"
 PFAM_DIR="${OUT_DIR}/pfam"
+REFPROT_DIR="${OUT_DIR}/uniprot/reference_proteomes"
 
-mkdir -p "${UNIPROT_DIR}" "${TAXONOMY_DIR}" "${PFAM_DIR}"
+mkdir -p "${UNIPROT_DIR}" "${TAXONOMY_DIR}" "${PFAM_DIR}" "${REFPROT_DIR}"
 
 curl_fetch() {
   local url="$1"
@@ -76,3 +77,9 @@ else
 fi
 
 echo "[done] Reference data ready under ${OUT_DIR}"
+
+# --- UniProt Reference Proteomes README (mapping proteome IDs → taxa) ---
+# Downloaded last so previous steps aren't affected. Skips if present.
+REFPROT_README_URL="https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/reference_proteomes/README"
+REFPROT_README_PATH="${REFPROT_DIR}/README"
+curl_fetch "${REFPROT_README_URL}" "${REFPROT_README_PATH}"

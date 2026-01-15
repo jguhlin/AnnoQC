@@ -410,6 +410,31 @@ impl TaxonomyResolver {
         self.nodes.get(&taxid).map(|n| n.parent)
     }
 
+    pub fn name_of(&self, taxid: u32) -> Option<&str> {
+        self.scientific_names.get(&taxid).map(|s| s.as_str())
+    }
+
+    pub fn ancestor_at_rank(&self, taxid: u32, target_rank: &str) -> Option<u32> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let mut current = taxid;
+        let mut seen = HashSet::new();
+        while let Some(node) = self.nodes.get(&current) {
+            if !seen.insert(current) {
+                break;
+            }
+            if node.rank == target_rank {
+                return Some(current);
+            }
+            if node.parent == current {
+                break;
+            }
+            current = node.parent;
+        }
+        None
+    }
+
     // Public helper to expose lineage for external selection code (name/ids).
     pub fn reconstruct_lineage_public(
         &self,

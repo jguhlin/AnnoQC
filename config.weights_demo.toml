@@ -3,12 +3,23 @@ homology = 0.5
 intrinsic = 0.3
 taxonomy = 0.0
 domains = 0.1
+domains_strength = 0.05
 length = 0.1
 orphan = 0.0
+subject_cov = 0.0
+termini = 0.0
+divergence = 0.0
+conserved_regions = 0.1
+genomic = 0.0
+
+[calibration]
+mode = "Off"
 
 [consensus]
 min_hits = 5
 max_panel = 15
+diversity_rank_index = 3
+diversity_rank_cap = 3
 filt_qcov = 0.70
 filt_scov = 0.50
 filt_evalue = 1e-5

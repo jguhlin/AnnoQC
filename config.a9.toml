@@ -1,0 +1,89 @@
+# A9 protein set config (end-to-end run)
+
+fasta = "a9.faa"
+db = "uniprot_sprot.dmnd"
+threads = 16
+approx_id = 50
+member_cover = 80
+out = "results_a9"
+mode = "Auto"
+top = 5
+diamond_bin = "diamond"
+hmmscan_bin = "hmmscan"
+mafft_bin = "mafft"
+aligner = "spoa"
+reference_fasta = "uniprot_sprot.fasta.gz"
+alignment_top_hits = 5
+alignment_strategy = "Auto"
+conserved_identity_min = 0.8
+alignment_missing_exon = 30
+alignment_retained_intron = 30
+mafft_threads_per_job = 4
+mafft_max_jobs = 2
+pfam_db = "share/pfam/Pfam-A.hmm"
+pfam_clans = "share/pfam/Pfam-A.clans.tsv"
+
+[scoring.weights]
+homology = 0.8
+intrinsic = 0.0
+taxonomy = 0.0
+domains = 0.15
+domains_strength = 0.05
+length = 0.05
+orphan = 0.0
+subject_cov = 0.0
+termini = 0.0
+divergence = 0.0
+conserved_regions = 0.0
+genomic = 0.0
+
+[scoring.thresholds]
+high = 0.8
+medium = 0.75
+
+[scoring.caps]
+# structvar_fusion_max = 0.15
+# structvar_split_max = 0.35
+# structvar_dup_max = 0.90
+
+[scoring.homology]
+qcov_min = 0.75
+scov_min = 0.75
+density_min = 1.0
+evalue_max = 1e-5
+
+[scoring.intrinsic]
+ambiguous_max = 0.05
+max_homopolymer = 10
+
+[scoring.genomic]
+min_canonical = 0.6
+max_noncanonical = 0.3
+max_weird = 0.2
+
+[taxonomy]
+enabled = false
+min_support = 0.75
+top_hits = 20
+min_consensus = 3
+expected_domain = "Eukaryota"
+
+[consensus]
+min_hits = 5
+max_panel = 20
+diversity_rank_index = 3
+diversity_rank_cap = 3
+filt_qcov = 0.70
+filt_scov = 0.50
+filt_evalue = 1e-5
+filt_pident = 25.0
+len_ratio_tolerance = 0.30
+redundancy_pident = 90.0
+max_high_identity = 3
+
+[hmmer]
+top_n = 5
+orphan_analysis = true
+
+[diamond]
+auto_threshold = 200000

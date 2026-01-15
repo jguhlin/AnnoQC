@@ -245,10 +245,8 @@ pub fn parse_domtblout(bytes: &[u8]) -> Result<HmmscanSummary, String> {
         let accession = accession
             .ok_or_else(|| format!("domtblout line {} missing accession", line_no))?
             .to_string();
-        let hmm_len =
-            parse_domtblout_usize(hmm_len, "hmm_len", line_no)?;
-        let query_len =
-            parse_domtblout_usize(query_len, "query_len", line_no)?;
+        let hmm_len = parse_domtblout_usize(hmm_len, "hmm_len", line_no)?;
+        let query_len = parse_domtblout_usize(query_len, "query_len", line_no)?;
         let i_eval = parse_domtblout_f64(i_eval, "i_eval", line_no)?;
         let score = parse_domtblout_f64(score, "score", line_no)?;
         let bias = parse_domtblout_f64(bias, "bias", line_no)?;
@@ -288,11 +286,7 @@ pub fn parse_domtblout(bytes: &[u8]) -> Result<HmmscanSummary, String> {
     })
 }
 
-fn parse_domtblout_usize(
-    field: Option<&str>,
-    name: &str,
-    line_no: usize,
-) -> Result<usize, String> {
+fn parse_domtblout_usize(field: Option<&str>, name: &str, line_no: usize) -> Result<usize, String> {
     let value = field.ok_or_else(|| format!("domtblout line {} missing {}", line_no, name))?;
     value
         .parse::<usize>()

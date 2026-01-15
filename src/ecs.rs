@@ -484,6 +484,7 @@ impl AlignmentDiag {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn alignment_schedule_system(
     mut commands: Commands,
     config: Res<AlignmentConfig>,
@@ -581,6 +582,7 @@ fn alignment_schedule_system(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn alignment_collect_system(
     mut commands: Commands,
     mut inflight: ResMut<AlignmentInflight>,
@@ -1014,22 +1016,81 @@ struct RenderParquetBuffer {
     metadata: Option<Vec<KeyValue>>,
 }
 
-#[derive(Resource, Default, Clone)]
+#[derive(Resource, Clone)]
 struct NotationStats {
     h_count: usize,
     h_complete: usize,
     h_fragmented: usize,
+    m_count: usize,
     l_count: usize,
     l_novel: usize,
     l_artifact: usize,
     x_count: usize,
     total: usize,
+    taxonomy_available: bool,
+    taxonomy_status_counts: HashMap<String, usize>,
+    taxonomy_considered: usize,
+    taxonomy_domain_counts: HashMap<String, usize>,
+    taxonomy_genus_counts: HashMap<String, usize>,
+    taxonomy_expected_domain: Option<String>,
+    taxonomy_warn_non_target_min_frac: f64,
+    taxonomy_warn_non_target_min_hits: usize,
+    taxonomy_warn_non_target_strong_frac: f64,
+    taxonomy_warn_non_target_strong_hits: usize,
+    taxonomy_warn_genus_min_frac: f64,
+    taxonomy_warn_genus_min_hits: usize,
+    taxonomy_low_coverage_frac: f64,
 }
 
+impl Default for NotationStats {
+    fn default() -> Self {
+        Self {
+            h_count: 0,
+            h_complete: 0,
+            h_fragmented: 0,
+            m_count: 0,
+            l_count: 0,
+            l_novel: 0,
+            l_artifact: 0,
+            x_count: 0,
+            total: 0,
+            taxonomy_available: true,
+            taxonomy_status_counts: HashMap::new(),
+            taxonomy_considered: 0,
+            taxonomy_domain_counts: HashMap::new(),
+            taxonomy_genus_counts: HashMap::new(),
+            taxonomy_expected_domain: None,
+            taxonomy_warn_non_target_min_frac: 0.05,
+            taxonomy_warn_non_target_min_hits: 200,
+            taxonomy_warn_non_target_strong_frac: 0.10,
+            taxonomy_warn_non_target_strong_hits: 500,
+            taxonomy_warn_genus_min_frac: 0.15,
+            taxonomy_warn_genus_min_hits: 300,
+            taxonomy_low_coverage_frac: 0.05,
+        }
+    }
+}
+
+impl NotationStats {
+    fn from_ctx(ctx: &RenderContext) -> Self {
+        let mut stats = Self::default();
+        stats.taxonomy_expected_domain = ctx.taxonomy_expected_domain.clone();
+        stats.taxonomy_warn_non_target_min_frac = ctx.taxonomy_warn_non_target_min_frac;
+        stats.taxonomy_warn_non_target_min_hits = ctx.taxonomy_warn_non_target_min_hits;
+        stats.taxonomy_warn_non_target_strong_frac = ctx.taxonomy_warn_non_target_strong_frac;
+        stats.taxonomy_warn_non_target_strong_hits = ctx.taxonomy_warn_non_target_strong_hits;
+        stats.taxonomy_warn_genus_min_frac = ctx.taxonomy_warn_genus_min_frac;
+        stats.taxonomy_warn_genus_min_hits = ctx.taxonomy_warn_genus_min_hits;
+        stats.taxonomy_low_coverage_frac = ctx.taxonomy_low_coverage_frac;
+        stats
+    }
+}
 #[derive(Debug, Clone)]
 pub struct RenderSummary {
     pub total: usize,
     pub high: usize,
+    #[allow(dead_code)]
+    pub medium: usize,
     pub low: usize,
     pub x: usize,
     pub high_complete: usize,
@@ -1043,6 +1104,7 @@ impl RenderSummary {
         Self {
             total: stats.total,
             high: stats.h_count,
+            medium: stats.m_count,
             low: stats.l_count,
             x: stats.x_count,
             high_complete: stats.h_complete,
@@ -1053,15 +1115,33 @@ impl RenderSummary {
     }
 }
 
-const CSV_HEADER_VERBOSE: &str = "gene_id,hits_count,panel_swissprot,panel_refprot,panel_cluster,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,subject_cov_score,subject_cov_penalty,fusion_split,final_score,classification,homology_score,intrinsic_score,genomic_score,taxonomy_score,domains_score,domains_arch_score,orphan_domain_score,length_score,length_ratio,length_class,termini_score,divergence_score,mafft_enabled,conserved_fraction,pairwise_identity,panel_pairwise_identity,divergence_ratio,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,missing_exon_run,retained_intron_run,start_concordance,start_class,end_concordance,end_class,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_contamination,taxonomy_support,taxonomy_considered,taxonomy_support_frac,consensus_taxon,taxonomy_consensus_rank,taxonomy_status,plugin_penalty,plugin_names,plugin_scores,plugin_penalties,plugin_metadata,warnings";
+const CSV_HEADER_VERBOSE: &str = "gene_id,hits_count,panel_swissprot,panel_refprot,panel_cluster,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,subject_cov_score,subject_cov_penalty,fusion_split,structvar_multiplier,final_score,classification,homology_score,intrinsic_score,genomic_score,taxonomy_score,domains_score,domains_arch_score,orphan_domain_score,length_score,length_ratio,length_class,length_expected_min,length_expected_max,length_in_expected_range,length_panel_n,conserved_regions_score,termini_score,divergence_score,mafft_enabled,conserved_fraction,pairwise_identity,panel_pairwise_identity,divergence_ratio,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,missing_exon_run,retained_intron_run,start_concordance,start_class,end_concordance,end_class,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_contamination,taxonomy_support,taxonomy_considered,taxonomy_support_frac,consensus_taxon,taxonomy_consensus_rank,taxonomy_status,plugin_penalty,plugin_names,plugin_scores,plugin_penalties,plugin_metadata,warnings";
 
-const CSV_HEADER_STANDARD: &str = "gene_id,hits_count,panel_swissprot,panel_refprot,panel_cluster,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,subject_cov_score,subject_cov_penalty,fusion_split,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,panel_pairwise_identity,divergence_ratio,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,orphan_domain_score,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,genomic_score,taxonomy_score,taxonomy_contamination,taxonomy_support,taxonomy_considered,taxonomy_support_frac,consensus_taxon,taxonomy_consensus_rank,taxonomy_status,plugin_penalty,plugin_names,plugin_scores,plugin_penalties,plugin_metadata,warnings";
+const CSV_HEADER_STANDARD: &str = "gene_id,hits_count,panel_swissprot,panel_refprot,panel_cluster,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,subject_cov_score,subject_cov_penalty,fusion_split,structvar_multiplier,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,panel_pairwise_identity,divergence_ratio,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,orphan_domain_score,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,genomic_score,taxonomy_score,taxonomy_contamination,taxonomy_support,taxonomy_considered,taxonomy_support_frac,consensus_taxon,taxonomy_consensus_rank,taxonomy_status,plugin_penalty,plugin_names,plugin_scores,plugin_penalties,plugin_metadata,warnings";
 
 fn classification_base(label: &str) -> &str {
-    label
-        .split(|c: char| c == ' ' || c == '(' || c == '[')
-        .next()
-        .unwrap_or(label)
+    label.split([' ', '(', '[']).next().unwrap_or(label)
+}
+
+fn top_counts(counts: &HashMap<String, usize>, top: usize) -> Vec<(String, usize)> {
+    let mut entries: Vec<(String, usize)> = counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(top);
+    entries
+}
+
+fn format_top_counts(counts: &HashMap<String, usize>, denom: usize, top: usize) -> String {
+    if denom == 0 || counts.is_empty() {
+        return "NA".to_string();
+    }
+    top_counts(counts, top)
+        .into_iter()
+        .map(|(label, count)| {
+            let pct = count as f64 / denom as f64 * 100.0;
+            format!("{} {:.1}%", label, pct)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn sanitize_meta_value(value: &str) -> String {
@@ -1337,7 +1417,7 @@ pub fn run_render_pipeline(
             enabled: parquet_enabled,
             metadata: parquet_meta,
         })
-        .insert_resource(NotationStats::default())
+        .insert_resource(NotationStats::from_ctx(&ctx))
         .add_systems(
             Update,
             (
@@ -1376,6 +1456,7 @@ pub fn run_render_pipeline(
     let mut render_summary = RenderSummary {
         total: 0,
         high: 0,
+        medium: 0,
         low: 0,
         x: 0,
         high_complete: 0,
@@ -1389,18 +1470,130 @@ pub fn run_render_pipeline(
         render_summary = RenderSummary::from_stats(&stats);
         if stats.total > 0 {
             let t = stats.total as f64;
-            let h_pct = (stats.h_count as f64 / t * 100.0).round();
-            let c_pct = (stats.h_complete as f64 / t * 100.0).round();
-            let f_pct = (stats.h_fragmented as f64 / t * 100.0).round();
-            let l_pct = (stats.l_count as f64 / t * 100.0).round();
-            let n_pct = (stats.l_novel as f64 / t * 100.0).round();
-            let a_pct = (stats.l_artifact as f64 / t * 100.0).round();
-            let x_pct = (stats.x_count as f64 / t * 100.0).round();
+            let h_pct = stats.h_count as f64 / t * 100.0;
+            let m_pct = stats.m_count as f64 / t * 100.0;
+            let c_pct = stats.h_complete as f64 / t * 100.0;
+            let f_pct = stats.h_fragmented as f64 / t * 100.0;
+            let l_pct = stats.l_count as f64 / t * 100.0;
+            let n_pct = stats.l_novel as f64 / t * 100.0;
+            let a_pct = stats.l_artifact as f64 / t * 100.0;
+            let x_pct = stats.x_count as f64 / t * 100.0;
 
             println!("----------------------------------------------------------------");
-            println!("AnnoQC Summary: H:{:.0}% [C:{:.0}%, F:{:.0}%], L:{:.0}% [N:{:.0}%, A:{:.0}%], X:{:.0}%", 
-                h_pct, c_pct, f_pct, l_pct, n_pct, a_pct, x_pct);
-            println!("Configuration: {}", ctx.features_string);
+            if stats.taxonomy_available {
+                println!(
+                    "AnnoQC Summary (n={}): H:{:.2}% [C:{:.2}%, F:{:.2}%], M:{:.2}%, L:{:.2}% [N:{:.2}%, A:{:.2}%], X:{:.2}%",
+                    stats.total, h_pct, c_pct, f_pct, m_pct, l_pct, n_pct, a_pct, x_pct
+                );
+            } else {
+                println!(
+                    "AnnoQC Summary (n={}): H:{:.2}% [C:{:.2}%, F:{:.2}%], M:{:.2}%, L:{:.2}% [N:{:.2}%, A:{:.2}%], X:NA (taxonomy unavailable)",
+                    stats.total, h_pct, c_pct, f_pct, m_pct, l_pct, n_pct, a_pct
+                );
+            }
+            println!(
+                "Configuration ({} v{}): {}",
+                TOOL_NAME, TOOL_VERSION, ctx.features_string
+            );
+            if stats.taxonomy_available {
+                let considered = stats.taxonomy_considered;
+                let coverage_pct = if stats.total > 0 {
+                    considered as f64 / stats.total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                let consensus = *stats.taxonomy_status_counts.get("Consensus").unwrap_or(&0);
+                let borrowed = *stats.taxonomy_status_counts.get("Borrowed").unwrap_or(&0);
+                let coarse = *stats
+                    .taxonomy_status_counts
+                    .get("CoarseConsensus")
+                    .unwrap_or(&0);
+                let nohits = *stats.taxonomy_status_counts.get("NoHits").unwrap_or(&0);
+                let insufficient = *stats
+                    .taxonomy_status_counts
+                    .get("InsufficientHits")
+                    .unwrap_or(&0);
+                let mut status_parts = vec![
+                    format!("Consensus {}", consensus),
+                    format!("Borrowed {}", borrowed),
+                    format!("NoHits {}", nohits),
+                ];
+                if insufficient > 0 {
+                    status_parts.push(format!("Insufficient {}", insufficient));
+                }
+                if coarse > 0 {
+                    status_parts.push(format!("Coarse {}", coarse));
+                }
+                let domain_summary =
+                    format_top_counts(&stats.taxonomy_domain_counts, considered, 3);
+                let genus_summary = format_top_counts(&stats.taxonomy_genus_counts, considered, 3);
+                println!(
+                    "Taxonomy (context): hits {}/{} ({:.2}%) | Status: {} | Domain: {} | Top genera: {}",
+                    considered,
+                    stats.total,
+                    coverage_pct,
+                    status_parts.join(", "),
+                    domain_summary,
+                    genus_summary
+                );
+                let mut notes = Vec::new();
+                if considered > 0
+                    && (considered as f64 / stats.total.max(1) as f64)
+                        < stats.taxonomy_low_coverage_frac
+                {
+                    notes.push(format!("coverage low ({:.1}% hits)", coverage_pct));
+                }
+                if let Some(expected) = stats.taxonomy_expected_domain.as_ref() {
+                    let mut non_target_hits = 0usize;
+                    for (domain, count) in &stats.taxonomy_domain_counts {
+                        if domain != expected && domain != "Unknown" {
+                            non_target_hits += *count;
+                        }
+                    }
+                    if considered > 0 {
+                        let non_target_frac = non_target_hits as f64 / considered as f64;
+                        if non_target_hits >= stats.taxonomy_warn_non_target_strong_hits
+                            && non_target_frac >= stats.taxonomy_warn_non_target_strong_frac
+                        {
+                            notes.push(format!(
+                                "non-target domain high ({:.1}% / {} hits)",
+                                non_target_frac * 100.0,
+                                non_target_hits
+                            ));
+                        } else if non_target_hits >= stats.taxonomy_warn_non_target_min_hits
+                            && non_target_frac >= stats.taxonomy_warn_non_target_min_frac
+                        {
+                            notes.push(format!(
+                                "non-target domain elevated ({:.1}% / {} hits)",
+                                non_target_frac * 100.0,
+                                non_target_hits
+                            ));
+                        }
+                    }
+                }
+                if considered > 0 && !stats.taxonomy_genus_counts.is_empty() {
+                    if let Some((genus, count)) =
+                        top_counts(&stats.taxonomy_genus_counts, 1).first()
+                    {
+                        let frac = *count as f64 / considered as f64;
+                        if *count >= stats.taxonomy_warn_genus_min_hits
+                            && frac >= stats.taxonomy_warn_genus_min_frac
+                        {
+                            notes.push(format!(
+                                "dominant genus {} ({:.1}% / {} hits)",
+                                genus,
+                                frac * 100.0,
+                                count
+                            ));
+                        }
+                    }
+                }
+                if !notes.is_empty() {
+                    println!("Taxonomy note: {}", notes.join("; "));
+                }
+            } else {
+                println!("Taxonomy (context): unavailable");
+            }
             println!("----------------------------------------------------------------");
         }
     }
@@ -1508,6 +1701,13 @@ fn cards_to_dataframe(cards: &[ScoreCard]) -> PolarsResult<DataFrame> {
         Series::new(
             "divergence_score",
             cards.iter().map(|c| c.divergence_score).collect::<Vec<_>>(),
+        ),
+        Series::new(
+            "conserved_regions_score",
+            cards
+                .iter()
+                .map(|c| c.conserved_regions_score)
+                .collect::<Vec<_>>(),
         ),
         Series::new(
             "length_score",
@@ -1718,27 +1918,72 @@ fn render_flush_system(
         }
         if let Some(card) = record.card {
             stats.total += 1;
-            if classification_base(&card.classification) == "High" {
-                stats.h_count += 1;
-                let len_ok = card.length_class == "InRange" || card.length_class.is_empty();
-                let orphan_ok = card.orphan_status == "None" || card.orphan_status.is_empty();
-                if len_ok && orphan_ok {
-                    stats.h_complete += 1;
-                } else {
-                    stats.h_fragmented += 1;
+            if card.taxonomy_status == "disabled" || card.taxonomy_status == "NoResolver" {
+                stats.taxonomy_available = false;
+            }
+            if !card.taxonomy_status.is_empty() {
+                *stats
+                    .taxonomy_status_counts
+                    .entry(card.taxonomy_status.clone())
+                    .or_insert(0) += 1;
+            }
+            let base = classification_base(&card.classification);
+            match base {
+                "High" => {
+                    stats.h_count += 1;
+                    let len_ok = card.length_class == "InRange" || card.length_class.is_empty();
+                    let orphan_ok = card.orphan_status == "None" || card.orphan_status.is_empty();
+                    if len_ok && orphan_ok {
+                        stats.h_complete += 1;
+                    } else {
+                        stats.h_fragmented += 1;
+                    }
                 }
-            } else {
-                stats.l_count += 1;
-                if card.intrinsic_score >= 0.5 {
-                    stats.l_novel += 1;
-                } else {
-                    stats.l_artifact += 1;
+                "Medium" => {
+                    stats.m_count += 1;
+                }
+                "Low" => {
+                    stats.l_count += 1;
+                    if card.intrinsic_score >= 0.5 {
+                        stats.l_novel += 1;
+                    } else {
+                        stats.l_artifact += 1;
+                    }
+                }
+                "NoData" => {
+                    stats.x_count += 1;
+                }
+                _ => {
+                    stats.l_count += 1;
+                    if card.intrinsic_score >= 0.5 {
+                        stats.l_novel += 1;
+                    } else {
+                        stats.l_artifact += 1;
+                    }
                 }
             }
             // Simple X heuristic for now: Excluded if taxonomy contamination is very high (>0.9)
             if let Some(contam) = card.taxonomy_contamination {
                 if contam > 0.9 {
                     stats.x_count += 1;
+                }
+            }
+            if matches!(
+                card.taxonomy_status.as_str(),
+                "Consensus" | "Borrowed" | "CoarseConsensus"
+            ) {
+                stats.taxonomy_considered += 1;
+                if !card.taxonomy_domain.is_empty() {
+                    *stats
+                        .taxonomy_domain_counts
+                        .entry(card.taxonomy_domain.clone())
+                        .or_insert(0) += 1;
+                }
+                if !card.taxonomy_genus.is_empty() {
+                    *stats
+                        .taxonomy_genus_counts
+                        .entry(card.taxonomy_genus.clone())
+                        .or_insert(0) += 1;
                 }
             }
             if parquet_buffer.enabled {

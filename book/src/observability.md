@@ -14,5 +14,10 @@ Analyze emits structured progress and a compact metrics sidecar to help monitor 
   - Schema: `{ "schema_version": "1.0", "steps": [{"name":"ecs","seconds":1.23}, ...], "totals": { ... } }`
   - Totals include: `total_genes`, `mafft_alignments`, `hmmer_genes`, `hmmer_hits_total`, `diamond_mode`.
 
-Text mode uses simple `step_start:` / `step_finish:` log lines; chunk lines are suppressed.
+- Sidecar: `run_summary.json`
+  - High-level rollup: counts (H/L/X, complete/fragmented), throughput, feature flags, and timing summary.
 
+- Sidecar: `slowest_genes.json`
+  - Per-stage top 50 slowest genes for alignment and hmmscan, useful for tuning panels and thread caps.
+
+Text mode uses simple `step_start:` / `step_finish:` log lines; chunk lines are suppressed.

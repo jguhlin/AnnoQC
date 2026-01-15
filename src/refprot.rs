@@ -22,11 +22,14 @@ pub fn parse_readme(path: &str) -> Result<Vec<ProteomeEntry>, String> {
             continue;
         }
         let fields: Vec<&str> = if line.contains('\t') {
-            line.split('\t').map(str::trim).filter(|s| !s.is_empty()).collect()
+            line.split('\t')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
         } else {
             line.split_whitespace().collect()
         };
-        let pid = match fields.get(0) {
+        let pid = match fields.first() {
             Some(s) if s.len() >= 11 && s.starts_with("UP") => (*s).to_string(),
             _ => continue,
         };
@@ -79,7 +82,7 @@ pub fn select_by_taxon(
         let mut cur = e.taxid;
         let mut chain: Vec<u32> = Vec::new();
         let mut hops = 0usize;
-        let mut result = None;
+        let result: Option<bool>;
         loop {
             if let Some(cached) = memo.get(&cur).copied() {
                 result = Some(cached);

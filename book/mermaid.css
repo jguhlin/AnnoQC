@@ -1,0 +1,19 @@
+/* Make Mermaid diagrams readable in mdBook's narrow content column:
+   - Don't auto-shrink SVG to column width
+   - Allow horizontal scrolling for wide diagrams */
+
+.mermaid {
+  padding: 0.5rem 0;
+}
+
+.mermaid-wrapper {
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+}
+
+.mermaid > svg {
+  max-width: none !important;
+  height: auto;
+  display: block;
+}

@@ -312,10 +312,7 @@ fn compute_len_stats(hits: &[AggregatedHit]) -> LenStats {
         };
     }
     let median_val = median(&mut ratios);
-    let mut deviations: Vec<f64> = ratios
-        .iter()
-        .map(|lr| (lr - median_val).abs())
-        .collect();
+    let mut deviations: Vec<f64> = ratios.iter().map(|lr| (lr - median_val).abs()).collect();
     let mad_val = if deviations.is_empty() {
         0.0
     } else {
