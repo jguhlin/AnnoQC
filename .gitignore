@@ -43,3 +43,6 @@ logs/
 *.class
 results_a9/
 share/
+results_*/
+ptg000001l.orf
+galba.converted.gff3
