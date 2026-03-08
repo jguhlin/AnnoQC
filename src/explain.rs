@@ -107,6 +107,58 @@ fn print_breakdown(val: &Value) {
         println!("Taxonomy: status={} detail={}", status, detail);
     }
 
+    if let Some(rnaseq) = val.get("rnaseq").and_then(|v| v.as_object()) {
+        if let Some(score) = rnaseq.get("expression_score").and_then(|v| v.as_f64()) {
+            println!("RNA-seq expression score: {:.4}", score);
+        }
+        if let Some(tpm) = rnaseq.get("tpm").and_then(|v| v.as_f64()) {
+            println!("RNA-seq TPM: {:.2}", tpm);
+        }
+        if let Some(num_reads) = rnaseq.get("num_reads").and_then(|v| v.as_u64()) {
+            println!("RNA-seq num_reads: {}", num_reads);
+        }
+    }
+
+    if let Some(intrinsic) = val.get("intrinsic").and_then(|v| v.as_object()) {
+        if let Some(orf_diagnostics) = intrinsic.get("orf_diagnostics").and_then(|v| v.as_object())
+        {
+            println!("ORF diagnostics:");
+            if let Some(start_met) = orf_diagnostics
+                .get("start_methionine")
+                .and_then(|v| v.as_bool())
+            {
+                println!("  start_methionine: {}", start_met);
+            }
+            if let Some(alt_start) = orf_diagnostics
+                .get("alt_start_pos")
+                .and_then(|v| v.as_u64())
+            {
+                println!("  alt_start_pos: {}", alt_start);
+            }
+            if let Some(internal_stops) = orf_diagnostics
+                .get("internal_stop_count")
+                .and_then(|v| v.as_u64())
+            {
+                println!("  internal_stop_count: {}", internal_stops);
+            }
+            if let Some(terminal_stop) = orf_diagnostics
+                .get("terminal_stop")
+                .and_then(|v| v.as_bool())
+            {
+                println!("  terminal_stop: {}", terminal_stop);
+            }
+            if let Some(orf_start_score) = orf_diagnostics
+                .get("orf_start_score")
+                .and_then(|v| v.as_f64())
+            {
+                println!("  orf_start_score: {:.4}", orf_start_score);
+            }
+            if let Some(orf_score) = orf_diagnostics.get("orf_score").and_then(|v| v.as_f64()) {
+                println!("  orf_score: {:.4}", orf_score);
+            }
+        }
+    }
+
     if let Some(warnings) = val.get("warnings").and_then(|v| v.as_array()) {
         if !warnings.is_empty() {
             let mut joined = String::new();

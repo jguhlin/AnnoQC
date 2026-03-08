@@ -633,12 +633,120 @@ pub struct DomainsArchDiagnostics {
     pub score: f64,
 }
 
+/// Calculate domain order penalty by comparing query domain order against reference panel.
+/// Uses pairwise inversion counting: compares each pair of adjacent domains in query vs panel.
+/// Returns a penalty in [0, 1], where 0 means perfect order match and 1 means completely inverted.
+fn calculate_domain_order_penalty(
+    query_hits: &[HmmscanHit],
+    ref_ids: &[String],
+    ref_map: &std::collections::HashMap<String, HmmscanSummary>,
+) -> f64 {
+    // Extract query domain order (unique accessions in order of occurrence)
+    let query_domains: Vec<&str> = query_hits
+        .iter()
+        .filter(|h| h.evalue < 1e-5) // Only consider significant hits
+        .map(|h| h.accession.as_str())
+        .collect();
+
+    if query_domains.is_empty() || ref_ids.is_empty() {
+        return 0.0;
+    }
+
+    // Collect panel domain orders
+    let mut panel_orders: Vec<Vec<&str>> = Vec::new();
+    for rid in ref_ids {
+        if let Some(summary) = ref_map.get(rid) {
+            let domains: Vec<&str> = summary
+                .hits
+                .iter()
+                .filter(|h| h.evalue < 1e-5)
+                .map(|h| h.accession.as_str())
+                .collect();
+            if !domains.is_empty() {
+                panel_orders.push(domains);
+            }
+        }
+    }
+
+    if panel_orders.is_empty() {
+        return 0.0;
+    }
+
+    // Calculate average order penalty across all panel sequences
+    let mut total_penalty = 0.0;
+    let mut comparisons = 0;
+
+    for panel_domains in &panel_orders {
+        let penalty = calculate_order_penalty_between(&query_domains, panel_domains);
+        total_penalty += penalty;
+        comparisons += 1;
+    }
+
+    if comparisons == 0 {
+        return 0.0;
+    }
+
+    (total_penalty / comparisons as f64).min(1.0)
+}
+
+/// Calculate order penalty between two domain orderings using pairwise inversion counting.
+/// For each pair of domains, check if their relative order matches between query and panel.
+fn calculate_order_penalty_between(query: &[&str], panel: &[&str]) -> f64 {
+    if query.len() < 2 || panel.len() < 2 {
+        return 0.0;
+    }
+
+    // Create position maps for quick lookup
+    let mut query_pos: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, &domain) in query.iter().enumerate() {
+        query_pos.insert(domain, i);
+    }
+
+    let mut panel_pos: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, &domain) in panel.iter().enumerate() {
+        panel_pos.insert(domain, i);
+    }
+
+    // Count inversions: for each pair of domains in query, check if order matches panel
+    let mut inversions = 0;
+    let mut total_comparisons = 0;
+
+    // Only compare domains that exist in both query and panel
+    let common_domains: Vec<&str> = query_pos
+        .keys()
+        .cloned()
+        .filter(|d| panel_pos.contains_key(*d))
+        .collect();
+
+    for i in 0..common_domains.len() {
+        for j in (i + 1)..common_domains.len() {
+            let d1 = common_domains[i];
+            let d2 = common_domains[j];
+
+            let q_order = query_pos.get(d1).unwrap_or(&0) < query_pos.get(d2).unwrap_or(&0);
+            let p_order = panel_pos.get(d1).unwrap_or(&0) < panel_pos.get(d2).unwrap_or(&0);
+
+            if q_order != p_order {
+                inversions += 1;
+            }
+            total_comparisons += 1;
+        }
+    }
+
+    if total_comparisons == 0 {
+        return 0.0;
+    }
+
+    (inversions as f64 / total_comparisons as f64).min(1.0)
+}
+
 /// Same logic as `domains_architecture_score` but returns detailed diagnostics to aid debugging.
 /// Assumes inputs are already clan-collapsed if desired by caller.
 pub fn domains_architecture_diagnostics(
     query: &HmmscanSummary,
     ref_ids: &[String],
     ref_map: &std::collections::HashMap<String, HmmscanSummary>,
+    order_weight: f64,
 ) -> DomainsArchDiagnostics {
     use std::collections::{HashMap, HashSet};
     // Always record query-side domain count (useful even if refs have none)
@@ -713,11 +821,15 @@ pub fn domains_architecture_diagnostics(
     } else {
         0.0
     };
+
+    // Calculate domain order penalty
+    // Compare query domain order against reference panel domain order
+    let order_pen = calculate_domain_order_penalty(&query.hits, ref_ids, ref_map);
+
     let w_core = 0.6;
     let w_acc = 0.3;
     let w_extra = 0.1;
-    let w_ord = 0.0;
-    let order_pen = 0.0;
+    let w_ord = order_weight; // Use configurable weight
     diag.score = (w_core * diag.recall_core + w_acc * diag.precision_acc
         - w_extra * diag.extras_pen
         - w_ord * order_pen)

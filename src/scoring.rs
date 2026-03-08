@@ -3,6 +3,7 @@ use crate::genomic::GenomicMetrics;
 use crate::hmmer::HmmscanSummary;
 use crate::mafft::AlignmentMetrics;
 use crate::metrics::IntrinsicMetrics;
+use crate::rnaseq::RnaseqMetrics;
 use crate::structvar::StructVar;
 use crate::taxonomy::TaxonomyEvidence;
 
@@ -27,10 +28,57 @@ pub fn compute_homology_score(s: Option<&DiamondHitStats>) -> f64 {
 /// Computes intrinsic sequence quality from ambiguity, low complexity, and homopolymer metrics.
 /// Returns a score in [0.0, 1.0].
 pub fn compute_intrinsic_score(im: &IntrinsicMetrics) -> f64 {
+    let seq_quality = compute_sequence_quality_score(im);
+    let orf = compute_orf_score(im);
+    // Weight: 30% sequence quality, 70% ORF completeness
+    (0.3 * seq_quality + 0.7 * orf).clamp(0.0, 1.0)
+}
+
+/// Computes sequence quality score from ambiguity, low complexity, and homopolymer metrics.
+/// Returns a score in [0.0, 1.0].
+fn compute_sequence_quality_score(im: &IntrinsicMetrics) -> f64 {
     let amb_pen = (1.0 - (im.ambiguous_fraction).min(1.0)).max(0.0);
     let lc_pen = (1.0 - im.low_complexity_fraction.min(1.0)).max(0.0);
     let hp_pen = (1.0 - (im.max_homopolymer as f64 / 30.0).min(1.0)).max(0.0);
     (0.5 * amb_pen + 0.4 * lc_pen + 0.1 * hp_pen).clamp(0.0, 1.0)
+}
+
+/// Computes ORF completeness score [0, 1] based on start/stop codons and internal stops.
+/// Penalizes sequences with:
+/// - Missing start methionine
+/// - Internal stop codons
+/// - Missing terminal stop
+/// Bonuses for:
+/// - Start methionine present
+/// - Terminal stop present
+/// - Alternative start position (partial recovery)
+pub fn compute_orf_score(im: &IntrinsicMetrics) -> f64 {
+    // Start with a perfect score and penalize issues
+    let mut score = 1.0;
+
+    // Check start methionine
+    if im.start_methionine {
+        // Perfect start
+        score += 0.0;
+    } else if im.alt_start_pos.is_some() {
+        // Partial recovery: alt start exists within first 10 residues
+        score -= 0.15;
+    } else {
+        // Missing start methionine entirely
+        score -= 0.3;
+    }
+
+    // Internal stop codons are severe - each one reduces score
+    if im.internal_stop_count > 0 {
+        score -= 0.25 * im.internal_stop_count as f64;
+    }
+
+    // Missing terminal stop
+    if !im.terminal_stop {
+        score -= 0.25;
+    }
+
+    score.clamp(0.0, 1.0)
 }
 
 /// Computes taxonomy congruence score from available evidence.
@@ -173,6 +221,73 @@ pub fn compute_genomic_score_with_cfg(
         }
     }
     score.clamp(0.0, 1.0)
+}
+
+/// Compute RNA-seq expression score [0, 1]
+/// Returns 0.0 if no RNA-seq data available for the gene
+pub fn compute_rnaseq_score(rnaseq: Option<&RnaseqMetrics>) -> f64 {
+    rnaseq
+        .map(|r| r.expression_score.clamp(0.0, 1.0))
+        .unwrap_or(0.0)
+}
+
+/// Compute block conservation score [0, 1]
+/// Penalizes sequences missing conserved blocks present in the panel,
+/// or having extra blocks not well-supported in the panel.
+/// Returns 1.0 if no alignment data or no conserved blocks detected.
+pub fn compute_block_conservation_score(am: Option<&AlignmentMetrics>) -> f64 {
+    let am = match am {
+        Some(a) if a.mafft_enabled => a,
+        _ => return 1.0, // No alignment data = no penalty
+    };
+
+    // If no conserved blocks were identified, no penalty
+    if am.conserved_blocks.is_empty() {
+        return 1.0;
+    }
+
+    let total_panel_conserved = am.total_conserved_panel;
+    if total_panel_conserved == 0 {
+        return 1.0;
+    }
+
+    // Calculate coverage: what fraction of panel conserved blocks are present in query
+    let query_coverage = if total_panel_conserved > 0 {
+        am.total_conserved_query as f64 / total_panel_conserved as f64
+    } else {
+        1.0
+    };
+
+    // Penalty for missing blocks, weighted by conservation level
+    let missing_penalty: f64 = am
+        .missing_blocks
+        .iter()
+        .map(|b| {
+            let weight = b.conservation_fraction; // High conservation = high penalty
+            b.length as f64 * weight
+        })
+        .sum();
+
+    // Penalty for extra blocks (query has, panel doesn't support well)
+    let extra_penalty: f64 = am
+        .extra_blocks
+        .iter()
+        .map(|b| {
+            // Lower conservation fraction in panel = less confident penalty
+            let weight = 1.0 - b.conservation_fraction;
+            b.length as f64 * weight * 0.5 // Extra blocks are less severe than missing
+        })
+        .sum();
+
+    let total_block_length = am.conserved_blocks.iter().map(|b| b.length).sum::<usize>() as f64;
+
+    if total_block_length > 0.0 {
+        let normalized_missing = missing_penalty / total_block_length;
+        let normalized_extra = extra_penalty / total_block_length;
+        (query_coverage - normalized_missing - normalized_extra).clamp(0.0, 1.0)
+    } else {
+        query_coverage.clamp(0.0, 1.0)
+    }
 }
 
 #[cfg(test)]

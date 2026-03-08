@@ -3,14 +3,35 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use needletail::parse_fastx_file;
+use serde::{Deserialize, Serialize};
 use spoa::{AlignmentEngine, AlignmentType, Graph};
 
 use crate::taxonomy::canonical_accession;
+
+/// Represents a single conserved block in the alignment
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConservedBlock {
+    pub start: usize,
+    pub end: usize,
+    pub length: usize,
+    pub conservation_fraction: f64,
+    pub panel_count: usize,
+    pub query_present: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlignerBackend {
     Mafft,
     Spoa,
+}
+
+impl std::fmt::Display for AlignerBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AlignerBackend::Mafft => write!(f, "mafft"),
+            AlignerBackend::Spoa => write!(f, "spoa"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +74,195 @@ pub struct AlignmentMetrics {
     pub end_class: String,
     pub missing_exon_run: usize,
     pub retained_intron_run: usize,
+    // Block-level conservation metrics
+    pub conserved_blocks: Vec<ConservedBlock>,
+    pub missing_blocks: Vec<ConservedBlock>,
+    pub extra_blocks: Vec<ConservedBlock>,
+    pub total_conserved_query: usize,
+    pub total_conserved_panel: usize,
+    pub block_conservation_score: f64,
+}
+
+/// Result of block-level conservation analysis
+#[derive(Debug, Clone, Default)]
+struct BlockConservationResult {
+    conserved_blocks: Vec<ConservedBlock>,
+    missing_blocks: Vec<ConservedBlock>,
+    extra_blocks: Vec<ConservedBlock>,
+    total_conserved_query: usize,
+    total_conserved_panel: usize,
+    score: f64,
+}
+
+/// Analyze block-level conservation in alignment
+/// Identifies conserved blocks and compares query vs panel
+fn analyze_block_conservation(sequences: &[Vec<u8>], query_idx: usize) -> BlockConservationResult {
+    if sequences.is_empty() {
+        return BlockConservationResult::default();
+    }
+
+    let seq_len = sequences[0].len();
+    let window_size = 5; // Minimum block size
+    let min_conservation = 0.8; // 80% panel agreement
+    let min_panel_support = 0.5; // 50% of sequences
+
+    let mut conserved_blocks: Vec<ConservedBlock> = Vec::new();
+    let mut in_block = false;
+    let mut block_start = 0;
+    let mut block_conservation_sum = 0.0;
+
+    // Sliding window analysis
+    for pos in 0..seq_len {
+        // Calculate conservation at this position
+        let (panel_cons, count) = calculate_position_conservation(sequences, query_idx, pos);
+
+        if panel_cons >= min_conservation
+            && count as f64 >= (sequences.len() as f64 * min_panel_support)
+        {
+            // Start or extend block
+            if !in_block {
+                block_start = pos;
+                in_block = true;
+            }
+            block_conservation_sum += panel_cons;
+        } else if in_block {
+            // End block
+            let block_len = pos - block_start;
+            if block_len >= window_size {
+                let avg_conservation = block_conservation_sum / block_len as f64;
+                let query_has_block = sequences[query_idx][block_start..pos]
+                    .iter()
+                    .any(|&c| c != b'-');
+
+                conserved_blocks.push(ConservedBlock {
+                    start: block_start,
+                    end: pos,
+                    length: block_len,
+                    conservation_fraction: avg_conservation,
+                    panel_count: count,
+                    query_present: query_has_block,
+                });
+            }
+            in_block = false;
+            block_conservation_sum = 0.0;
+        }
+    }
+
+    // Handle block that extends to end
+    if in_block {
+        let block_len = seq_len - block_start;
+        if block_len >= window_size {
+            let avg_conservation = block_conservation_sum / block_len as f64;
+            let query_has_block = sequences[query_idx][block_start..seq_len]
+                .iter()
+                .any(|&c| c != b'-');
+
+            conserved_blocks.push(ConservedBlock {
+                start: block_start,
+                end: seq_len,
+                length: block_len,
+                conservation_fraction: avg_conservation,
+                panel_count: sequences.len() - 1,
+                query_present: query_has_block,
+            });
+        }
+    }
+
+    // Classify blocks
+    let missing_blocks: Vec<ConservedBlock> = conserved_blocks
+        .iter()
+        .filter(|b| !b.query_present)
+        .cloned()
+        .collect();
+
+    let extra_blocks: Vec<ConservedBlock> = conserved_blocks
+        .iter()
+        .filter(|b| b.query_present && b.panel_count < (sequences.len() / 3))
+        .cloned()
+        .collect();
+
+    let total_conserved_query: usize = conserved_blocks
+        .iter()
+        .filter(|b| b.query_present)
+        .map(|b| b.length)
+        .sum();
+
+    let total_conserved_panel: usize = conserved_blocks.iter().map(|b| b.length).sum();
+
+    // Calculate score
+    let score = if total_conserved_panel == 0 {
+        1.0 // No blocks = no penalty
+    } else {
+        let query_coverage = total_conserved_query as f64 / total_conserved_panel as f64;
+        let missing_penalty: f64 = missing_blocks
+            .iter()
+            .map(|b| {
+                let weight = b.conservation_fraction; // High conservation = high penalty
+                b.length as f64 * weight
+            })
+            .sum();
+        let total_block_length = total_conserved_panel as f64;
+        if total_block_length > 0.0 {
+            let normalized_missing = missing_penalty / total_block_length;
+            (query_coverage - normalized_missing).clamp(0.0, 1.0)
+        } else {
+            query_coverage.clamp(0.0, 1.0)
+        }
+    };
+
+    BlockConservationResult {
+        conserved_blocks,
+        missing_blocks,
+        extra_blocks,
+        total_conserved_query,
+        total_conserved_panel,
+        score,
+    }
+}
+
+/// Calculate conservation fraction at a specific alignment position
+fn calculate_position_conservation(
+    sequences: &[Vec<u8>],
+    query_idx: usize,
+    pos: usize,
+) -> (f64, usize) {
+    let panel_seqs: Vec<_> = sequences
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != query_idx)
+        .map(|(_, seq)| seq.get(pos).copied().unwrap_or(b'-'))
+        .collect();
+
+    if panel_seqs.is_empty() {
+        return (0.0, 0);
+    }
+
+    // Find consensus residue (most common non-gap character)
+    let mut counts: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    for &c in &panel_seqs {
+        if c != b'-' {
+            *counts.entry(c).or_insert(0) += 1;
+        }
+    }
+
+    let consensus = counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(c, _)| c)
+        .unwrap_or(b'-');
+
+    let count = panel_seqs
+        .iter()
+        .filter(|&&c| c == consensus || c == b'-')
+        .count();
+
+    let fraction = if panel_seqs.is_empty() {
+        0.0
+    } else {
+        count as f64 / panel_seqs.len() as f64
+    };
+
+    (fraction, count)
 }
 
 pub fn load_sequences_by_ids(
@@ -438,6 +648,9 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         .to_string();
     }
 
+    // Block-level conservation analysis
+    let block_result = analyze_block_conservation(seqs, 0);
+
     AlignmentMetrics {
         mafft_enabled: true,
         strategy_used: "auto".to_string(),
@@ -464,6 +677,12 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         end_class,
         missing_exon_run: compute_consensus_gap_run(seqs, true),
         retained_intron_run: compute_consensus_gap_run(seqs, false),
+        conserved_blocks: block_result.conserved_blocks,
+        missing_blocks: block_result.missing_blocks,
+        extra_blocks: block_result.extra_blocks,
+        total_conserved_query: block_result.total_conserved_query,
+        total_conserved_panel: block_result.total_conserved_panel,
+        block_conservation_score: block_result.score,
     }
 }
 

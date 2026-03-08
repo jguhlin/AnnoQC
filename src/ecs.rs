@@ -1115,9 +1115,9 @@ impl RenderSummary {
     }
 }
 
-const CSV_HEADER_VERBOSE: &str = "gene_id,hits_count,panel_swissprot,panel_refprot,panel_cluster,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,subject_cov_score,subject_cov_penalty,fusion_split,structvar_multiplier,final_score,classification,homology_score,intrinsic_score,genomic_score,taxonomy_score,domains_score,domains_arch_score,orphan_domain_score,length_score,length_ratio,length_class,length_expected_min,length_expected_max,length_in_expected_range,length_panel_n,conserved_regions_score,termini_score,divergence_score,mafft_enabled,conserved_fraction,pairwise_identity,panel_pairwise_identity,divergence_ratio,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,missing_exon_run,retained_intron_run,start_concordance,start_class,end_concordance,end_class,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_contamination,taxonomy_support,taxonomy_considered,taxonomy_support_frac,consensus_taxon,taxonomy_consensus_rank,taxonomy_status,plugin_penalty,plugin_names,plugin_scores,plugin_penalties,plugin_metadata,warnings";
+const CSV_HEADER_VERBOSE: &str = "gene_id,hits_count,panel_swissprot,panel_refprot,panel_cluster,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,subject_cov_score,subject_cov_penalty,fusion_split,structvar_multiplier,final_score,classification_base,classification_final,homology_score,intrinsic_score,genomic_score,taxonomy_score,domains_score,domains_arch_score,orphan_domain_score,length_score,length_ratio,length_class,length_expected_min,length_expected_max,length_in_expected_range,length_panel_n,conserved_regions_score,termini_score,divergence_score,orf_start_methionine,orf_internal_stops,orf_terminal_stop,orf_score,mafft_enabled,conserved_fraction,pairwise_identity,panel_pairwise_identity,divergence_ratio,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,missing_exon_run,retained_intron_run,start_concordance,start_class,end_concordance,end_class,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,taxonomy_contamination,taxonomy_support,taxonomy_considered,taxonomy_support_frac,consensus_taxon,taxonomy_consensus_rank,taxonomy_status,plugin_penalty,plugin_names,plugin_scores,plugin_penalties,plugin_metadata,warnings";
 
-const CSV_HEADER_STANDARD: &str = "gene_id,hits_count,panel_swissprot,panel_refprot,panel_cluster,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,subject_cov_score,subject_cov_penalty,fusion_split,structvar_multiplier,final_score,classification,mafft_enabled,conserved_fraction,pairwise_identity,panel_pairwise_identity,divergence_ratio,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,orphan_domain_score,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,genomic_score,taxonomy_score,taxonomy_contamination,taxonomy_support,taxonomy_considered,taxonomy_support_frac,consensus_taxon,taxonomy_consensus_rank,taxonomy_status,plugin_penalty,plugin_names,plugin_scores,plugin_penalties,plugin_metadata,warnings";
+const CSV_HEADER_STANDARD: &str = "gene_id,hits_count,panel_swissprot,panel_refprot,panel_cluster,top_hit,top_bitscore,top_evalue,top_qcov,top_scov,bitscore_density,coverage_delta,coverage_ratio,subject_cov_score,subject_cov_penalty,fusion_split,structvar_multiplier,final_score,classification_base,classification_final,mafft_enabled,conserved_fraction,pairwise_identity,panel_pairwise_identity,divergence_ratio,sequences_aligned,query_gap_fraction,gap_run_count,max_gap_run,domains_score,domains_arch_score,orphan_domain_score,structvar_class,structvar_gap,structvar_left_len,structvar_right_len,structvar_cov_left,structvar_cov_right,orphan_status,genomic_score,taxonomy_score,taxonomy_contamination,taxonomy_support,taxonomy_considered,taxonomy_support_frac,consensus_taxon,taxonomy_consensus_rank,taxonomy_status,plugin_penalty,plugin_names,plugin_scores,plugin_penalties,plugin_metadata,warnings";
 
 fn classification_base(label: &str) -> &str {
     label.split([' ', '(', '[']).next().unwrap_or(label)
@@ -1643,7 +1643,7 @@ fn cards_to_dataframe(cards: &[ScoreCard]) -> PolarsResult<DataFrame> {
         "classification",
         cards
             .iter()
-            .map(|c| c.classification.as_str())
+            .map(|c| c.classification_base.as_str())
             .collect::<Vec<_>>(),
     );
 
@@ -1927,7 +1927,7 @@ fn render_flush_system(
                     .entry(card.taxonomy_status.clone())
                     .or_insert(0) += 1;
             }
-            let base = classification_base(&card.classification);
+            let base = classification_base(&card.classification_base);
             match base {
                 "High" => {
                     stats.h_count += 1;
