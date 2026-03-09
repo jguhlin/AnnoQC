@@ -1,8 +1,9 @@
 use std::fs;
 
+use crate::config_types::FileConfig;
 use crate::{
     resolve_calibration_settings, resolve_effective_config, AnalyzeArgs, CalibrationSettings,
-    EffectiveConfig, FileConfig, ReportFormat,
+    EffectiveConfig, ReportFormat,
 };
 
 pub(crate) struct AnalyzeBootstrap {

@@ -7,12 +7,13 @@ use crate::*;
 mod bootstrap;
 mod manifest;
 mod pipeline;
+mod pipeline_emit;
 
 use bootstrap::AnalyzeBootstrap;
-use pipeline::{
-    build_consensus_stage, finalize_outputs, prepare_emit_stage, run_diamond_stage,
-    run_heavy_stage, run_scoring_and_render_stage, FinalizeInputs, ScoringRenderInputs,
-    TimingInputs,
+use pipeline::{build_consensus_stage, run_diamond_stage, run_heavy_stage};
+use pipeline_emit::{
+    finalize_outputs, prepare_emit_stage, run_scoring_and_render_stage, FinalizeInputs,
+    ScoringRenderInputs, TimingInputs,
 };
 
 pub(crate) fn run_analyze(

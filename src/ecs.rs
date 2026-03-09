@@ -22,10 +22,9 @@ use std::time::{Duration, Instant};
 use crate::hmmer::{run_hmmscan, HmmscanSummary};
 use crate::mafft::{run_alignment_for_panel, AlignerConfig, AlignmentMetrics};
 use crate::preflight;
-use crate::render_gene_record;
 use crate::{
-    taxonomy, Checksums, RenderContext, RenderedRecord, ScoreCard, OUTPUT_SCHEMA_VERSION,
-    TOOL_NAME, TOOL_VERSION,
+    render_record::render_gene_record, taxonomy, Checksums, RenderContext, RenderedRecord,
+    ScoreCard, OUTPUT_SCHEMA_VERSION, TOOL_NAME, TOOL_VERSION,
 };
 
 const CPU_LABEL_ALIGN: &str = "align";

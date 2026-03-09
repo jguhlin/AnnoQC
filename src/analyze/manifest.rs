@@ -5,9 +5,10 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::config_types::FileConfig;
 use crate::{
     filehash_xx64, preflight, AnalyzeArgs, CalibrationSettings, Checksums, EffectiveConfig,
-    FileConfig, ReportFormat, OUTPUT_SCHEMA_VERSION, PLUGIN_SCHEMA_VERSION,
+    ReportFormat, OUTPUT_SCHEMA_VERSION, PLUGIN_SCHEMA_VERSION,
 };
 
 #[derive(Serialize, Clone)]

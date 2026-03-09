@@ -1,4 +1,4 @@
-use crate::{ScoringConfigOverride, ScoringThresholds};
+use crate::config_types::{ScoringConfigOverride, ScoringThresholds};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
