@@ -471,7 +471,7 @@ PF00001.1  PF00001.1  250  Q12345  -  120  1e-20  100.0  0.1  1  1  2e-20  1e-20
         );
         refs.insert("ref2".into(), make_summary(&[("CL0001", 1e-8)]));
         let ref_ids = vec!["ref1".to_string(), "ref2".to_string()];
-        let diag = domains_architecture_diagnostics(&query, &ref_ids, &refs);
+        let diag = domains_architecture_diagnostics(&query, &ref_ids, &refs, 0.0);
         assert_eq!(diag.panel_size, ref_ids.len());
         assert_eq!(diag.refs_with_domains, 2);
         assert_eq!(diag.core_count, 1);

@@ -353,7 +353,10 @@ pub(crate) fn diamond_db_has_taxonomy(diamond_bin: &str, db_path: &Path) -> bool
 pub(crate) fn dbinfo_text_has_taxonomy(text: &str) -> bool {
     text.lines().any(|line| {
         let lower = line.to_ascii_lowercase();
-        lower.contains("taxonomy") || lower.contains("taxon count")
+        if lower.contains("no taxonomy") {
+            return false;
+        }
+        lower.contains("taxon count") || lower.contains("taxonomy")
     })
 }
 
