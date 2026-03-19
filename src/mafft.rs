@@ -80,7 +80,6 @@ pub struct AlignmentMetrics {
     pub extra_blocks: Vec<ConservedBlock>,
     pub total_conserved_query: usize,
     pub total_conserved_panel: usize,
-    pub block_conservation_score: f64,
 }
 
 /// Result of block-level conservation analysis
@@ -91,7 +90,6 @@ struct BlockConservationResult {
     extra_blocks: Vec<ConservedBlock>,
     total_conserved_query: usize,
     total_conserved_panel: usize,
-    score: f64,
 }
 
 /// Analyze block-level conservation in alignment
@@ -189,34 +187,12 @@ fn analyze_block_conservation(sequences: &[Vec<u8>], query_idx: usize) -> BlockC
 
     let total_conserved_panel: usize = conserved_blocks.iter().map(|b| b.length).sum();
 
-    // Calculate score
-    let score = if total_conserved_panel == 0 {
-        1.0 // No blocks = no penalty
-    } else {
-        let query_coverage = total_conserved_query as f64 / total_conserved_panel as f64;
-        let missing_penalty: f64 = missing_blocks
-            .iter()
-            .map(|b| {
-                let weight = b.conservation_fraction; // High conservation = high penalty
-                b.length as f64 * weight
-            })
-            .sum();
-        let total_block_length = total_conserved_panel as f64;
-        if total_block_length > 0.0 {
-            let normalized_missing = missing_penalty / total_block_length;
-            (query_coverage - normalized_missing).clamp(0.0, 1.0)
-        } else {
-            query_coverage.clamp(0.0, 1.0)
-        }
-    };
-
     BlockConservationResult {
         conserved_blocks,
         missing_blocks,
         extra_blocks,
         total_conserved_query,
         total_conserved_panel,
-        score,
     }
 }
 
@@ -682,7 +658,6 @@ fn compute_alignment_metrics(seqs: &[Vec<u8>]) -> AlignmentMetrics {
         extra_blocks: block_result.extra_blocks,
         total_conserved_query: block_result.total_conserved_query,
         total_conserved_panel: block_result.total_conserved_panel,
-        block_conservation_score: block_result.score,
     }
 }
 

@@ -29,13 +29,16 @@ intrinsic = 0.0
 taxonomy = 0.0
 domains = 0.15
 domains_strength = 0.05
+domains_order = 0.0
 length = 0.05
 orphan = 0.0
 subject_cov = 0.0
 termini = 0.0
 divergence = 0.0
 conserved_regions = 0.0
+block_conservation = 0.0
 genomic = 0.0
+rnaseq = 0.0
 
 [scoring.thresholds]
 high = 0.8
@@ -83,6 +86,11 @@ expected_domain = "Eukaryota"        # set to emit non-target domain warnings
 # low_coverage_frac = 0.05             # note when taxonomy hits <5% of total
 # cache_path = "share/uniprot/uniprot_taxonomy.tsv"
 # taxdump_dir = "share/taxonomy/new_taxdump"
+
+[rnaseq]
+enabled = false
+# file = "path/to/quant.tsv"           # Salmon/Kallisto quant table or expression file
+# min_tpm = 1.0                        # Minimum TPM threshold for expression support
 
 [consensus]
 # Minimum number of homologs required for consensus-based analyses (MAFFT/start, domain architecture)

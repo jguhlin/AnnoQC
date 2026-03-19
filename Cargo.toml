@@ -2,6 +2,25 @@
 name = "AnnoQC"
 version = "0.1.1"
 edition = "2021"
+description = "Production-grade protein sequence quality control using homology, intrinsic metrics, and genomic context"
+authors = ["Joseph Guhlin <joseph.guhlin@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/jguhlin/AnnoQC"
+homepage = "https://github.com/jguhlin/AnnoQC"
+documentation = "https://jguhlin.github.io/AnnoQC"
+keywords = ["bioinformatics", "protein-quality", "sequence-analysis", "homology-search", "qc", "annotation"]
+categories = ["science"]
+readme = "README.md"
+exclude = [
+    "book/",
+    "examples/",
+    "tests/fixtures/",
+    "*.fq",
+    "*.faa",
+    "*.fasta",
+    "*.dmnd",
+    "*.log",
+]
 
 [profile.dev.package."*"]
 opt-level = 3

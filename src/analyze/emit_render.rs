@@ -57,12 +57,31 @@ pub(in crate::analyze) fn run_scoring_and_render_stage(
         input.args.genome.as_deref(),
         input.log_json,
     );
+    let rnaseq_requested = input.args.rnaseq_file.is_some()
+        || input
+            .file_cfg
+            .rnaseq
+            .as_ref()
+            .and_then(|r| r.enabled)
+            .unwrap_or(false);
+    let rnaseq_min_tpm = if input.args.rnaseq_file.is_some() {
+        input.args.rnaseq_min_tpm
+    } else {
+        input
+            .file_cfg
+            .rnaseq
+            .as_ref()
+            .and_then(|r| r.min_tpm)
+            .unwrap_or(input.args.rnaseq_min_tpm)
+    };
     let (rnaseq_enabled, rnaseq_map) = load_rnaseq_data(
+        rnaseq_requested,
         input
             .args
             .rnaseq_file
             .clone()
             .or_else(|| input.file_cfg.rnaseq.as_ref().and_then(|r| r.file.clone())),
+        rnaseq_min_tpm,
     );
     let t_scoring = step_start("scoring", input.log_json);
     let (scores_map_inner, raw_scores_inner) = build_scores_map(

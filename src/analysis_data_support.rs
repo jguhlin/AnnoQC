@@ -6,8 +6,13 @@ use crate::orchestration::{step_finish, step_start};
 use crate::rnaseq::{parse_expression_file, parse_quant_table, RnaseqMetrics};
 
 pub fn load_rnaseq_data(
+    rnaseq_enabled: bool,
     rnaseq_path: Option<String>,
+    min_tpm: f64,
 ) -> (bool, Arc<HashMap<String, RnaseqMetrics>>) {
+    if !rnaseq_enabled {
+        return (false, Arc::new(HashMap::new()));
+    }
     if let Some(path) = rnaseq_path {
         log::info!("loading RNA-seq data from: {}", path);
         let map = if path.ends_with(".tsv") || path.ends_with(".txt") {
@@ -16,8 +21,18 @@ pub fn load_rnaseq_data(
             parse_expression_file(&path)
         };
         match map {
-            Ok(m) => {
-                log::info!("loaded RNA-seq data for {} genes", m.len());
+            Ok(mut m) => {
+                for metrics in m.values_mut() {
+                    if metrics.tpm.unwrap_or(0.0) < min_tpm {
+                        metrics.has_support = false;
+                        metrics.expression_score = 0.0;
+                    }
+                }
+                log::info!(
+                    "loaded RNA-seq data for {} genes (min_tpm={})",
+                    m.len(),
+                    min_tpm
+                );
                 (true, Arc::new(m))
             }
             Err(e) => {

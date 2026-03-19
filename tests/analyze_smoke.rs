@@ -225,3 +225,72 @@ fn analyze_smoke_produces_outputs() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn analyze_smoke_spoa_backend() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = TempDir::new()?;
+    let stub = compile_diamond_stub(tmp.path());
+
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let input = fixtures.join("input.faa");
+    let reference = fixtures.join("reference.faa");
+    let expected_gene_ids = load_fasta_ids(&input)?;
+    let db_src = fixtures.join("mock.dmnd");
+    let db = tmp.path().join("mock.dmnd");
+    if db_src.exists() {
+        let _ = fs::copy(&db_src, &db);
+    }
+    if !db.exists() || db.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+        fs::write(&db, b"stub-db")?;
+    }
+    let out_dir = tmp.path().join("results");
+
+    // Explicitly test SPOA backend
+    let status = Command::new(env!("CARGO_BIN_EXE_AnnoQC"))
+        .args(["analyze", "--fasta"])
+        .arg(&input)
+        .args(["--db"])
+        .arg(&db)
+        .args(["--diamond-bin"])
+        .arg(&stub)
+        .args(["--reference-fasta"])
+        .arg(&reference)
+        .args(["--out"])
+        .arg(&out_dir)
+        .args(["--threads", "1", "--aligner", "spoa"])
+        .status()?;
+    assert!(status.success(), "analyze command with SPOA should succeed");
+
+    let jsonl_path = out_dir.join("qc_report.jsonl");
+    let csv_path = out_dir.join("qc_summary.csv");
+    assert!(jsonl_path.exists(), "qc_report.jsonl missing");
+    assert!(csv_path.exists(), "qc_summary.csv missing");
+
+    let json_file = fs::File::open(&jsonl_path)?;
+    let reader = BufReader::new(json_file);
+    let mut seen_gene_ids = std::collections::HashSet::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)?;
+        if value["type"].as_str() == Some("metadata") {
+            continue;
+        }
+        let gene_id = value["gene_id"]
+            .as_str()
+            .ok_or_else(|| invalid_data("missing gene_id"))?;
+        assert!(
+            expected_gene_ids.contains(gene_id),
+            "unexpected gene_id in output: {gene_id}"
+        );
+        seen_gene_ids.insert(gene_id.to_string());
+    }
+    assert_eq!(
+        seen_gene_ids, expected_gene_ids,
+        "scorecards did not match input genes"
+    );
+
+    Ok(())
+}

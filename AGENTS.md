@@ -75,3 +75,17 @@ Use this short spiel when starting edits:
 - Keep systems deterministic: cap async pools with `max_jobs`, maintain ordered flush via `next_index`, and despawn entities after flushing to keep memory flat.
 - Diagnostics belong in ECS resources too (e.g., domains_arch_debug, structvar summaries). When adding new per-gene diagnostics, aggregate via systems instead of post-processing the whole dataset.
 - When touching Bevy APIs, consult upstream docs for 0.17 patterns—avoid direct entity handles after despawn; use resources/queues instead.
+
+## CRITICAL DIRECTIVES
+CRITICAL: Always when you invoke a any shell command pipe it through `distill` and tell exactly what you want to know, including specifics.
+`distill` will summarize the response to save tokens, which is critical for us.
+
+Examples:
+- `bun test 2>&1 | distill "did the tests pass?"`
+- `git diff 2>&1 | distill "what changed?"`
+- `terraform plan 2>&1 | distill "is this safe?"`
+- `npm audit 2>&1 | distill "extract vulnerabilities as JSON"`
+
+THERE ARE ONLY TWO SCENARIOS WHEN YOU ARE ALLOWED TO NOT USE `distill`:
+- Do not use `distill` if exact uncompressed output is required.
+- Do not use `distill` if it would break an interactive/TUI workflow.
